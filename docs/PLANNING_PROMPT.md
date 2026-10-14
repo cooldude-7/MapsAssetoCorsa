@@ -67,6 +67,16 @@ Don't ask about these again:
   scenery come later.
 - **Free, personal project.** No payments, no Upgrade tier, no account tiers. Accounts only matter
   if and when the website happens.
+- **AI cars are a core goal, not an extra.** Every generated track must ship a working AI line
+  (`ai/fast_lane.ai`), so the ideal-line assist works and the track is ready for bots. The user wants
+  two kinds of bot cars eventually:
+  1. **Traffic cars on the road**, Shutoko Revival style: cars cruising both directions while you drive.
+  2. **Touge battles**, Initial D style: a 1v1 race down the mountain road against an AI car. The
+     dream is an AI that **drifts the corners** like in the show.
+  Be honest in the plan about what vanilla AC, Custom Shaders Patch (CSP) and AssettoServer can and
+  can't do here. Vanilla AI drives grip lines and doesn't drift. Find out what it would actually
+  take (CSP Lua AI scripting, custom AI controllers, physics tricks) and rate it as feasible,
+  hard, or research project.
 
 ## 3. Your job
 
@@ -85,6 +95,8 @@ the user is a player, not a modder.
 - Required dummy/empty objects and naming: `AC_START_n`, `AC_PIT_n`, `AC_HOTLAP_START_n`,
   `AC_TIME_n_L/R`. For **point-to-point** tracks: `AC_AB_START_L/R` and `AC_AB_FINISH_L/R`.
   Explain how A→B timing and the session types (practice, hotlap, drift) work.
+- Keep the bot-car goals (section H) in mind here: AI needs clean road boundaries, and two-way
+  traffic needs lanes, so record lane data from the start.
 - Physical surfaces: mesh naming conventions (for example `1ROAD`, `1GRASS`, `1KERB`, `1WALL`, `1SAND`)
   and how they map to `surfaces.ini` keys (friction, damping, `IS_VALID_TRACK`, etc.).
 - **KN5 file format:** the binary structure (header, textures, materials and shader properties, node
@@ -138,6 +150,25 @@ the user is a player, not a modder.
 - `ui_track.json`: name, length, tags, geotags (lat/lon), country, run (A→B), pitboxes.
 - Pit/start positions for a point-to-point run (start grid at A), `cameras.ini` for replays.
 
+### H. Bot cars: traffic and touge battles
+- **AI line generation:** produce `fast_lane.ai` (and `pit_lane.ai` if needed) from the road
+  centreline. Cover the racing line, speed profile from curvature and grade, and the left/right
+  boundaries the AI uses. Fallback: record it in game with the AI-line recording tools in AC or Content
+  Manager on the user's PC, and document the exact steps.
+- **Point-to-point limits:** can vanilla AC run a *race* session with AI on an A→B track, or only
+  hotlap/time attack? What does CSP add? Workarounds if needed: generate an out-and-back layout, a
+  loop variant, or a touge layout where both cars start side by side at A and finish at B.
+- **Traffic:** how traffic works in (a) CSP offline (for example its traffic/"new AI" features and the
+  Traffic Planner tool), and (b) AssettoServer's AI traffic for multiplayer (lane splines,
+  `fast_lane.ai`-based splines, two-way traffic, spawn density). What data does each need from the
+  track (lanes in both directions, junctions, lane widths from OSM `lanes` tags), and can we
+  generate it automatically?
+- **Touge battle AI:** what controls exist for AI aggression and driving style (AI level, `ai_hints.ini`,
+  CSP AI tweaks, Lua scripting)? Is a **drifting AI** possible, and how? Look at existing community
+  drift-AI or Lua-controlled car projects. Recommend a realistic path: start with a fast grip-driving
+  AI opponent, then make drifting a stretch goal with its own research spike.
+- What the user installs for each option (CSP version, AssettoServer, Content Manager settings).
+
 ### F. Product and infrastructure (later phase: website)
 - Frontend stack: Leaflet or MapLibre with CARTO dark tiles. Cover the pin UX (drag, undo,
   reverse, clear), place search (Nominatim or Photon, respecting usage policies) and live route
@@ -165,7 +196,7 @@ Structure it like this:
    `pins → route → elevation → geometry → kn5 + data files → AI line → zip`.
 3. **Tech stack**, with the reason for each choice.
 4. **Repository layout** (directories and modules).
-5. **Detailed design** for sections A–G above, including file formats with field-level detail
+5. **Detailed design** for sections A–H above, including file formats with field-level detail
    wherever you found authoritative sources. Cite links.
 6. **Milestones.** Each milestone is shippable, with concrete acceptance tests. For example:
    - **M0 (spike):** prove we can write a KN5 that AC loads: a flat test strip with a start
@@ -174,11 +205,16 @@ Structure it like this:
      outputs a track folder in `content/tracks` with the real road shape, **real elevation, terrain and
      walls**, and working A→B timing. The test routes are Gorges d'Ollioules D N8 (France, Copernicus)
      and the 3.6 km Aurora IL route above (3DEP).
-   - **M2:** a generated AI line, so AI opponents and the ideal-line assist work.
-   - **M3:** a local map picker (a small web page served by the tool) with pins, a route preview
+   - **M2:** a generated AI line, so the ideal-line assist works and an AI car can drive the road from
+     A to B in game.
+   - **M3:** touge battle v1: race one AI opponent down the road (grip driving is fine).
+   - **M4:** traffic cars on the road (two-way), via CSP and/or AssettoServer, whichever the
+     research recommends.
+   - **M5:** a local map picker (a small web page served by the tool) with pins, a route preview
      and a Build button.
-   - **M4:** procedural scenery (trees, grass, buildings).
-   - **M5 (later):** a hosted website with accounts, "Your builds" and email delivery.
+   - **M6:** procedural scenery (trees, grass, buildings).
+   - **Stretch:** Initial D-style drifting AI for touge battles.
+   - **Later:** a hosted website with accounts, "Your builds" and email delivery.
 7. **Testing strategy.** Unit tests for geometry and format writers, round-trip tests that read the
    KN5 back with an independent parser, golden files, and a manual in-game checklist.
 8. **Risks and open questions**, ranked, each with a fallback (for example "a direct KN5 writer turns out to be
