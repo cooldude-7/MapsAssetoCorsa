@@ -150,25 +150,6 @@ the user is a player, not a modder.
 - `ui_track.json`: name, length, tags, geotags (lat/lon), country, run (A→B), pitboxes.
 - Pit/start positions for a point-to-point run (start grid at A), `cameras.ini` for replays.
 
-### H. Bot cars: traffic and touge battles
-- **AI line generation:** produce `fast_lane.ai` (and `pit_lane.ai` if needed) from the road
-  centreline. Cover the racing line, speed profile from curvature and grade, and the left/right
-  boundaries the AI uses. Fallback: record it in game with the AI-line recording tools in AC or Content
-  Manager on the user's PC, and document the exact steps.
-- **Point-to-point limits:** can vanilla AC run a *race* session with AI on an A→B track, or only
-  hotlap/time attack? What does CSP add? Workarounds if needed: generate an out-and-back layout, a
-  loop variant, or a touge layout where both cars start side by side at A and finish at B.
-- **Traffic:** how traffic works in (a) CSP offline (for example its traffic/"new AI" features and the
-  Traffic Planner tool), and (b) AssettoServer's AI traffic for multiplayer (lane splines,
-  `fast_lane.ai`-based splines, two-way traffic, spawn density). What data does each need from the
-  track (lanes in both directions, junctions, lane widths from OSM `lanes` tags), and can we
-  generate it automatically?
-- **Touge battle AI:** what controls exist for AI aggression and driving style (AI level, `ai_hints.ini`,
-  CSP AI tweaks, Lua scripting)? Is a **drifting AI** possible, and how? Look at existing community
-  drift-AI or Lua-controlled car projects. Recommend a realistic path: start with a fast grip-driving
-  AI opponent, then make drifting a stretch goal with its own research spike.
-- What the user installs for each option (CSP version, AssettoServer, Content Manager settings).
-
 ### F. Product and infrastructure (later phase: website)
 - Frontend stack: Leaflet or MapLibre with CARTO dark tiles. Cover the pin UX (drag, undo,
   reverse, clear), place search (Nominatim or Photon, respecting usage policies) and live route
@@ -187,6 +168,25 @@ the user is a player, not a modder.
 - DEM licences (USGS public domain, Copernicus attribution terms).
 - Kunos/AC trademark use: a compatibility statement only, and never ship Kunos assets (cars,
   textures, shaders from the game files).
+
+### H. Bot cars: traffic and touge battles
+- **AI line generation:** produce `fast_lane.ai` (and `pit_lane.ai` if needed) from the road
+  centreline. Cover the racing line, speed profile from curvature and grade, and the left/right
+  boundaries the AI uses. Fallback: record it in game with the AI-line recording tools in AC or Content
+  Manager on the user's PC, and document the exact steps.
+- **Point-to-point limits:** can vanilla AC run a *race* session with AI on an A→B track, or only
+  hotlap/time attack? What does CSP add? Workarounds if needed: generate an out-and-back layout, a
+  loop variant, or a touge layout where both cars start side by side at A and finish at B.
+- **Traffic:** how traffic works in (a) CSP offline (for example its traffic/"new AI" features and the
+  Traffic Planner tool), and (b) AssettoServer's AI traffic for multiplayer (lane splines,
+  `fast_lane.ai`-based splines, two-way traffic, spawn density). What data does each need from the
+  track (lanes in both directions, junctions, lane widths from OSM `lanes` tags), and can we
+  generate it automatically?
+- **Touge battle AI:** what controls exist for AI aggression and driving style (AI level, `ai_hints.ini`,
+  CSP AI tweaks, Lua scripting)? Is a **drifting AI** possible, and how? Look at existing community
+  drift-AI or Lua-controlled car projects. Recommend a realistic path: start with a fast grip-driving
+  AI opponent, then make drifting a stretch goal with its own research spike.
+- What the user installs for each option (CSP version, AssettoServer, Content Manager settings).
 
 ## 5. Deliverable: `docs/PLAN.md`
 
