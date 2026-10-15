@@ -9,10 +9,14 @@ Everything here is format glue that was proven in game at M0 (docs/checklists/M0
 - `spawn_dummy` / `gate_dummies`: local +Z along the road, `_L` on the driver's left
   (`coords.left_of`), verified with dm_t12 (S4, S6).
 - `zip_tracks` packs track folders deterministically (sorted entries, fixed dates and modes).
+- `clear_track_folder` / `install_track` only ever delete a folder drift-maps made (a
+  `.driftmaps` marker, or "drift-maps" in `ui/ui_track.json` tags), unless forced: an id
+  that clashes with a Kunos or mod track must never wipe it.
 """
 
 from __future__ import annotations
 
+import json
 import shutil
 import zipfile
 from collections.abc import Callable, Sequence
@@ -39,9 +43,15 @@ from driftmaps.geometry.primitives import MeshData, MeshFlags, to_kn5_mesh
 __all__ = [
     "DECAL_FLAGS",
     "HIDDEN_WALL_FLAGS",
+    "MARKER_FILE",
+    "MARKER_TEXT",
     "Scene",
+    "TrackFolderError",
+    "check_track_folder",
+    "clear_track_folder",
     "gate_dummies",
     "install_track",
+    "is_driftmaps_track",
     "ks_per_pixel",
     "spawn_dummy",
     "write_ai_files",
@@ -192,12 +202,58 @@ def zip_tracks(track_dirs: Sequence[Path], zip_path: Path) -> Path:
     return zip_path
 
 
-def install_track(track_dir: Path, tracks_root: Path) -> Path:
+# Written into every track folder drift-maps builds; together with the "drift-maps" ui tag it
+# marks a folder that drift-maps may replace.
+MARKER_FILE = ".driftmaps"
+MARKER_TEXT = "Made by drift-maps. drift-maps build/install may replace this folder.\n"
+
+
+class TrackFolderError(FileExistsError):
+    """A track folder of that id exists and was not made by drift-maps."""
+
+
+def is_driftmaps_track(folder: Path) -> bool:
+    """True if `folder` was made by drift-maps (marker file, or the ui_track.json tag)."""
+    folder = Path(folder)
+    if (folder / MARKER_FILE).is_file():
+        return True
+    try:
+        ui = json.loads((folder / "ui" / "ui_track.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return False
+    tags = ui.get("tags") if isinstance(ui, dict) else None
+    return isinstance(tags, list) and "drift-maps" in tags
+
+
+def check_track_folder(folder: Path, *, force: bool = False) -> None:
+    """Raise `TrackFolderError` if `folder` exists and may not be replaced."""
+    folder = Path(folder)
+    if not folder.exists() or force:
+        return
+    if not folder.is_dir() or not is_driftmaps_track(folder):
+        raise TrackFolderError(
+            f"{folder} already exists and was not made by drift-maps (another game or mod "
+            "track?). Refusing to replace it: pick another --id, or pass --force to replace it."
+        )
+
+
+def clear_track_folder(folder: Path, *, force: bool = False) -> None:
+    """Delete an existing track folder before it is rebuilt, but only one drift-maps made
+    (or anything with `force`); otherwise raise `TrackFolderError` and touch nothing."""
+    folder = Path(folder)
+    check_track_folder(folder, force=force)
+    if folder.is_dir() and not folder.is_symlink():
+        shutil.rmtree(folder)
+    elif folder.exists() or folder.is_symlink():
+        folder.unlink()
+
+
+def install_track(track_dir: Path, tracks_root: Path, *, force: bool = False) -> Path:
     """Copy a built track folder into `tracks_root` (an AC `content/tracks` folder), replacing
-    an existing folder of the same id. Returns the installed folder."""
+    an existing folder of the same id only if drift-maps made it (or `force`). Returns the
+    installed folder."""
     track_dir = Path(track_dir)
     dest = Path(tracks_root) / validate_track_id(track_dir.name)
-    if dest.exists():
-        shutil.rmtree(dest)
+    clear_track_folder(dest, force=force)
     shutil.copytree(track_dir, dest)
     return dest

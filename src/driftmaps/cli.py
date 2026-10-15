@@ -162,7 +162,13 @@ def build(
     install: bool = typer.Option(
         False, help="Also copy the track into Assetto Corsa's content/tracks."
     ),
-    splits: int = typer.Option(0, help="Number of intermediate timing splits (AC_TIME_n)."),
+    force: bool = typer.Option(
+        False,
+        help="Replace an existing track folder of that id even if drift-maps did not make it.",
+    ),
+    splits: int = typer.Option(
+        0, min=0, max=1, clamp=True, help="Intermediate timing splits (AC_TIME_0): 0 or 1."
+    ),
     dem: str = typer.Option(
         None, help="Prefer this elevation source (e.g. glo30, hrdem-1m, 3dep-1m)."
     ),
@@ -178,10 +184,29 @@ def build(
     refresh: bool = _REFRESH,
 ) -> None:
     """Build an Assetto Corsa track folder from pins (or a route.json)."""
-    from driftmaps.ac.scene import install_track, zip_tracks
+    from driftmaps.ac.scene import TrackFolderError, check_track_folder, install_track, zip_tracks
+    from driftmaps.ac.track_files import make_track_id, validate_track_id
     from driftmaps.build import BuildOptions, build_track
     from driftmaps.config import find_ac_root, tracks_dir
     from driftmaps.geo.router import Route
+
+    # Refuse to overwrite somebody else's track before any download or build work.
+    tid = validate_track_id(track_id or make_track_id(name))
+    targets = [out / tid]
+    ac_tracks = None
+    if install:
+        root = find_ac_root()
+        if root is None:
+            typer.echo("Assetto Corsa not found; set DRIFTMAPS_AC_ROOT to install.", err=True)
+            raise typer.Exit(1)
+        ac_tracks = tracks_dir(root)
+        targets.append(ac_tracks / tid)
+    try:
+        for target in targets:
+            check_track_folder(target, force=force)
+    except TrackFolderError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(1) from None
 
     if route_json is not None:
         r = Route.load(route_json)
@@ -197,20 +222,14 @@ def build(
         elevation_prefer=dem,
         texture_format="dds" if dds else "png",
         debug_png=debug_png,
+        force=force,
     )
     if dem_file is not None:
-        from driftmaps.elevation.sources import CogSource, SourceInfo
+        from driftmaps.elevation.sources import local_dem_source
 
-        info = SourceInfo(
-            "dem-file",
-            f"Local DEM {dem_file.name}",
-            1.0,
-            "DTM",
-            "user supplied",
-            f"Elevation from the user-supplied file {dem_file.name}.",
-        )
-        options.elevation_sources = {"dem-file": CogSource(info, str(dem_file))}
-        options.elevation_chain = ["dem-file"]
+        source = local_dem_source(dem_file)
+        options.elevation_sources = {source.name: source}
+        options.elevation_chain = [source.name]
     result = build_track(r, out, options)
     typer.echo(result.summary())
     for image in result.debug_images:
@@ -218,9 +237,5 @@ def build(
     if zip_path:
         zip_tracks([result.track_dir], zip_path)
         typer.echo(f"zip      {zip_path}")
-    if install:
-        root = find_ac_root()
-        if root is None:
-            typer.echo("Assetto Corsa not found; set DRIFTMAPS_AC_ROOT to install.", err=True)
-            raise typer.Exit(1)
-        typer.echo(f"install  {install_track(result.track_dir, tracks_dir(root))}")
+    if ac_tracks is not None:
+        typer.echo(f"install  {install_track(result.track_dir, ac_tracks, force=force)}")

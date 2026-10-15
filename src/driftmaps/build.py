@@ -12,17 +12,22 @@ Pipeline (PLAN §5.1-§5.5, docs/research/geo.md §1-§3, ac_format.md §2, §3,
    weight 0 on bridges and tunnels (+10 m), then `road_profile` (smoothing plus hard grade and
    vertical-curvature limits). The source covering most of the road is the reference; points
    that fell through to another source are shifted by the median offset between the two, so a
-   coverage gap cannot leave a step. Heights are relative to the road at A (A sits at Y = 0).
+   coverage gap cannot leave a step. That offset is measured on gentle terrain in the near ring
+   beside the road (not on the road, where a coarse DSM is biased by cuts and trees) and
+   dropped if it is over 2 m. Heights are relative to the road at A (A sits at Y = 0).
 4. **Road, terrain, walls** (`geometry.road`, `.terrain`, `.walls`).
-5. **Dummies and AI**: spawns 1 m above the road (M0 verified), `AC_START_0/1` side by side
-   behind A, `AC_PIT_n` in pairs behind them, `AC_HOTLAP_START_0` further back, A->B gates with
-   `_L` on the driver's left, optional `AC_TIME_n` splits. The AI line follows the centre of
+5. **Dummies and AI**: spawns 1 m above the road (M0 verified), one `AC_START_n` per pit box
+   in side-by-side rows behind A, `AC_PIT_n` in pairs behind them, `AC_HOTLAP_START_0` further
+   back (the run-up grows to fit them), A->B gates with `_L` on the driver's left, at most one
+   `AC_TIME_0` split. Hidden walls reach `height_m` above the higher of the ground and the
+   nearest road, so they hold on fills and bridges too. The AI line follows the centre of
    the driving lane (right in Canada/US/France, left in Japan/UK) from the start of the run-up
    to `ai_past_b_m` past B; the run-off road ends in the corridor's end wall.
 6. **Files** (`ac.track_files`): surfaces (ROAD, GRASS, GRAVEL, DIRT), map, cameras, UI, credits
    (`LICENSE-DATA.txt`, `route_osm.geojson`, `route.json`).
 
-`build_track(route, out_dir, options)` writes `<out_dir>/<track_id>/` and returns a
+`build_track(route, out_dir, options)` writes `<out_dir>/<track_id>/` (replacing an existing
+folder only if drift-maps made it, or with `options.force`) and returns a
 `BuildResult` with the statistics the CLI prints. Same route + same DEM cache -> identical
 bytes (no clocks or random numbers in the output).
 """
@@ -31,7 +36,6 @@ from __future__ import annotations
 
 import functools
 import json
-import shutil
 import time
 import warnings
 from collections.abc import Mapping, Sequence
@@ -50,7 +54,11 @@ from driftmaps.ac.model import Dummy, Kn5, Texture
 from driftmaps.ac.scene import (
     DECAL_FLAGS,
     HIDDEN_WALL_FLAGS,
+    MARKER_FILE,
+    MARKER_TEXT,
     Scene,
+    check_track_folder,
+    clear_track_folder,
     gate_dummies,
     spawn_dummy,
     write_ai_files,
@@ -112,6 +120,22 @@ __all__ = [
 SPAWN_HEIGHT_M = 1.0  # M0 verified (dm_t1, dm_t12): cars drop onto the road
 GATE_EXTRA_M = 5.0  # gate dummies this far beyond the asphalt edge (ac_format.md §2.3)
 GATE_HEIGHT_M = 1.0
+# Spawn grid (distances behind A): first start row, row spacing, gap between the start rows and
+# the pit rows and between the pit rows and the hotlap start, and the road kept behind the
+# hotlap start (before the run-up's end wall).
+GRID_FIRST_M = 6.0
+GRID_ROW_M = 7.0
+GRID_GAP_M = 8.0
+GRID_TAIL_M = 8.0
+MAX_SPLITS = 1  # A->B tracks: one AC_TIME split is verified; more are not
+# Datum offset between DEM sources (geo.md §2): measured on gentle near-ring terrain beside the
+# road. ASSUMED values; real datum differences (CGVD28/2013, EGM2008) are well under 2 m.
+OFFSET_RING_M = (30.0, 60.0, 100.0, 140.0)
+OFFSET_ROAD_CLEAR_M = 20.0
+OFFSET_SLOPE_STEP_M = 10.0
+OFFSET_MAX_SLOPE = 0.15
+OFFSET_MAX_M = 2.0
+M_PER_DEG = 111_320.0
 BRIDGE_WEIGHT_PAD_M = 10.0  # geo.md §2.4: zero elevation weight 10 m beyond bridges/tunnels
 WIDTH_RAMP_M = 30.0  # geo.md §1.5: ramp width changes over 30 m
 # ASSUMED: lodOut far enough that far terrain never pops out inside the corridor.
@@ -174,8 +198,8 @@ class BuildOptions:
     country: str | None = None  # None: from the elevation region (Canada, US, France)
     cache_dir: Path | None = None
     run_up_m: float = 60.0
-    run_off_m: float = 130.0
-    ai_past_b_m: float = 100.0
+    run_off_m: float = 250.0
+    ai_past_b_m: float = 220.0  # AI keeps going this far past B, so it never brakes at the gate
     shoulder_m: float = 1.0
     verge_m: float = 4.0  # walls stand this far beyond the gravel shoulder
     max_deviation_m: float = 1.5
@@ -191,6 +215,7 @@ class BuildOptions:
     elevation_chain: Sequence[str] | None = None
     elevation_prefer: str | Sequence[str] | None = None
     debug_png: bool = True
+    force: bool = False  # replace an existing <id> folder even if drift-maps did not make it
 
 
 @dataclass
@@ -240,6 +265,7 @@ class _Elevation:
         self.offsets: dict[str, float] = {}
         self.info: dict[str, SourceInfo] = {}
         self.coverage: dict[str, float] = {}
+        self._road_lonlat: tuple[np.ndarray, np.ndarray] | None = None
         self._ref: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
 
     def _sample(self, lon: np.ndarray, lat: np.ndarray, chain: Sequence[str] | None = None):
@@ -252,14 +278,51 @@ class _Elevation:
             prefer=self.prefer if chain is None else None,
         )
 
+    def _reference(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(lon, lat, reference height) at gentle-slope terrain points of the near ring beside
+        the road, where datum offsets to other sources are measured. The road itself is left
+        out: a coarse DSM is biased there (cuts, valleys, trees), and that bias must not shift
+        the far terrain or leave a step at the near/far seam."""
+        if self._ref is None:
+            lon, lat = self._road_lonlat
+            lon0, lat0 = float(lon.mean()), float(lat.mean())
+            kx, ky = M_PER_DEG * np.cos(np.radians(lat0)), M_PER_DEG
+            road = np.stack([(lon - lon0) * kx, (lat - lat0) * ky], axis=1)
+            ang = np.arange(8) * (np.pi / 4.0)
+            ring = np.asarray(OFFSET_RING_M)[:, None, None] * np.stack(
+                [np.cos(ang), np.sin(ang)], axis=1
+            )
+            centres = road[:: max(1, len(road) // 300)]
+            cand = (centres[:, None, :] + ring.reshape(1, -1, 2)).reshape(-1, 2)
+            cand = cand[cKDTree(road).query(cand)[0] >= OFFSET_ROAD_CLEAR_M]
+            h = OFFSET_SLOPE_STEP_M
+            stencil = np.array([[0.0, 0.0], [h, 0.0], [-h, 0.0], [0.0, h], [0.0, -h]])
+            pts = (cand[:, None, :] + stencil[None]).reshape(-1, 2)
+            z = self._sample(
+                pts[:, 0] / kx + lon0, pts[:, 1] / ky + lat0, chain=[self.primary]
+            ).heights.reshape(-1, 5)
+            with np.errstate(invalid="ignore"):
+                slope = np.hypot(z[:, 1] - z[:, 2], z[:, 3] - z[:, 4]) / (2.0 * h)
+                ok = np.isfinite(z).all(axis=1) & (slope <= OFFSET_MAX_SLOPE)
+            self._ref = (cand[ok, 0] / kx + lon0, cand[ok, 1] / ky + lat0, z[ok, 0])
+        return self._ref
+
     def _offset(self, name: str) -> float:
         if name == self.primary or not name:
             return 0.0
         if name not in self.offsets:
-            lon, lat, z = self._ref
-            other = self._sample(lon, lat, chain=[name]).heights
+            lon, lat, z = self._reference()
+            other = self._sample(lon, lat, chain=[name]).heights if len(lon) else z
             ok = np.isfinite(other)
-            self.offsets[name] = float(np.median(z[ok] - other[ok])) if ok.any() else 0.0
+            offset = float(np.median(z[ok] - other[ok])) if ok.any() else 0.0
+            if abs(offset) > OFFSET_MAX_M:
+                warnings.warn(
+                    f"elevation source {name} differs from {self.primary} by {offset:+.1f} m on "
+                    "flat ground near the road; that is not a datum shift, so it is not corrected",
+                    stacklevel=2,
+                )
+                offset = 0.0
+            self.offsets[name] = offset
         return self.offsets[name]
 
     def _corrected(self, smp) -> np.ndarray:
@@ -280,9 +343,7 @@ class _Elevation:
         self.primary = str(names[order[0]])
         total = counts.sum()
         self.coverage = {str(n): float(c) / total for n, c in zip(names, counts, strict=True)}
-        sel = np.flatnonzero(smp.source == self.primary)
-        sel = sel[np.linspace(0, len(sel) - 1, min(len(sel), 2000)).astype(int)]
-        self._ref = (lon.ravel()[sel], lat.ravel()[sel], smp.heights[sel])
+        self._road_lonlat = (lon.ravel(), lat.ravel())
         return self._corrected(smp).reshape(lon.shape)
 
     def resolution_m(self) -> float:
@@ -371,7 +432,8 @@ def prepare_geometry(route: Route, options: BuildOptions) -> TrackGeometry:
     raw_length = float(nodes.s[-1])
 
     xz_f, p_f = fillet_corners(*simplify(xz, nodes.s, 0.3))
-    xz_e, p_e = extend_straight(xz_f, p_f, options.run_up_m, options.run_off_m)
+    run_up = max(options.run_up_m, grid_length_m(options.pits) + GRID_TAIL_M)
+    xz_e, p_e = extend_straight(xz_f, p_f, run_up, options.run_off_m)
     xz_s, param = smooth_centreline(
         xz_e,
         p_e,
@@ -470,6 +532,22 @@ def lane_offset(geo: TrackGeometry) -> np.ndarray:
     return _box_smooth(raw, int(WIDTH_RAMP_M))
 
 
+def _grid(pits: int) -> tuple[list[float], list[float], float]:
+    """Distances behind A of the start rows (two cars each, one slot per pit box, at least
+    one row), of the pit rows, and of the hotlap start."""
+    start_rows = (max(2, pits) + 1) // 2
+    starts = [GRID_FIRST_M + GRID_ROW_M * r for r in range(start_rows)]
+    pit0 = starts[-1] + GRID_GAP_M
+    pit_rows = [pit0 + GRID_ROW_M * r for r in range((pits + 1) // 2)]
+    hot = (pit_rows[-1] if pit_rows else starts[-1]) + GRID_GAP_M
+    return starts, pit_rows, hot
+
+
+def grid_length_m(pits: int) -> float:
+    """How far behind A the last spawn (the hotlap start) sits."""
+    return _grid(pits)[2]
+
+
 @dataclass
 class _Dummies:
     nodes: list[Dummy]
@@ -499,25 +577,29 @@ def _dummies(geo: TrackGeometry, options: BuildOptions) -> _Dummies:
             return sign * quarter, -sign * quarter
         return drive, -drive
 
-    # Grid: AC_START_0/1 side by side 6 m behind A, pits in pairs every 7 m behind them,
-    # the hotlap start 4 m behind the last pit row.
-    first = geo.s_a - 6.0
-    rows = (options.pits + 1) // 2
-    hot_s = first - 8.0 - 7.0 * rows - 4.0
+    # Grid: a start slot per pit box (at least 2), side by side in rows every 7 m from 6 m
+    # behind A (the first car of a row on the driving lane), the pits in pairs behind them and
+    # the hotlap start behind those (`grid_length_m`; prepare_geometry sized the run-up).
+    starts, pit_rows, hot = _grid(options.pits)
+    hot_s = geo.s_a - hot
     if hot_s < 3.0:
         raise ValueError("run_up_m is too short for the spawn grid; increase it or use fewer pits")
-    d, o = lanes_at(first)
-    spawn("AC_START_0", first, d)
-    spawn("AC_START_1", first, o)
-    for n in range(options.pits):
-        s = first - 8.0 - 7.0 * (n // 2)
-        d, o = lanes_at(s)
-        spawn(f"AC_PIT_{n}", s, d if n % 2 == 0 else o)
+    n_starts = 2 * len(starts)
+    for prefix, count, rows in (("AC_START", n_starts, starts), ("AC_PIT", options.pits, pit_rows)):
+        for n in range(count):
+            s = geo.s_a - rows[n // 2]
+            d, o = lanes_at(s)
+            spawn(f"{prefix}_{n}", s, d if n % 2 == 0 else o)
     spawn("AC_HOTLAP_START_0", hot_s, lanes_at(hot_s)[0])
 
+    splits = min(max(int(options.splits), 0), MAX_SPLITS)
+    if splits != options.splits:
+        warnings.warn(
+            f"{options.splits} splits asked; A->B tracks get at most {MAX_SPLITS}", stacklevel=2
+        )
     gates: dict[str, float] = {"AC_AB_START": geo.s_a, "AC_AB_FINISH": geo.s_b}
-    for k in range(options.splits):
-        gates[f"AC_TIME_{k}"] = geo.s_a + (k + 1) * geo.length_m / (options.splits + 1)
+    for k in range(splits):
+        gates[f"AC_TIME_{k}"] = geo.s_a + (k + 1) * geo.length_m / (splits + 1)
     for prefix, s in gates.items():
         pos, fwd, left = m.at(s)
         reach = m.interp(m.half_width, s) + GATE_EXTRA_M
@@ -740,10 +822,15 @@ def _geojson(geo: TrackGeometry) -> str:
 
 
 def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None) -> BuildResult:
-    """Build `<out_dir>/<track_id>/` from a route. An existing folder of that id is replaced."""
+    """Build `<out_dir>/<track_id>/` from a route. An existing folder of that id is replaced
+    if drift-maps made it (or `options.force`); otherwise `TrackFolderError` is raised before
+    anything is built."""
     options = options or BuildOptions()
     t0 = time.perf_counter()
     track_id = validate_track_id(options.track_id or make_track_id(options.name))
+    out_dir = Path(out_dir)
+    track_dir = out_dir / track_id
+    check_track_folder(track_dir, force=options.force)  # fail before the slow part
     notes: list[str] = []
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -756,15 +843,19 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
         corridor = corridor_polygon(m, m.outer + options.verge_m)
         lines = wall_lines(corridor)
 
+        centre_tree = cKDTree(m.centre[:, [0, 2]])
+
+        def road_height(xz: np.ndarray) -> np.ndarray:
+            return m.centre[centre_tree.query(xz)[1], 1]
+
         def ground(xz: np.ndarray) -> np.ndarray:
             h = terrain.height_at(xz)
             bad = ~np.isfinite(h)
             if bad.any():
-                _, i = cKDTree(m.centre[:, [0, 2]]).query(xz[bad])
-                h[bad] = m.centre[i, 1]
+                h[bad] = road_height(xz[bad])
             return h
 
-        walls = wall_meshes(lines, ground)
+        walls = wall_meshes(lines, ground, road_fn=road_height)
         dummies = _dummies(geo, options)
         ai, ai_slice = _ai_line(geo, options)
     for w in caught:
@@ -773,12 +864,10 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
     ext = ".dds" if options.texture_format == "dds" else ".png"
     kn5, counts = _assemble_kn5(track_id, roads, terrain, walls, dummies.nodes, ext)
 
-    out_dir = Path(out_dir)
-    track_dir = out_dir / track_id
-    if track_dir.exists():
-        shutil.rmtree(track_dir)
+    clear_track_folder(track_dir, force=options.force)
     data_dir, ui_dir = track_dir / "data", track_dir / "ui"
     track_dir.mkdir(parents=True)
+    (track_dir / MARKER_FILE).write_text(MARKER_TEXT, encoding="utf-8", newline="\n")
     kn5_path = write_kn5(kn5, track_dir / f"{track_id}.kn5")
     write_ai_files(ai, track_dir)
 

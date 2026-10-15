@@ -356,3 +356,30 @@ def test_live_default_chain(tmp_path, lon, lat, source, expected):
     r = sample_elevation([lon], [lat], cache_dir=tmp_path)
     assert r.source[0] == source
     assert r.heights[0] == pytest.approx(expected, abs=0.5)
+
+
+# ---------------------------------------------------------------------------------------------
+# Local DEM files (--dem-file)
+# ---------------------------------------------------------------------------------------------
+
+
+def test_local_dem_source_reads_pixel_size_and_rekeys_when_the_file_changes(tmp_path):
+    import os
+
+    tif = tmp_path / "my_dem.tif"
+    lon, lat = np.array([-80.0 + 5.5 / 3600]), np.array([43.5 - 5.5 / 3600])
+    _write_tif(tif, np.full((32, 32), 100.0), west=-80.0, north=43.5, px=1 / 3600)
+    src = srcmod.local_dem_source(tif)
+    # Geographic pixels are converted to metres: 1 arc-second is ~30.9 m north-south.
+    assert src.info.resolution_m == pytest.approx(30.9, abs=0.2)
+    assert src.sample(lon, lat, tmp_path / "cache")[0] == pytest.approx(100.0)
+    # Same path, new contents: the cache must not hand back the old heights.
+    _write_tif(tif, np.full((32, 32), 250.0), west=-80.0, north=43.5, px=1 / 3600)
+    st = tif.stat()
+    os.utime(tif, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    again = srcmod.local_dem_source(tif)
+    assert again.sample(lon, lat, tmp_path / "cache")[0] == pytest.approx(250.0)
+    # A projected file keeps its own pixel size.
+    utm = tmp_path / "utm.tif"
+    _write_tif(utm, np.zeros((16, 16)), west=500000.0, north=4800000.0, px=2.0, crs="EPSG:32617")
+    assert srcmod.local_dem_source(utm).info.resolution_m == pytest.approx(2.0)

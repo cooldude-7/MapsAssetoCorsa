@@ -72,6 +72,7 @@ __all__ = [
     "WmsSource",
     "default_cache_dir",
     "default_sources",
+    "local_dem_source",
     "region_of",
     "sample_elevation",
     "sample_grid",
@@ -364,10 +365,11 @@ class _Raster:
 
 
 class _CogRaster(_Raster):
-    """A (cloud-optimised) GeoTIFF, local path or https URL, read in its own internal blocks."""
+    """A (cloud-optimised) GeoTIFF, local path or https URL, read in its own internal blocks.
+    `key` (default: the URL) names its cache folder."""
 
-    def __init__(self, url: str, cache_dir: Path) -> None:
-        super().__init__(url, cache_dir)
+    def __init__(self, url: str, cache_dir: Path, key: str | None = None) -> None:
+        super().__init__(key or url, cache_dir)
         self.url = url
 
     def _read_meta(self) -> dict:
@@ -495,14 +497,51 @@ def _guard(src: ElevationSource, fn: Callable[[], FloatArray], n: int) -> FloatA
 
 
 class CogSource(ElevationSource):
-    """A single GeoTIFF/COG (local path or https URL) covering the whole source area."""
+    """A single GeoTIFF/COG (local path or https URL) covering the whole source area.
+    `cache_key` (default: the URL) names its block cache; give a local file one that changes
+    with the file's contents."""
 
-    def __init__(self, info: SourceInfo, url: str) -> None:
+    def __init__(self, info: SourceInfo, url: str, cache_key: str | None = None) -> None:
         super().__init__(info)
         self.url = url
+        self.cache_key = cache_key
 
     def sample(self, lon: FloatArray, lat: FloatArray, cache_dir: Path) -> FloatArray:
-        return _guard(self, lambda: _CogRaster(self.url, cache_dir).sample(lon, lat), len(lon))
+        raster = _CogRaster(self.url, cache_dir, self.cache_key)
+        return _guard(self, lambda: raster.sample(lon, lat), len(lon))
+
+
+def local_dem_source(path: Path | str, name: str = "dem-file") -> CogSource:
+    """A user-supplied GeoTIFF as an elevation source (`drift-maps build --dem-file`).
+
+    The cache key is the resolved path plus the file's size and modification time, so an
+    edited or replaced file is read again. The resolution is the file's real pixel size in
+    metres (the coarser axis; degrees are converted at the raster's centre latitude).
+    """
+    path = Path(path).resolve()
+    st = path.stat()
+    with rasterio.open(path) as ds:
+        rx, ry = abs(float(ds.res[0])), abs(float(ds.res[1]))
+        crs = ds.crs
+        if crs is not None and crs.is_geographic:
+            lat = 0.5 * (ds.bounds.bottom + ds.bounds.top)
+            rx *= 111_320.0 * math.cos(math.radians(lat))
+            ry *= 111_320.0
+        elif crs is not None:
+            try:
+                factor = float(crs.linear_units_factor[1])
+            except Exception:  # noqa: BLE001 - unknown units: assume metres
+                factor = 1.0
+            rx, ry = rx * factor, ry * factor
+    info = SourceInfo(
+        name,
+        f"Local DEM {path.name}",
+        round(max(rx, ry), 3),
+        "DTM",
+        "user supplied",
+        f"Elevation from the user-supplied file {path.name}.",
+    )
+    return CogSource(info, str(path), cache_key=f"{path}|{st.st_size}|{st.st_mtime_ns}")
 
 
 class TiledCogSource(ElevationSource):

@@ -8,7 +8,9 @@ radius from the nearest centreline point. The round caps of the union close both
 road, which gives the end walls behind the run-up and after the run-off.
 
 Walls are double-sided vertical strips (`primitives.wall`) from `depth_m` below the terrain
-to `height_m` above it, cut into ~`chunk_m` pieces named `1WALL_c###`, and are never rendered
+to `height_m` above the higher of the terrain and the nearest road (so they still hold where
+the road runs on a fill or a bridge above the ground they stand on), cut into ~`chunk_m`
+pieces named `1WALL_c###`, and are never rendered
 (ac_format.md §3.2). Multi-level corridors (a bridge over its own road) are not split into
 layers yet: such a crossing would get one merged footprint (rare on touge routes).
 """
@@ -78,14 +80,18 @@ def wall_meshes(
     lines: WallLines,
     ground_fn: Callable[[np.ndarray], np.ndarray],
     *,
+    road_fn: Callable[[np.ndarray], np.ndarray] | None = None,
     height_m: float = 3.0,
     depth_m: float = 1.0,
     chunk_m: float = 100.0,
 ) -> list[MeshData]:
-    """Double-sided wall strips along `lines`, standing on `ground_fn(xz)` heights."""
+    """Double-sided wall strips along `lines`, standing on `ground_fn(xz)` heights and
+    reaching `height_m` above the higher of the ground and `road_fn(xz)` (the nearest road)."""
     out: list[MeshData] = []
     for ring in lines.rings:
         ground = np.asarray(ground_fn(ring), np.float64)
+        top = ground if road_fn is None else np.maximum(ground, road_fn(ring))
+        tall = top + height_m - (ground - depth_m)
         seg = np.linalg.norm(np.diff(ring, axis=0), axis=1)
         s = np.concatenate([[0.0], np.cumsum(seg)])
         count = max(1, math.ceil(s[-1] / chunk_m))
@@ -103,5 +109,5 @@ def wall_meshes(
             base = base[keep]
             if len(base) < 2:
                 continue
-            out.append(wall(base, height_m + depth_m, double_sided=True, u_tile_m=4.0))
+            out.append(wall(base, tall[a : b + 1][keep], double_sided=True, u_tile_m=4.0))
     return out
