@@ -8,7 +8,8 @@ through `BuildOptions` hooks, so nothing touches the network:
 - land cover: class 6 (mixed forest) everywhere;
 - OSM barriers: one guard rail traced 4.5 m right of the centreline over 120 m of the road;
 - guardrails.json: one left-side span (route metres from A);
-- buildings: one house 30 m left of the road and one shed inside the wall corridor (must go).
+- buildings: one house 30 m left of the road, one shed inside the wall corridor and one barn
+  in the forest reaching into the corridor (both must go, and no tree may grow out of them).
 
 The written KN5 is re-read and checked: every scenery mesh is named, sized and flagged right,
 trees stand outside the hidden walls and off the buildings, rails exist only where a source
@@ -29,7 +30,7 @@ from scipy.spatial import cKDTree
 
 from driftmaps.ac.kn5 import read_kn5, validate
 from driftmaps.ac.model import MAX_MESH_VERTICES, Kn5, Mesh
-from driftmaps.build import BuildOptions, BuildResult, build_track
+from driftmaps.build import BuildOptions, BuildResult, _merge_notices, build_track
 from driftmaps.elevation.sources import CogSource, SourceInfo
 from driftmaps.geo.barriers import OsmBarrier
 from driftmaps.geo.buildings import Footprint
@@ -46,6 +47,12 @@ TEST_TERRAIN = TerrainOptions(rings=((15.0, 3.0), (60.0, 8.0), (150.0, 20.0)), n
 TRACK_ID = "dm_forks_scenery"
 RAIL_FROM_A_M = (500.0, 620.0)  # the synthetic OSM guard rail, route metres from A (right)
 USER_SPAN = {"side": "left", "from_m": 200.0, "to_m": 240.0}  # guardrails.json
+
+
+def BARN(route: Route) -> np.ndarray:  # noqa: N802
+    """A barn in the synthetic forest 8-24 m left of the road at 400 m: it reaches into the
+    wall corridor, so it is not drawn, but the canopy over it is its roof, not trees."""
+    return _box(route, 400.0, 16.0, (20.0, 16.0))
 
 
 def _projection(route: Route) -> LocalProjection:
@@ -112,6 +119,7 @@ def scenery_options(route: Route, root: Path, **kw) -> BuildOptions:
     rail = OsmBarrier(1, "guard_rail", _offset_line(route, *RAIL_FROM_A_M, 4.5), {})
     house = Footprint("osm:w1", "osm", _box(route, 700.0, 30.0, (12.0, 9.0)), {"building": "house"})
     shed = Footprint("osm:w2", "osm", _box(route, 900.0, 6.0, (4.0, 3.0)), {"building": "shed"})
+    barn = Footprint("osm:w3", "osm", BARN(route), {"building": "barn"})
     info = SourceInfo(
         "hrdem-fixture",
         "NRCan HRDEM 1 m mosaic (5 m test window)",
@@ -135,7 +143,7 @@ def scenery_options(route: Route, root: Path, **kw) -> BuildOptions:
         canopy_source=synthetic_canopy,
         landcover_source=mixed_forest,
         osm_barriers=[rail],
-        building_footprints=[house, shed],
+        building_footprints=[house, shed, barn],
         guardrails_file=spans,
         debug_png=True,
     )
@@ -200,10 +208,28 @@ def test_summary_and_credits(built):
         assert re.search(rf"^{word}\s", text, re.M), word
     sc = built.stats["scenery"]
     assert sc["trees"]["total"] > 500
-    assert sc["buildings"]["buildings"] == 1  # the shed inside the wall corridor is dropped
+    assert sc["buildings"]["buildings"] == 1  # the shed and the barn (corridor) are dropped
     assert sc["user_spans"] == 1 and sc["osm_barriers"] == 1
     lic = (built.track_dir / "LICENSE-DATA.txt").read_text(encoding="utf-8")
     assert "building data" in lic  # OSM building footprints are credited
+    assert "synthetic" not in lic and "route_osm.geojson" in lic
+    # One credit per source and licence text: OSM once (road + buildings + barriers).
+    bodies = [p.split(": ", 1)[1] for p in lic.split("\n\n") if ": " in p]
+    assert len(bodies) == len(set(bodies))
+    assert lic.count("OpenStreetMap contributors") == 1
+    ogl = "Contains information licensed under the OGL-Canada. Source: NRCan, HRDEM."
+    merged = _merge_notices(
+        [f"Elevation (HRDEM DTM): {ogl}", f"Tree heights (HRDEM DSM): {ogl}", "Land cover: x"]
+    )
+    assert merged == [f"Elevation (HRDEM DTM); Tree heights (HRDEM DSM): {ogl}", "Land cover: x"]
+    # ODbL: the OSM ways used are listed with the route's, buildings and barriers too.
+    geo = json.loads((built.track_dir / "route_osm.geojson").read_text(encoding="utf-8"))
+    uses = {
+        (f["properties"]["use"], f["properties"]["osm_way_id"])
+        for f in geo["features"]
+        if "use" in f["properties"]
+    }
+    assert uses == {("building", 1), ("tree mask", 2), ("tree mask", 3), ("barrier", 1)}
     ui = json.loads((built.track_dir / "ui" / "ui_track.json").read_text())
     assert "Trees" in ui["description"] and "Buildings" in ui["description"]
     assert json.loads((built.track_dir / "guardrails.json").read_text()) == [USER_SPAN]
@@ -224,6 +250,11 @@ def test_trees_stand_outside_the_hidden_walls_and_off_buildings(built):
     for b in built.scenery.buildings:
         inside = shapely.contains_xy(b.polygon.buffer(1.9), trees.xz[:, 0], trees.xz[:, 1])
         assert not inside.any(), b.id
+    # Not drawn, but a real building: no clump of trees where the barn stands.
+    proj = built.geometry.projection
+    e, n = proj.to_enu(*BARN(built.geometry.route).T)
+    barn = shapely.Polygon(np.stack([e, -n], axis=1)).buffer(1.9)
+    assert not shapely.contains_xy(barn, trees.xz[:, 0], trees.xz[:, 1]).any()
     # The synthetic forest is where the trees are: open ground gets none (a tree may sit
     # between crowns, a gap fill, or be pushed up to 3 m out of the road's clearance).
     x, z = trees.xz[:, 0], trees.xz[:, 1]
@@ -237,7 +268,7 @@ def test_rails_only_where_a_source_says_so(built, kn5):
     by_source = {}
     for sp in spans:
         by_source.setdefault(sp.source, []).append(sp)
-    assert set(by_source) == {"osm", "user", "bridge"}
+    assert set(by_source) == {"osm", "user"}  # no invented bridge-approach rails
     (osm,) = by_source["osm"]
     assert osm.side == "right" and osm.kind == "guard_rail"
     assert osm.s0 - geo.s_a == pytest.approx(RAIL_FROM_A_M[0], abs=4.0)
@@ -245,9 +276,6 @@ def test_rails_only_where_a_source_says_so(built, kn5):
     (user,) = by_source["user"]
     assert user.side == "left"
     assert (user.s0 - geo.s_a, user.s1 - geo.s_a) == pytest.approx((200.0, 240.0))
-    for sp in by_source["bridge"]:  # approaches: up to 20 m before/after a deck
-        assert any(abs(sp.s1 - p.s0) < 0.5 or abs(sp.s0 - p.s1) < 0.5 for p in built.scenery.plans)
-        assert sp.length <= 20.0 + 1e-6
     # Every guardrail vertex stands at the shoulder edge, within one of those spans.
     pts = np.concatenate([g.positions.astype(np.float64) for g in meshes(kn5, r"guardrail_")])
     _, i = cKDTree(m.centre[:, [0, 2]]).query(pts[:, [0, 2]])
@@ -329,7 +357,7 @@ def test_density_zero_means_no_trees_and_missing_data_only_warns(forks_route, tm
     assert res.stats["scenery"]["trees"]["total"] == 0
     assert any("OSM guardrails unavailable" in w for w in res.warnings)
     assert any("building footprints unavailable" in w for w in res.warnings)
-    assert {sp.source for sp in res.scenery.spans} == {"user", "bridge"}
+    assert {sp.source for sp in res.scenery.spans} == {"user"}
 
 
 def test_clamp_heights_lowers_only_grid_points(built):
@@ -350,3 +378,101 @@ def test_clamp_heights_lowers_only_grid_points(built):
     assert np.array_equal(out.heights[~lowered], terrain.heights[~lowered])
     assert np.allclose(np.linalg.norm(out.normals, axis=1), 1.0)
     assert clamp_heights(terrain, np.full(len(terrain.heights), np.inf))[1] == 0
+
+
+# --------------------------------------------------------------------------------------------
+# guardrails.json: rebuilds in place, reversed builds; the CLI
+# --------------------------------------------------------------------------------------------
+
+FAST = dict(trees=False, buildings=False, debug_png=False)
+
+
+def test_rebuild_in_place_keeps_the_users_guardrails(forks_route, tmp_path):
+    """guardrails.json kept next to route.json INSIDE the track folder survives a rebuild over
+    that folder (it used to be deleted with the old folder, and then the copy crashed)."""
+    out = tmp_path / "out"
+    first = build_track(forks_route, out, scenery_options(forks_route, tmp_path, **FAST))
+    user_file = first.track_dir / "guardrails.json"
+    raw = b"\xef\xbb\xbf" + json.dumps({"guardrails": [USER_SPAN]}, indent=2).encode()  # + BOM
+    user_file.write_bytes(raw)
+    opts = scenery_options(
+        forks_route, tmp_path, guardrails_file=user_file, bridge_approach_rails=True, **FAST
+    )
+    res = build_track(Route.load(first.track_dir / "route.json"), out, opts)
+    assert user_file.read_bytes() == raw
+    # Asked for: invented approach rails, up to 20 m before/after each railed deck.
+    by_source = {}
+    for sp in res.scenery.spans:
+        by_source.setdefault(sp.source, []).append(sp)
+    assert set(by_source) == {"osm", "user", "bridge"}
+    for sp in by_source["bridge"]:
+        assert any(abs(sp.s1 - p.s0) < 0.5 or abs(sp.s0 - p.s1) < 0.5 for p in res.scenery.plans)
+        assert sp.length <= 20.0 + 1e-6
+
+
+def _reverse_via_cli(forks_route, tmp_path, monkeypatch) -> BuildResult:
+    import dataclasses
+
+    from typer.testing import CliRunner
+
+    import driftmaps.build as build_mod
+    from driftmaps import cli
+
+    route_json = tmp_path / "routes" / "route.json"
+    forks_route.save(route_json)
+    (route_json.parent / "guardrails.json").write_text(json.dumps([USER_SPAN]), encoding="utf-8")
+    base = scenery_options(forks_route, tmp_path, **FAST)
+    monkeypatch.setattr(build_mod, "BuildOptions", lambda **kw: dataclasses.replace(base, **kw))
+    results = []
+    real = build_mod.build_track
+    monkeypatch.setattr(build_mod, "build_track", lambda *a: results.append(real(*a)) or results[0])
+    args = ["build", "--route", str(route_json), "--name", "Rev", "--id", "dm_forks_rev",
+            "--reverse", "--offline", "--no-trees", "--no-buildings", "--no-debug-png",
+            "--cache-dir", str(tmp_path / "cache"), "--out", str(tmp_path / "out")]  # fmt: skip
+    res = CliRunner().invoke(cli.app, args)
+    assert res.exit_code == 0, res.output
+    return results[0]
+
+
+def test_cli_reverse_build_mirrors_the_users_guardrails(forks_route, tmp_path, monkeypatch):
+    """guardrails.json is measured as driven along route.json; `--reverse` drives from B, so
+    the left rail 200-240 m from A is on the right, 200-240 m before the new B."""
+    res = _reverse_via_cli(forks_route, tmp_path, monkeypatch)
+    geo = res.geometry
+    (user,) = [sp for sp in res.scenery.spans if sp.source == "user"]
+    length = geo.length_m
+    assert user.side == "right"
+    assert (user.s0 - geo.s_a, user.s1 - geo.s_a) == pytest.approx((length - 240, length - 200))
+    # The copy next to the reversed route.json says it is measured the other way.
+    copy = json.loads((res.track_dir / "guardrails.json").read_text(encoding="utf-8"))
+    assert copy == {"reversed": True, "guardrails": [USER_SPAN]}
+    again = build_track(
+        Route.load(res.track_dir / "route.json"),
+        tmp_path / "again",
+        scenery_options(
+            forks_route, tmp_path, guardrails_file=res.track_dir / "guardrails.json", **FAST
+        ),
+    )
+    (user2,) = [sp for sp in again.scenery.spans if sp.source == "user"]
+    assert (user2.side, user2.s0, user2.s1) == pytest.approx(("right", user.s0, user.s1))
+
+
+def test_cli_prints_the_zip_size_and_stops_big_zips(tmp_path, capsys):
+    import typer
+
+    from driftmaps.cli import ZIP_ERROR_MB, ZIP_WARN_MB, check_zip_size
+
+    def zip_of(mb: float):
+        path = tmp_path / f"{mb}.zip"
+        with path.open("wb") as f:
+            f.truncate(int(mb * 1e6))
+        return path
+
+    assert check_zip_size(zip_of(3.2)) == pytest.approx(3.2)
+    out = capsys.readouterr()
+    assert "(3.2 MB)" in out.out and not out.err
+    check_zip_size(zip_of(ZIP_WARN_MB))
+    assert "warning" in capsys.readouterr().err
+    with pytest.raises(typer.Exit):
+        check_zip_size(zip_of(ZIP_ERROR_MB))
+    assert "error" in capsys.readouterr().err

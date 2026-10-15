@@ -278,6 +278,62 @@ def test_exclude_geometry_removes_trees(synthetic_trees):
     assert len(t) < len(synthetic_trees)
 
 
+def test_roofs_are_masked_before_the_tree_top_search():
+    """A tall flat roof (a building the lidar sees as 20 m "canopy") must not hide the real
+    tree top next to it: inside `exclude` the CHM is bare ground before the search."""
+    house = (100.0, 112.0, 40.0, 52.0)  # x0, x1, z0, z1
+    tree = (106.0, 54.6, 16.0, 3.5)  # top 2.6 m beyond the house, outside the 2 m buffer
+    base = _synthetic_chm()
+
+    def chm(xz):
+        out = base(xz)
+        x, z = xz[:, 0], xz[:, 1]
+        cx, cz, h, r = tree
+        r2 = ((x - cx) ** 2 + (z - cz) ** 2) / r**2
+        out = np.maximum(out, np.where(r2 < 1, h * (1 - r2), 0.0))
+        x0, x1, z0, z1 = house
+        out[(x >= x0) & (x <= x1) & (z >= z0) & (z <= z1)] = 20.0
+        return out
+
+    footprint = shapely.box(house[0], house[2], house[1], house[3]).buffer(2.0)
+    t = place_trees(_road(), chm, seed=3, options=FAST, exclude=footprint)
+    assert not shapely.contains_xy(footprint, t.xz[:, 0], t.xz[:, 1]).any()
+    d, i = _nearest(t, tree[0], tree[1])
+    assert d < 1.5 and t.source[i] == 0 and t.height[i] > 14.0  # the real top, found
+
+
+def test_low_crowns_stop_at_the_hidden_walls():
+    """Conifers have foliage down to the ground: their cards (after the aspect clamp) must not
+    reach the wall line, `clearance_m - wall_margin_m` beyond the footprint edge (|z| = 4)."""
+    rows = [(x, side * z, 16.0, 4.0) for x in range(-260, 261, 40) for side in (1, -1)
+            for z in (9.0, 10.5)]  # fmt: skip
+    crowns = np.array(rows)
+
+    def chm(xz):
+        x, z = xz[:, 0], xz[:, 1]
+        out = np.zeros(len(xz))
+        for cx, cz, h, r in crowns:
+            r2 = ((x - cx) ** 2 + (z - cz) ** 2) / r**2
+            out = np.maximum(out, np.where(r2 < 1, h * (1 - r2), 0.0))
+        return out
+
+    opts = VegetationOptions(far_m=150.0, clearance_m=4.5)  # the build's: walls 4 m out
+    needleleaf = lambda xz: np.full(len(xz), 1, np.uint8)  # noqa: E731
+    t = place_trees(_road(False), chm, landcover=needleleaf, seed=2, options=opts)
+    low = t.kind != DECIDUOUS
+    assert low.sum() >= 20
+    wall = 4.0 + 4.0  # |z| of the wall line: footprint edge + clearance - wall margin
+    meshes = tree_meshes(t.subset(low), _ground)
+    pos = np.concatenate([m.data.positions for m in meshes]).reshape(-1, 4, 3)
+    trunk = 0.5 * (pos[:, 0, [0, 2]] + pos[:, 1, [0, 2]])
+    owner = cKDTree(t.subset(low).xz).query(trunk)[1]
+    fill = np.array([tt.fill for tt in TREE_TILES])[t.subset(low).tile[owner]]
+    half = fill[:, None, None] * (pos[:, :2][:, :, [0, 2]] - trunk[:, None, :])  # visible
+    edge = np.abs(trunk[:, None, 1] + half[..., 1])
+    assert edge.min() >= wall - 0.05  # foliage stops at the wall line
+    assert np.all(np.abs(t.xz[low, 1]) - t.reach[low] >= wall - 1e-9)
+
+
 def test_land_cover_decides_the_kind():
     chm = _synthetic_chm(far_forest=True)
     opts = VegetationOptions(far_m=260.0, far_keep=1.0)
@@ -548,9 +604,29 @@ def test_cards_stand_on_the_terrain_with_the_tree_height():
     assert np.array_equal(np.bincount(owner, minlength=len(trees)), k)
     assert np.allclose(pos[:, 2, 1], base[owner] + trees.height[owner], atol=0.01)  # top
     assert np.allclose(pos[:, 3, 1], base[owner] + trees.height[owner], atol=0.01)
-    corner_ground = _ground(pos[:, :2][:, :, [0, 2]].reshape(-1, 2)).reshape(-1, 2)
     assert (pos[:, :2, 1] <= base[owner, None] - 0.3 + 1e-9).all()  # never floats at the trunk
-    assert (pos[:, :2, 1] <= corner_ground - 0.3 + 0.01).all()  # nor at its corners
+    # Rectangular: a bottom corner over lower ground drops at most 0.5 m more.
+    assert (pos[:, :2, 1] >= base[owner, None] - 0.3 - 0.5 - 1 / 64).all()
+
+
+def test_cards_on_a_steep_slope_stay_rectangular():
+    """On a 1:1 slope a card follows the ground at neither corner: its bottom stays at the
+    trunk base (the trunk is not buried), a corner drops at most `max_corner_drop_m`."""
+    trees = _one_cell(_mesh_trees(), 20)
+
+    def slope(xz):
+        return 1.0 * xz[:, 0]
+
+    opts = TreeMeshOptions(cell_m=10_000.0)
+    (mesh,) = tree_meshes(trees, slope, options=opts)  # one cell: all trees have x, z > 0
+    pos = mesh.data.positions.reshape(-1, 4, 3)
+    mid = 0.5 * (pos[:, 0, [0, 2]] + pos[:, 1, [0, 2]])
+    owner = cKDTree(trees.xz).query(mid)[1]
+    trunk_y = slope(trees.xz)[owner] - opts.sink_m
+    bottom = pos[:, :2, 1]
+    assert (bottom <= trunk_y[:, None] + 1e-9).all()
+    assert (bottom >= trunk_y[:, None] - 0.5 - 1 / 64).all()  # max_corner_drop_m
+    assert (np.abs(pos[:, 0, [0, 2]] - pos[:, 1, [0, 2]]).max(axis=1) > 1.0).all()  # wide cards
 
 
 def test_tree_meshes_split_big_cells_and_drop_trees_without_ground():

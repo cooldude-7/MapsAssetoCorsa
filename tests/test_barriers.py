@@ -217,6 +217,11 @@ def test_user_spans_are_route_distances_from_a(tmp_path):
     assert load_user_spans(tmp_path / "guardrails.json") == []
     (tmp_path / "guardrails.json").write_text(json.dumps(data), encoding="utf-8")
     assert len(load_user_spans(tmp_path / "guardrails.json", s_origin=60.0)) == 2
+    # Windows editors save UTF-8 with a BOM.
+    bom = tmp_path / "bom" / "guardrails.json"
+    bom.parent.mkdir()
+    bom.write_bytes(b"\xef\xbb\xbf" + json.dumps(data).encode("utf-8"))
+    assert load_user_spans(bom, s_origin=60.0) == spans
     for bad in (
         [{"side": "middle", "from_m": 0, "to_m": 5}],
         [{"side": "left", "from_m": 3, "to_m": 3}],
@@ -226,6 +231,26 @@ def test_user_spans_are_route_distances_from_a(tmp_path):
     ):
         with pytest.raises(ValueError):
             parse_user_spans(bad)
+
+
+def test_user_spans_are_mirrored_for_the_other_direction(tmp_path):
+    """Spans are measured as driven along route.json; a --reverse build (or a file that says
+    "reversed") swaps the sides and measures from the other end."""
+    data = [{"side": "left", "from_m": 100, "to_m": 150}]
+    same = parse_user_spans(data, s_origin=60.0, reverse=False, length_m=1000.0)
+    assert [(sp.side, sp.s0, sp.s1) for sp in same] == [("left", 160.0, 210.0)]
+    rev = parse_user_spans(data, s_origin=60.0, reverse=True, length_m=1000.0)
+    assert [(sp.side, sp.s0, sp.s1) for sp in rev] == [("right", 910.0, 960.0)]
+    flagged = {"reversed": True, "guardrails": data}
+    assert parse_user_spans(flagged, s_origin=60.0, reverse=True, length_m=1000.0) == same
+    assert parse_user_spans(flagged, s_origin=60.0, length_m=1000.0) == rev
+    path = tmp_path / "guardrails.json"
+    path.write_text(json.dumps(flagged), encoding="utf-8")
+    assert load_user_spans(path, s_origin=60.0, reverse=True, length_m=1000.0) == same
+    with pytest.raises(ValueError):
+        parse_user_spans(data, reverse=True)  # mirroring needs the length
+    with pytest.raises(ValueError):
+        parse_user_spans({"reversed": "yes", "guardrails": data})
 
 
 # --------------------------------------------------------------------------------------------
@@ -241,6 +266,7 @@ def cliff(xz: np.ndarray) -> np.ndarray:
 def test_nothing_is_invented_by_default():
     m = straight()
     assert plan_barriers(m) == []
+    assert plan_barriers(m, bridges=[(100.0, 140.0)]) == []  # no approach rails either
     # The opt-in heuristic does see the drop on the left, but only when asked for.
     found = drop_off_spans(m, cliff)
     assert [(sp.side, sp.source) for sp in found] == [("left", "heuristic")]
@@ -254,7 +280,7 @@ def test_plan_priorities_bridges_and_approaches():
     bridges = [(200.0, 240.0)]
     osm = [BarrierSpan("right", 100.0, 220.0, source="osm", osm_id=9)]
     user = [BarrierSpan("right", 150.0, 170.0, "jersey_barrier", "user")]
-    plan = plan_barriers(m, osm=osm, user=user, bridges=bridges)
+    plan = plan_barriers(m, osm=osm, user=user, bridges=bridges, approach_m=20.0)
     got = [(sp.side, sp.s0, sp.s1, sp.kind, sp.source) for sp in plan]
     assert got == [
         ("left", 180.0, 200.0, "guard_rail", "bridge"),

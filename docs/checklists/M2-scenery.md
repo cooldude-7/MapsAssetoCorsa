@@ -10,10 +10,12 @@ asked for:
   building outlines, at their real (lidar) height.
 - **Real bridges** instead of floating road sheets: a concrete deck, concrete side walls you
   can hit, solid ends (abutments) and support columns (piers) on the long one. The ground under
-  a bridge is now the real creek valley.
+  a bridge is now the real creek valley. Small culverts at ground level are just road (no side
+  walls).
 - **Guardrails only where they really are.** No map we can use shows guardrails on these roads
-  (OpenStreetMap has none), so you get rails only next to each bridge for now. **Tell us where
-  the real ones are** (section 5) and the next build will have them.
+  (OpenStreetMap has none), so there are **no guardrails** for now; only the bridges have their
+  concrete side walls. **Tell us where the real ones are** (section 5) and the next build will
+  have exactly those.
 
 You need: Assetto Corsa on Windows, Content Manager (CM), Custom Shaders Patch (CSP), and
 about 45 minutes. At the end there is a reply template you can copy and fill in.
@@ -29,17 +31,21 @@ about 45 minutes. At the end there is a reply template you can copy and fill in.
   From some angles you may see that they are flat.
 - Trees stop about 400 m from the road, and beyond 150 m there are fewer, bigger ones.
 - Right beside the road (about 5 m past the gravel) there are no tree trunks. That's where the
-  invisible walls are, and it keeps you from ever driving through a tree. Branches still hang
+  invisible walls are, and it keeps you from ever driving through a tree. Evergreens and
+  bushes stop at the invisible walls too; only the high branches of tall leafy trees still hang
   over the road.
 - Buildings are simple shapes (walls and a flat or pitched roof) with painted-on windows and
   doors. No signs, mailboxes, fences, power lines or road signs yet.
-- Guardrails are only on the 20 m before and after each bridge (see section 5).
+- No guardrails anywhere yet (no map has them; see section 5). Bridges have concrete side
+  walls; the small ground-level culverts don't.
 - The walls are still invisible.
 
 > For the developers: built with `uv run drift-maps build --route out/ontario/<id>/route.json
 > --name "<name>" --id <id> --out out/ontario_v2 --zip out/send_v2/drift-maps-<name>.zip`
-> (default scenery: trees, buildings, guardrails on, `--scenery-density 1`). Ids unchanged,
-> so the install replaces the M1 folders. Debug images (trees, buildings, rails, bridges,
+> (default scenery: trees, buildings, guardrails on, `--scenery-density 1`; guardrails come
+> only from OSM or a `guardrails.json` next to `route.json`, spans as driven A->B in that
+> route's direction; invented bridge-approach rails only with `--bridge-approach-rails`). Ids
+> unchanged, so the install replaces the M1 folders. Debug images (trees, buildings, rails, bridges,
 > distance ticks every 250 m from A): `out/ontario_v2/debug/`. Per-track stats are in the
 > build output (`trees`, `houses`, `rails`, `bridge` lines).
 
@@ -102,26 +108,23 @@ or replay camera) and look at it from the side and from below if you can.
 - [ ] **Ground under the bridge** looks like the real creek valley; no ground poking up
       through the deck or the road.
 - [ ] **Driving over is smooth:** no bump where the bridge starts or ends.
-- [ ] **Forks culverts** (around 2.6 and 2.8 km): short concrete walls on both sides, nothing
-      odd.
+- [ ] **Forks culverts** (around 2.6 and 2.8 km): just road at ground level, no side walls,
+      nothing odd (no bump, no hole).
 - [ ] The real bridges: do they have **concrete walls** (like ours) or **steel railings**? Do
-      the real roads have **guardrails on the bridge approaches** (we put 20 m on each side)?
+      the real roads have **guardrails on the bridge approaches** (we put none)?
 
 ---
 
 ## 5. Guardrails: where are the real ones?
 
-Our tracks now have rails only next to the bridges. You know these roads: please tell us
-where the **real** guardrails are, so we can add exactly those.
+Our tracks have no guardrails now (only the bridges' concrete side walls). You know these
+roads: please tell us where the **real** guardrails are, so we can add exactly those.
 
 For each stretch, write: which track, which side **when driving from the start (A) to the
 finish (B)**, and where it starts and ends, any way you can describe it (for example
 "Snake Road, right side, from the sharp left to about 200 m before the bridge" or "Sydenham,
 both sides, the whole first steep climb"). Rough is fine; we convert it into a small
 `guardrails.json` file for each track.
-
-- [ ] Also check: the rails we added at the bridges stand at the edge of the gravel, look
-      like a W-shaped steel rail on posts, and you bounce off them.
 
 ---
 

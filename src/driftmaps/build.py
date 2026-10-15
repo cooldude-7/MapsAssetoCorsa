@@ -26,12 +26,14 @@ Pipeline (PLAN §5.1-§5.5, docs/research/geo.md §1-§3, ac_format.md §2, §3,
 6. **Scenery** (M2, docs/research/scenery.md §7), every part optional (`trees`, `buildings`,
    `guardrails`) and failing soft (a download error becomes a warning, never a failed build):
    - **Bridges** (`geometry.bridges`, always): deck slab, concrete parapets with hidden
-     collision, abutments and piers under every OSM bridge span. The terrain under a deck is
-     the real lidar ground, kept `TerrainOptions.bridge_clearance_m` below the road and, as a
-     safety net, clamped under `bridges.deck_ceiling` (no terrain through a deck).
+     collision, abutments and piers under every OSM bridge span; an at-grade culvert (solid,
+     or deck under 2 m above the ground) is just road, without parapets. The terrain under a
+     deck is the real lidar ground, kept `TerrainOptions.bridge_clearance_m` below the road
+     and, as a safety net, clamped under `bridges.deck_ceiling` (no terrain through a deck).
    - **Guardrails** (`geo.barriers`, `geometry.barriers`): only real ones: OSM
-     `barrier=guard_rail|jersey_barrier|wall|retaining_wall` beside the road, the user's
-     `guardrails.json` (`guardrails_file`), and rails on bridge approaches.
+     `barrier=guard_rail|jersey_barrier|wall|retaining_wall` beside the road and the user's
+     `guardrails.json` (`guardrails_file`). Rails on bridge approaches are invented (no
+     source), so only with `bridge_approach_rails`.
    - **Buildings** (`geo.buildings`, `geometry.buildings`): OSM + Microsoft footprints, lidar
      heights, outside the wall corridor.
    - **Trees** (`geometry.vegetation`): lidar tree tops (DSM - DTM) with NRCan land cover
@@ -40,8 +42,9 @@ Pipeline (PLAN §5.1-§5.5, docs/research/geo.md §1-§3, ac_format.md §2, §3,
    All of it goes into the one KN5 (tree and building atlases as DDS); the trees' and
    buildings' data sources are credited in LICENSE-DATA.txt.
 7. **Files** (`ac.track_files`): surfaces (ROAD, GRASS, GRAVEL, DIRT), map, cameras, UI, credits
-   (`LICENSE-DATA.txt`, `route_osm.geojson`, `route.json`, and `guardrails.json` if one was
-   used).
+   (`LICENSE-DATA.txt`, `route_osm.geojson` with the OSM road, building and barrier ways used,
+   `route.json`, and `guardrails.json` if one was used: its bytes are read before the old
+   track folder is cleared, so a file kept inside the track folder survives a rebuild).
 
 `build_track(route, out_dir, options)` writes `<out_dir>/<track_id>/` (replacing an existing
 folder only if drift-maps made it, or with `options.force`) and returns a
@@ -54,7 +57,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 import json
-import shutil
 import time
 import urllib.error
 import warnings
@@ -129,6 +131,7 @@ from driftmaps.geo.barriers import (
     match_barriers,
 )
 from driftmaps.geo.buildings import (
+    OSM_BUILDINGS_ATTRIBUTION,
     BuildingFootprints,
     Footprint,
     fetch_buildings,
@@ -158,7 +161,6 @@ from driftmaps.geometry.buildings import (
     Building,
     BuildingStats,
     building_scene,
-    buildings_polygon,
     place_buildings,
 )
 from driftmaps.geometry.primitives import MeshData, split
@@ -302,12 +304,16 @@ class BuildOptions:
     elevation_prefer: str | Sequence[str] | None = None
     debug_png: bool = True
     force: bool = False  # replace an existing <id> folder even if drift-maps did not make it
-    # Scenery (M2). Bridges always get their structure and parapets.
+    # Scenery (M2). Bridges always get their structure (parapets: all but at-grade culverts).
     trees: bool = True
     buildings: bool = True
-    guardrails: bool = True  # OSM barriers, guardrails.json and bridge-approach rails
+    guardrails: bool = True  # OSM barriers and guardrails.json (only real ones)
+    bridge_approach_rails: bool = False  # also invent rails on bridge approaches (no source)
     scenery_density: float = 1.0  # scales the tree budget (0 = no trees, 2 = twice the cap)
     guardrails_file: Path | None = None  # user spans (route metres from A); see geo.barriers
+    # The route is route.json driven the other way (--reverse): guardrails.json spans, measured
+    # in route.json's direction, are mirrored (left <-> right, s -> length - s).
+    route_reversed: bool = False
     microsoft_buildings: bool = True  # add Microsoft footprints where OSM has none
     offline: bool = False  # scenery downloads (Overpass, Microsoft) come from the cache only
     bridge: BridgeOptions = field(default_factory=BridgeOptions)
@@ -367,6 +373,7 @@ class BuildResult:
                     f"bridge   {b['length_m']:.0f} m at {b['from_a_m']:.0f} m from A, deck up to "
                     f"{b['max_height_m']:.1f} m above ground, {b['piers']} piers"
                     + (" (solid: culvert/embankment)" if b["solid"] else "")
+                    + ("" if b["railing"] else ", no parapets (at-grade culvert)")
                 )
             if sc["deck_intrusion_m"] > DECK_TOLERANCE_M:
                 lines.append(f"warning  terrain {sc['deck_intrusion_m']:.2f} m into a bridge deck")
@@ -941,7 +948,7 @@ def _assemble_kn5(
 # car can never reach a tree card, which has no collision (scenery.md §4.1).
 TREE_WALL_MARGIN_M = 0.5
 DECK_TOLERANCE_M = 0.05  # terrain grazing a deck by less than this is not reported
-APPROACH_RAIL_M = 20.0  # guard rail on both sides this far before and after each bridge
+APPROACH_RAIL_M = 20.0  # opt-in rails on both sides this far before and after each bridge
 BUILDINGS_AROUND_M = 150.0  # footprints this close to the road (= BuildingOptions.max_distance_m)
 _DATA_ERRORS = (OverpassError, SourceUnavailable, OSError, urllib.error.URLError, EOFError)
 
@@ -958,8 +965,11 @@ class _Scenery:
     footprints: BuildingFootprints | None = None
     attributions: list[str] = field(default_factory=list)
     osm_barriers: int = 0
+    osm_barrier_ways: list[OsmBarrier] = field(default_factory=list)  # matched to the road
+    footprints_masked: bool = False  # every fetched footprint kept trees off (tree mask)
     user_spans: int = 0
     user_file: Path | None = None
+    user_bytes: bytes = b""  # the user file as read, rewritten after the folder is cleared
     deck_intrusion_m: float = 0.0
     terrain_clamped: int = 0
     ground: Callable[[np.ndarray], np.ndarray] | None = field(default=None, repr=False)
@@ -1018,9 +1028,10 @@ def _barriers(
     options: BuildOptions,
     sc: _Scenery,
 ) -> None:
-    """Real roadside barriers only: OSM ways, the user's guardrails.json, bridge approaches."""
+    """Real roadside barriers only: OSM ways and the user's guardrails.json (bridge approach
+    rails only if asked for). Decks with a railing are skipped; culverts are plain road."""
     m = geo.model
-    decks = [(p.s0, p.s1) for p in sc.plans]
+    decks = [(p.s0, p.s1) for p in sc.plans if p.railing]
     osm_spans: list[BarrierSpan] = []
     if options.osm_barriers is not None:
         osm = list(options.osm_barriers)
@@ -1035,12 +1046,26 @@ def _barriers(
     sc.osm_barriers = len(osm)
     if osm:
         osm_spans = match_barriers(osm, geo.projection, m.centre[:, [0, 2]], m.s)
+        used = {sp.osm_id for sp in osm_spans}
+        sc.osm_barrier_ways = [b for b in osm if b.id in used]
     user: list[BarrierSpan] = []
     if options.guardrails_file is not None and Path(options.guardrails_file).is_file():
-        user = load_user_spans(options.guardrails_file, s_origin=geo.s_a)
-        sc.user_file = Path(options.guardrails_file)
+        path = Path(options.guardrails_file)
+        # Read now: the file may live in the track folder that is cleared before writing.
+        sc.user_bytes = path.read_bytes()
+        user = load_user_spans(
+            path, s_origin=geo.s_a, reverse=options.route_reversed, length_m=geo.length_m
+        )
+        sc.user_file = path
+        if options.route_reversed:  # the copy sits next to the reversed route.json: say so
+            data = json.loads(sc.user_bytes.decode("utf-8-sig"))
+            if not isinstance(data, Mapping):
+                data = {"guardrails": data}
+            data = {**data, "reversed": not data.get("reversed", False)}
+            sc.user_bytes = (json.dumps(data, indent=1) + "\n").encode("utf-8")
     sc.user_spans = len(user)
-    sc.spans = plan_barriers(m, osm=osm_spans, user=user, bridges=decks, approach_m=APPROACH_RAIL_M)
+    approach = APPROACH_RAIL_M if options.bridge_approach_rails else 0.0
+    sc.spans = plan_barriers(m, osm=osm_spans, user=user, bridges=decks, approach_m=approach)
     sc.pieces += barrier_pieces(m, sc.spans, ground, options.bridge.barrier, bridges=decks)
 
 
@@ -1149,7 +1174,7 @@ def _trees(
         landcover = options.landcover_source(geo.projection)
     else:
         landcover = LandcoverSampler(geo.projection, cache_dir=options.cache_dir)
-    exclude = buildings_polygon(sc.buildings) if sc.buildings else None
+    exclude = _tree_exclusion(geo, sc)
     try:
         sc.trees = place_trees(
             geo.model, canopy, landcover=landcover, exclude=exclude, seed=track_id, options=vopt
@@ -1157,11 +1182,38 @@ def _trees(
     except _DATA_ERRORS as e:
         warnings.warn(f"lidar canopy unavailable ({_short(e)}); no trees", stacklevel=2)
         return
+    if sc.footprints is not None and sc.footprints.footprints:
+        sc.footprints_masked = True
+        sc.attributions += [a for a in sc.footprints.attributions if a not in sc.attributions]
     if len(sc.trees) == 0 and region_of(
         np.array([geo.route.pins[0].snap_lon]), np.array([geo.route.pins[0].snap_lat])
     )[0] not in ("CA", "CA-border"):
         warnings.warn("no trees: lidar canopy heights exist only in Canada", stacklevel=2)
     sc.attributions += [a for a in sc.trees.attributions if a not in sc.attributions]
+
+
+TREE_BUILDING_BUFFER_M = 2.0  # no tree trunk this close to any building footprint
+
+
+def _footprint_polygon(fp: Footprint, projection: LocalProjection) -> shapely.Geometry | None:
+    if len(fp.lonlat) < 4:
+        return None
+    e, n = projection.to_enu(fp.lonlat[:, 0], fp.lonlat[:, 1])
+    return shapely.make_valid(shapely.Polygon(np.stack([e, -n], axis=1)))
+
+
+def _tree_exclusion(geo: TrackGeometry, sc: _Scenery) -> shapely.Geometry | None:
+    """Where no tree may stand: EVERY fetched building footprint, also the ones not drawn
+    (in the wall corridor, too small, ...), and the drawn buildings, buffered 2 m. The lidar
+    canopy sees roofs as tall flat "trees", so without this a house that is not drawn becomes
+    a clump of trees. `place_trees` also masks the canopy there before looking for tree tops."""
+    polys = [b.polygon for b in sc.buildings]
+    if sc.footprints is not None:
+        polys += [_footprint_polygon(fp, geo.projection) for fp in sc.footprints.footprints]
+    polys = [p for p in polys if p is not None and not p.is_empty]
+    if not polys:
+        return None
+    return shapely.union_all(shapely.buffer(np.array(polys), TREE_BUILDING_BUFFER_M))
 
 
 def _scenery_stats(sc: _Scenery, geo: TrackGeometry, extra: Mapping[str, object]) -> dict:
@@ -1184,6 +1236,7 @@ def _scenery_stats(sc: _Scenery, geo: TrackGeometry, extra: Mapping[str, object]
                 "length_m": p.length,
                 "piers": len(p.piers),
                 "solid": p.solid,
+                "railing": p.railing,
                 "max_height_m": float(np.nanmax(c[:, 1] - sc.ground(c[:, [0, 2]]), initial=0.0)),
             }
         )
@@ -1213,7 +1266,24 @@ def _scenery_stats(sc: _Scenery, geo: TrackGeometry, extra: Mapping[str, object]
 # --------------------------------------------------------------------------------------------
 
 
-def _licence(geo: TrackGeometry) -> tuple[list[str], list[str]]:
+def _merge_notices(notices: Sequence[str]) -> list[str]:
+    """One line per credit: "label: text" notices with the same text (e.g. the HRDEM licence
+    for the elevation and for the tree heights) become one "label; label: text" line."""
+    order: list[str] = []
+    labels: dict[str, list[str]] = {}
+    for notice in notices:
+        label, sep, body = notice.partition(": ")
+        key = body if sep else notice
+        if key not in labels:
+            order.append(key)
+            labels[key] = []
+        if sep and label not in labels[key]:
+            labels[key].append(label)
+    return [f"{'; '.join(labels[k])}: {k}" if labels[k] else k for k in order]
+
+
+def _licence(geo: TrackGeometry, sc: _Scenery | None = None) -> tuple[list[str], list[str]]:
+    """LICENSE-DATA.txt keys (`DATA_SOURCES`) and extra notices, duplicates merged."""
     keys = ["osm"]
     extra: list[str] = []
     for name, info in sorted(geo.elevation.info.items()):
@@ -1222,13 +1292,68 @@ def _licence(geo: TrackGeometry) -> tuple[list[str], list[str]]:
             if key not in keys:
                 keys.append(key)
         else:
-            notice = f"Elevation ({info.title}): {info.attribution}"
-            if notice not in extra:
-                extra.append(notice)
-    return keys, extra
+            extra.append(f"Elevation ({info.title}): {info.attribution}")
+    if sc is not None:
+        extra += sc.attributions
+        if OSM_BUILDINGS_ATTRIBUTION in extra or sc.osm_barrier_ways:
+            # One OSM credit for the road, the buildings and the barriers.
+            extra = [a for a in extra if a != OSM_BUILDINGS_ATTRIBUTION]
+            keys[keys.index("osm")] = "osm_scenery"
+    return keys, _merge_notices(extra)
 
 
-def _geojson(geo: TrackGeometry) -> str:
+def _osm_ref(footprint_id: str) -> tuple[str, int] | None:
+    """("way" | "relation", id) of an OSM footprint id ("osm:w1", "osm:r2.0")."""
+    head, _, rest = footprint_id.partition(":")
+    if head != "osm" or rest[:1] not in ("w", "r"):
+        return None
+    return ("way" if rest[0] == "w" else "relation"), int(rest[1:].split(".")[0])
+
+
+def _lonlat_list(lonlat: np.ndarray) -> list[list[float]]:
+    return [[round(float(lon), 7), round(float(lat), 7)] for lon, lat in lonlat]
+
+
+def _scenery_features(sc: _Scenery) -> list[dict]:
+    """route_osm.geojson features for the OSM buildings (drawn, or used to keep trees off)
+    and barrier ways the build used (ODbL: the OSM data in the track is listed with it)."""
+    features = []
+    drawn = {b.id for b in sc.buildings}
+    fps = sc.footprints.footprints if sc.footprints is not None else []
+    for fp in fps:
+        ref = _osm_ref(fp.id)
+        if ref is None or not (fp.id in drawn or sc.footprints_masked):
+            continue
+        kind, oid = ref
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "Polygon", "coordinates": [_lonlat_list(fp.lonlat)]},
+                "properties": {
+                    f"osm_{kind}_id": oid,
+                    "osm_url": f"https://www.openstreetmap.org/{kind}/{oid}",
+                    "use": "building" if fp.id in drawn else "tree mask",
+                    "tags": dict(sorted(fp.tags.items())),
+                },
+            }
+        )
+    for b in sc.osm_barrier_ways:
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "LineString", "coordinates": _lonlat_list(b.lonlat)},
+                "properties": {
+                    "osm_way_id": b.id,
+                    "osm_url": f"https://www.openstreetmap.org/way/{b.id}",
+                    "use": "barrier",
+                    "tags": dict(sorted(b.tags.items())),
+                },
+            }
+        )
+    return features
+
+
+def _geojson(geo: TrackGeometry, sc: _Scenery | None = None) -> str:
     route = geo.route
     features = []
     edges = route.edges
@@ -1256,7 +1381,7 @@ def _geojson(geo: TrackGeometry) -> str:
         "license": "ODbL-1.0 (https://opendatacommons.org/licenses/odbl/1-0/)",
         "osm_base": route.osm_base,
         "pins": [{"lat": p.lat, "lon": p.lon} for p in route.pins],
-        "features": features,
+        "features": features + (_scenery_features(sc) if sc is not None else []),
     }
     return json.dumps(doc, indent=1, ensure_ascii=False) + "\n"
 
@@ -1343,8 +1468,7 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
 
     region = geo.elevation.region
     country = options.country if options.country is not None else _COUNTRIES.get(region, "")
-    keys, extra = _licence(geo)
-    extra += [a for a in sc.attributions if a not in extra]
+    keys, extra = _licence(geo, sc)
     pin_a = route.pins[0]
     dem_titles = ", ".join(geo.elevation.info[n].title for n in sorted(geo.elevation.info))
     scenery_text = ""
@@ -1374,10 +1498,10 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
     write_preview_png(ui_dir / "preview.png", [line], title=options.name)
     write_outline_png(ui_dir / "outline.png", [line])
     write_data_license(track_dir, keys, track_name=options.name, extra_notices=extra)
-    (track_dir / "route_osm.geojson").write_text(_geojson(geo), encoding="utf-8", newline="\n")
+    (track_dir / "route_osm.geojson").write_text(_geojson(geo, sc), encoding="utf-8", newline="\n")
     route.save(track_dir / "route.json")
-    if sc.user_file is not None:
-        shutil.copyfile(sc.user_file, track_dir / sc.user_file.name)
+    if sc.user_file is not None:  # bytes read before the old folder was cleared
+        (track_dir / sc.user_file.name).write_bytes(sc.user_bytes)
 
     images: list[Path] = []
     if options.debug_png:
@@ -1602,7 +1726,7 @@ def _draw_scenery_over(dr, px, m: RoadModel, sc: _Scenery) -> None:
             dr.line(px(pts), fill=_RAIL_RGB, width=3)
     half = deck_half_width(m)
     for plan in sc.plans:
-        for sign in (1.0, -1.0):
+        for sign in (1.0, -1.0) if plan.railing else ():
             pts = _span_points(m, sign * (edge + 0.15), plan.s0, plan.s1)
             if len(pts) >= 2:
                 dr.line(px(pts), fill=_PARAPET_RGB, width=3)

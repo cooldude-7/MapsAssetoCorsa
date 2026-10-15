@@ -10,7 +10,10 @@ nothing here guesses. Two sources say where a barrier stands:
    test roads had any (scenery.md §5a); they appear automatically once someone maps them.
 2. **`guardrails.json`** next to `route.json`: a list of
    `{"side": "left" | "right", "from_m": s0, "to_m": s1, "kind": "guard_rail"}` in metres of
-   route distance from A (the user has driven these roads and knows where the rails are).
+   route distance from A (the user has driven these roads and knows where the rails are), or
+   `{"reversed": false, "guardrails": [...]}`. Sides and distances are as driven in the
+   direction of that `route.json` (`"reversed": true`: as driven the other way). A build that
+   drives the other way (`--reverse`) mirrors every span: left <-> right, s -> L - s.
 
 `match_barriers` turns each OSM way into `BarrierSpan`s along the built centreline: every
 point of the way (densified to 1 m) is projected onto the nearest centreline segment, which
@@ -364,15 +367,29 @@ def merge_spans(spans: Sequence[BarrierSpan], join_m: float = 1.0) -> list[Barri
 
 
 def parse_user_spans(
-    data: object, *, s_origin: float = 0.0, default_kind: str = "guard_rail"
+    data: object,
+    *,
+    s_origin: float = 0.0,
+    default_kind: str = "guard_rail",
+    reverse: bool = False,
+    length_m: float | None = None,
 ) -> list[BarrierSpan]:
     """User barrier spans from parsed `guardrails.json`: a list of
-    `{"side", "from_m", "to_m", "kind"?}` (or `{"guardrails": [...]}`), in metres of route
-    distance from A; `s_origin` (the model station of A) converts them to model stations.
-    `from_m` > `to_m` is accepted (swapped). Raises ValueError on anything malformed."""
+    `{"side", "from_m", "to_m", "kind"?}` (or `{"reversed"?: bool, "guardrails": [...]}`), in
+    metres of route distance from A; `s_origin` (the model station of A) converts them to
+    model stations. `from_m` > `to_m` is accepted (swapped). `reverse`: the build drives the
+    route the other way from the file's (`"reversed"`, default false); then each span is
+    mirrored (left <-> right, s -> `length_m` - s, `length_m` = the A->B length, required).
+    Raises ValueError on anything malformed."""
     items = data.get("guardrails") if isinstance(data, Mapping) else data
     if not isinstance(items, list):
         raise ValueError("guardrails.json must be a list of spans (or {'guardrails': [...]})")
+    file_reversed = data.get("reversed", False) if isinstance(data, Mapping) else False
+    if not isinstance(file_reversed, bool):
+        raise ValueError(f"'reversed' must be true or false, got {file_reversed!r}")
+    mirror = file_reversed != bool(reverse)
+    if mirror and (length_m is None or not length_m > 0):
+        raise ValueError("mirroring guardrails.json for a reversed route needs its length")
     out = []
     for k, item in enumerate(items):
         if not isinstance(item, Mapping):
@@ -390,17 +407,27 @@ def parse_user_spans(
         a, b = min(a, b), max(a, b)
         if not b > a:
             raise ValueError(f"span {k}: from_m and to_m must differ")
+        if mirror:
+            side = "right" if side == "left" else "left"
+            a, b = length_m - b, length_m - a
         out.append(BarrierSpan(side, s_origin + a, s_origin + b, kind, "user"))
     return out
 
 
-def load_user_spans(path: Path | str, *, s_origin: float = 0.0) -> list[BarrierSpan]:
-    """`parse_user_spans` of a JSON file; a missing file means no user spans ([])."""
+def load_user_spans(
+    path: Path | str,
+    *,
+    s_origin: float = 0.0,
+    reverse: bool = False,
+    length_m: float | None = None,
+) -> list[BarrierSpan]:
+    """`parse_user_spans` of a JSON file (UTF-8, with or without the BOM Windows editors
+    add); a missing file means no user spans ([])."""
     path = Path(path)
     if not path.is_file():
         return []
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except ValueError as exc:
         raise ValueError(f"{path}: not valid JSON: {exc}") from exc
-    return parse_user_spans(data, s_origin=s_origin)
+    return parse_user_spans(data, s_origin=s_origin, reverse=reverse, length_m=length_m)

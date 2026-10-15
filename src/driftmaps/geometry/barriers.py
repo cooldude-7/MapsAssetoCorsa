@@ -4,11 +4,12 @@ and the bridge railings (concrete parapet, steel rail) that `geometry.bridges` p
 Only REAL barriers are built (docs/research/scenery.md §5, §7): `plan_barriers` combines
 - OSM barrier ways matched to the road (`geo.barriers.match_barriers`),
 - the user's `guardrails.json` spans (`geo.barriers.load_user_spans`), and
-- a guard rail on both sides of every bridge approach (`approach_m`, default 20 m; real
-  bridges here have parapets, and their approaches carry rails, ASSUMED),
-in that priority, never over a bridge deck (the deck has its own railing). The steep drop-off
-heuristic `drop_off_spans` exists but is OFF by default: nothing calls it unless the build
-asks for it, because the user wants only real barriers.
+- OPT-IN only (`approach_m` > 0; the build's `--bridge-approach-rails`): a guard rail on both
+  sides of every bridge approach. No source says these exist, so the default is 0 (none),
+in that priority, never over a bridge deck that has its own railing (`bridges`: the railed
+decks; a culvert without parapets is plain road, so rails from a source may run over it). The
+steep drop-off heuristic `drop_off_spans` is OFF by default too: nothing calls it unless the
+build asks for it, because the user wants only real barriers.
 
 Geometry (AC frame: X east, Y up, Z south; left = up x forward):
 - A barrier runs along a **face line**: the road's shoulder edge (`RoadModel.outer`) plus
@@ -487,8 +488,10 @@ def bridge_approach_spans(
     model: RoadModel, bridges: Sequence[tuple[float, float]], approach_m: float = 20.0
 ) -> list[BarrierSpan]:
     """A guard rail on both sides of each bridge approach: `approach_m` before the deck
-    and after it (clipped to the road)."""
+    and after it (clipped to the road). Invented (no source), so only used when asked for."""
     out = []
+    if approach_m <= 0.0:
+        return out
     lo, hi = float(model.s[0]), float(model.s[-1])
     for b0, b1 in bridges:
         for a, b in ((max(lo, b0 - approach_m), b0), (b1, min(hi, b1 + approach_m))):
@@ -504,14 +507,15 @@ def plan_barriers(
     osm: Sequence[BarrierSpan] = (),
     user: Sequence[BarrierSpan] = (),
     bridges: Sequence[tuple[float, float]] = (),
-    approach_m: float = 20.0,
+    approach_m: float = 0.0,
     heuristic: Sequence[BarrierSpan] = (),
     min_piece_m: float = 2.0,
 ) -> list[BarrierSpan]:
-    """The barriers to build: user spans, then OSM spans, then bridge approaches, then (only
-    if given) heuristic spans, each clipped to the road and to what a higher-priority source
-    or a bridge deck (station ranges in `bridges`) already covers on that side. With no OSM
-    barriers, no user file and no bridges, the result is empty: nothing is invented."""
+    """The barriers to build: user spans, then OSM spans, then (only if `approach_m` > 0)
+    bridge approaches, then (only if given) heuristic spans, each clipped to the road and to
+    what a higher-priority source or a railed bridge deck (station ranges in `bridges`)
+    already covers on that side. With no OSM barriers and no user file the result is empty:
+    nothing is invented."""
     lo, hi = float(model.s[0]), float(model.s[-1])
     covered: dict[str, list[tuple[float, float]]] = {
         "left": [(float(a), float(b)) for a, b in bridges],

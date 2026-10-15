@@ -13,6 +13,9 @@ surface and stay level/straight as the profile made them; this module adds, per 
 - **Railing** on both sides over [s0, s1]: a concrete parapet (default) or a steel rail on a
   concrete curb (`geometry.barriers`), each with a hidden, double-sided `1WALL` collision
   strip on its road face so cars cannot drive off (scenery.md §5: bridges always get one).
+  Except at-grade culverts (`BridgePlan.railing` False): a "solid" bridge (below) or one whose
+  deck is never `min_railing_height_m` (2 m) above the ground under it is just road, with no
+  parapets (the corridor's hidden walls still hold).
 - **Abutments**: a concrete block at each end, from `abutment_back_m` under the approach to
   the abutment face, top just under the road, bottom `embed_m` below the lowest ground under
   it, so it blends into the terrain whatever its slope. The face is placed adaptively: the
@@ -95,6 +98,8 @@ class BridgeOptions:
     cap_height_m: float = 0.8
     embed_m: float = 1.0
     lod_out_m: float = 2500.0
+    # Decks never this high above the ground under them (culverts) get no railing.
+    min_railing_height_m: float = 2.0
     barrier: BarrierOptions = field(default_factory=BarrierOptions)
 
     @property
@@ -105,7 +110,9 @@ class BridgeOptions:
 @dataclass
 class BridgePlan:
     """Where one bridge's parts go, in model stations. The open span (no abutment under the
-    deck) is [face0, face1]; `solid` bridges have none. `piers` are pier stations."""
+    deck) is [face0, face1]; `solid` bridges have none. `piers` are pier stations. `height`
+    is the deck's greatest height above the ground under it (inf: ground unknown); `railing`
+    False for an at-grade culvert (no parapets)."""
 
     index: int
     s0: float
@@ -114,6 +121,8 @@ class BridgePlan:
     face1: float
     piers: tuple[float, ...]
     thickness: float
+    height: float = math.inf
+    railing: bool = True
 
     @property
     def length(self) -> float:
@@ -228,21 +237,24 @@ def plan_bridge(
     deck = _interp(model, model.centre[:, 1], s)
     under = deck - t
     pts = _across(model, s, _interp(model, half_all, s), 9)
-    g = _ground(ground_fn, pts, under[:, None] - 1e3).max(axis=1)
+    g_all = _ground(ground_fn, pts, np.nan)
+    g = np.where(np.isnan(g_all), under[:, None] - 1e3, g_all).max(axis=1)
+    low = np.where(np.isnan(g_all), np.inf, g_all).min(axis=1)  # deepest ground across
+    height = float(np.max(deck - low)) if np.isfinite(low).any() else math.inf
     clear = g <= under - opt.abutment_clearance_m
     length = s1 - s0
     seat = min(opt.seat_m, length / 2)
     cap = opt.max_abutment_fraction * length
     inner = (s >= s0 + seat - 1e-9) & (s <= s1 - seat + 1e-9)
     ok = np.flatnonzero(clear & inner)
-    if len(ok) == 0:
-        mid = 0.5 * (s0 + s1)
-        return BridgePlan(index, s0, s1, mid, mid, (), t)
+    mid = 0.5 * (s0 + s1)
+    if len(ok) == 0:  # solid: an embankment over a culvert, just road
+        return BridgePlan(index, s0, s1, mid, mid, (), t, height, railing=False)
     face0 = min(float(s[ok[0]]), s0 + max(cap, seat))
     face1 = max(float(s[ok[-1]]), s1 - max(cap, seat))
     if face1 - face0 < 2.0:
-        mid = 0.5 * (s0 + s1)
-        return BridgePlan(index, s0, s1, mid, mid, (), t)
+        return BridgePlan(index, s0, s1, mid, mid, (), t, height, railing=False)
+    railing = height >= opt.min_railing_height_m
 
     # Piers: spans as close to pier_spacing_m as possible, within [min_span_m, max_span_m].
     open_len = face1 - face0
@@ -260,17 +272,19 @@ def plan_bridge(
         gp = _ground(ground_fn, p, np.nan)
         if np.isfinite(gp).any() and u - np.nanmax(gp) > opt.pier_min_gap_m:
             piers.append(float(sp))
-    return BridgePlan(index, s0, s1, face0, face1, tuple(piers), t)
+    return BridgePlan(index, s0, s1, face0, face1, tuple(piers), t, height, railing)
 
 
 def bridge_railing_spans(
     plans: Sequence[BridgePlan], options: BridgeOptions | None = None
 ) -> list[BarrierSpan]:
-    """The railing spans (both sides, [s0, s1]) of the planned bridges."""
+    """The railing spans (both sides, [s0, s1]) of the planned bridges that have one (not
+    the at-grade culverts)."""
     opt = options or BridgeOptions()
     return [
         BarrierSpan(side, p.s0, p.s1, opt.railing_kind, "bridge")
         for p in plans
+        if p.railing
         for side in ("left", "right")
     ]
 
@@ -391,7 +405,8 @@ def bridge_pieces(
 ) -> tuple[list[ScenePiece], list[BridgePlan]]:
     """KN5 pieces and plans for each bridge span (s0, s1) (e.g. `bridge_spans(model)`):
     `bridge##_concrete` (deck, abutments, piers, concrete railing parts), `bridge##_steel`
-    (steel railing, if chosen) and hidden collision `1WALL_BRIDGE##_<L|R>##`."""
+    (steel railing, if chosen) and hidden collision `1WALL_BRIDGE##_<L|R>##` (no railing and
+    no collision on an at-grade culvert, `BridgePlan.railing`)."""
     opt = options or BridgeOptions()
     pieces: list[ScenePiece] = []
     plans: list[BridgePlan] = []

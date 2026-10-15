@@ -25,9 +25,13 @@ Decisions: docs/research/scenery.md §1, §2, §4.1 and §7 ("Tree positions", "
    inside it are pushed out to its edge instead (roadside trees whose crowns lean over the road
    are the most visible ones). Bridges (`RoadModel.bridge`, padded): the DSM sees the deck as a
    10 m "canopy". Anything in `exclude` (building footprints buffered 2 m, water, or the wall
-   corridor for the stricter rule in scenery.md §4.1).
+   corridor for the stricter rule in scenery.md §4.1); the CHM is masked there before the
+   tree-top search and the gap fill too (a roof is not a tree).
 5. Crown radius = `crown_factor` x distance to the nearest other tree, clamped to 1.5-6 m (and
-   to the height). Low-crowned kinds (conifers, shrubs) never reach over the road footprint.
+   to the height). Low-crowned kinds (conifers, shrubs) have foliage down to the ground, so
+   their crown stops at the hidden walls (`clearance_m` - `wall_margin_m` from the road
+   footprint; `TreeSet.reach`), also after the card's aspect clamp: no car drives through
+   branches.
 6. Kind from NRCan Land Cover of Canada 2020 (30 m, OGL-Canada) at the tree, scenery.md §7:
    needleleaf 1/2 -> 90 % conifer; broadleaf 5 -> 90 % deciduous; mixed 6 -> 50/50;
    shrub/wetland 8/14 -> 80 % shrub + 20 % small deciduous below 5 m (taller ones as mixed);
@@ -50,10 +54,12 @@ the CHM is NaN.
 **Meshes** (`tree_meshes`, `tree_scene`): 2 crossed vertical cards per tree (3 for big near
 deciduous trees), each card's 4 vertices shared by the front and the mirrored back triangles
 (AC has no double-sided materials), baked "volumetric" normals (from the crown centre, blended
-towards +Y, with a per-tree blend for brightness variety), a constant tangent. Card bottoms
-follow the terrain at each corner and are sunk `sink_m`; the top is the trunk's terrain height +
-the CHM height. Trees are batched per 250 m cell and band into visual-only meshes named
-`trees_near_<n>` / `trees_far_<n>` (no digit prefix, no collision), at most 2,000 trees per mesh;
+towards +Y, with a per-tree blend for brightness variety), a constant tangent. Cards stay
+rectangular: the bottom edge is at the trunk's terrain height, sunk `sink_m`, and a corner over
+lower ground drops at most `max_corner_drop_m` (0.5 m) more (a card stretched down a slope
+would bury its trunk); the top is the trunk's terrain height + the CHM height. Trees are
+batched per 250 m cell and band into visual-only meshes named `trees_near_<n>` /
+`trees_far_<n>` (no digit prefix, no collision), at most 2,000 trees per mesh;
 near meshes `lod_out` 700 m with shadows, far meshes 1,500 m without. One `ksTree` material
 (Kunos' own NJMP settings: alpha-tested, blend opaque, ksAlphaRef 0.5, ksAmbient 0.4,
 ksDiffuse 0.25, ksSpecular 0) on the procedural atlas from `driftmaps.ac.tree_textures`.
@@ -194,6 +200,9 @@ class VegetationOptions:
     far_cell_m: float = 2.0
     tile_m: float = 256.0  # processing tile (plus a halo)
     clearance_m: float = 1.5  # beyond road + shoulder: no trunks in here
+    # The hidden walls stand this far inside the clearance edge (build: verge_m + 0.5 m
+    # clearance); low-crowned foliage (conifers, shrubs) stops at that wall line.
+    wall_margin_m: float = 0.5
     snap_m: float = 3.0  # tops up to this far inside the clearance are pushed out to its edge
     bridge_pad_m: float = 10.0  # bridge stations padded this far along the road...
     bridge_margin_m: float = 6.0  # ...and no trees within this distance beyond their footprint
@@ -229,7 +238,9 @@ class TreeSet:
     BUSH; `tile` index into `tree_textures.TREE_TILES`; `distance` from the road footprint edge
     (m); `band` 0 near / 1 far; `source` 0 lidar top / 1 OSM / 2 lidar gap fill; `angle` card
     rotation (rad); `flip` mirror the texture; `shade` 0..1 normal-blend for brightness
-    variety. `attributions` are LICENSE-DATA.txt lines for the data used.
+    variety; `reach` the most the visible crown may spread from the trunk (m; inf = no limit;
+    low crowns stop at the hidden walls). `attributions` are LICENSE-DATA.txt lines for the
+    data used.
     """
 
     xz: np.ndarray
@@ -244,11 +255,16 @@ class TreeSet:
     flip: np.ndarray
     shade: np.ndarray
     attributions: list[str] = field(default_factory=list)
+    reach: np.ndarray | None = None  # None: no limit (inf)
 
     _COLUMNS = (
         "xz", "height", "radius", "kind", "tile", "distance", "band", "source", "angle",
-        "flip", "shade",
+        "flip", "shade", "reach",
     )
+
+    def __post_init__(self) -> None:
+        if self.reach is None:
+            self.reach = np.full(len(self.xz), np.inf)
 
     def __len__(self) -> int:
         return int(self.xz.shape[0])
@@ -587,8 +603,15 @@ def _lidar_candidates(
     cell: float,
     o: VegetationOptions,
     seed: int,
+    exclude: shapely.Geometry | None = None,
 ) -> _Candidates:
-    """Tree tops + gap fill for one band (edge distance in (lo, hi]) on a `cell` lattice."""
+    """Tree tops + gap fill for one band (edge distance in (lo, hi]) on a `cell` lattice.
+    The CHM is masked to bare ground (0) inside `exclude`: roofs are not trees, and a roof
+    must neither become a top nor hide a real one next to it."""
+    if exclude is not None and exclude.is_empty:
+        exclude = None
+    if exclude is not None:
+        shapely.prepare(exclude)
     halo_cells = int(math.ceil((max(w for _, w in o.windows) + 4 * o.smooth_sigma_m) / cell))
     halo_m = halo_cells * cell
     tiles = _tiles_for_band(fp, lo, hi, cell, o)
@@ -609,17 +632,23 @@ def _lidar_candidates(
         rr, cc = np.nonzero(need)
         if len(rr) == 0:
             continue
-        grids.append((n, r0, c0, size, rr, cc))
-        points.append(np.stack([x[cc], z[rr]], axis=1))
+        roof = np.zeros(len(rr), bool)
+        if exclude is not None:
+            roof = shapely.contains_xy(exclude, x[cc], z[rr])
+        grids.append((n, r0, c0, size, rr, cc, roof))
+        points.append(np.stack([x[cc[~roof]], z[rr[~roof]]], axis=1))
     if not grids:
         return _Candidates.concat([])
-    heights = np.asarray(canopy(np.concatenate(points)), np.float64)
+    pts = np.concatenate(points)
+    heights = np.asarray(canopy(pts), np.float64) if len(pts) else np.zeros(0)
     out = []
     k = 0
-    for n, r0, c0, size, rr, cc in grids:
+    for n, r0, c0, size, rr, cc, roof in grids:
         chm = np.full((size, size), np.nan)
-        chm[rr, cc] = heights[k : k + len(rr)]
-        k += len(rr)
+        sampled = int((~roof).sum())
+        chm[rr[~roof], cc[~roof]] = heights[k : k + sampled]
+        chm[rr[roof], cc[roof]] = 0.0  # building footprints: bare ground, not canopy
+        k += sampled
         if not np.isfinite(chm).any():
             continue
         rows, cols, h = detect_tree_tops(
@@ -977,7 +1006,8 @@ def place_trees(
     `canopy`: XZ -> CHM metres (`CanopySampler`); None = no lidar. `landcover`: XZ -> NRCan
     class (`LandcoverSampler`); None = the mixed rule. `woods`: OSM fallback areas, used only
     where the CHM is NaN. `exclude`: XZ geometry with no trees (building footprints buffered
-    2 m, water, or the wall corridor). `seed`: int or string, e.g. the track id.
+    2 m, water, or the wall corridor); the CHM is masked there before the tree-top search and
+    the gap fill. `seed`: int or string, e.g. the track id.
     `attributions` are added to the result's own (taken from the samplers' `attributions`).
     """
     o = options or VegetationOptions()
@@ -986,10 +1016,10 @@ def place_trees(
     parts = []
     if canopy is not None:
         parts.append(_lidar_candidates(fp, canopy, BAND_NEAR, -math.inf, o.near_m,
-                                       o.near_cell_m, o, seed_i))
+                                       o.near_cell_m, o, seed_i, exclude))
         if o.far_m > o.near_m:
             parts.append(_lidar_candidates(fp, canopy, BAND_FAR, o.near_m, o.far_m,
-                                           o.far_cell_m, o, seed_i))
+                                           o.far_cell_m, o, seed_i, exclude))
     if woods:
         parts.append(_osm_candidates(fp, woods, canopy, o, seed_i))
     c = _Candidates.concat(parts)
@@ -1056,8 +1086,12 @@ def place_trees(
     kind = _choose_kinds(hint, lc, height, _u01(qx, qz, seed_i, _S_KIND))
     shrub = kind == BUSH
     radius[shrub] = np.clip(radius[shrub], 0.8, np.maximum(1.0, 0.9 * height[shrub]))
+    # Foliage down to the ground: the crown stops at the hidden walls' line (the trunk stands
+    # at least `wall_margin_m` beyond it, outside the clearance).
     low = (kind == CONIFER) | shrub
-    radius[low] = np.minimum(radius[low], np.maximum(d[low], 1.0))
+    reach = np.full(len(xz), np.inf)
+    reach[low] = np.maximum(d[low] - (o.clearance_m - o.wall_margin_m), 0.25)
+    radius = np.minimum(radius, reach)
     tile = _choose_tiles(kind, radius, height, _u01(qx, qz, seed_i, _S_TILE))
 
     # 7. Far band: keep a share, as bigger clumps.
@@ -1078,6 +1112,7 @@ def place_trees(
         flip=_u01(qx, qz, seed_i, _S_FLIP) < 0.5,
         shade=_u01(qx, qz, seed_i, _S_SHADE),
         attributions=notes(),
+        reach=reach,
     ).subset(keep)
 
     # 8. Budget: a share for each band; within a band the farthest, smallest and gap-fill
@@ -1120,6 +1155,7 @@ class TreeMeshOptions:
     far_shadows: bool = False
     three_cards_min_height_m: float = 12.0  # near deciduous trees this tall get a 3rd card
     sink_m: float = 0.3  # card bottoms this far below the terrain
+    max_corner_drop_m: float = 0.5  # a bottom corner over lower ground drops at most this
     normal_blend: tuple[float, float] = (0.35, 0.6)  # weight of the radial normal (vs +Y)
     aspect_clamp: tuple[float, float] = (0.65, 1.5)  # card w/h relative to the tile's aspect
     atlas_size: int = ATLAS_SIZE
@@ -1195,6 +1231,9 @@ def _cards(trees: TreeSet, base: np.ndarray, ground: GroundFn, o: TreeMeshOption
     width = 2.0 * trees.radius / fill
     lo, hi = o.aspect_clamp
     width = np.clip(width, lo * aspect * h, hi * aspect * h)
+    # After the aspect clamp (which can widen a narrow crown): the visible crown (fill x the
+    # card) never spreads past `reach`, so low foliage stops at the hidden walls.
+    width = np.minimum(width, 2.0 * trees.reach / fill)
 
     centre = np.stack([trees.xz[:, 0], base, trees.xz[:, 1]], axis=1)
     hw = 0.5 * width[tq][:, None]
@@ -1206,8 +1245,11 @@ def _cards(trees: TreeSet, base: np.ndarray, ground: GroundFn, o: TreeMeshOption
     trunk_y = base[tq] - o.sink_m
     g = np.where(np.isfinite(g), g - o.sink_m, np.concatenate([trunk_y, trunk_y]))
     nq = len(tq)
-    y_left = np.minimum(g[:nq], trunk_y)
-    y_right = np.minimum(g[nq:], trunk_y)
+    # Rectangular cards: the bottom edge at the trunk base; a corner over lower ground drops
+    # a little (no gap under the card), but never stretches the card down a slope.
+    drop = o.max_corner_drop_m
+    y_left = np.clip(g[:nq], trunk_y - drop, trunk_y)
+    y_right = np.clip(g[nq:], trunk_y - drop, trunk_y)
     y_top = base[tq] + h[tq]
 
     pos = np.empty((nq, 4, 3))

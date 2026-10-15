@@ -16,6 +16,30 @@ app = typer.Typer(
     add_completion=False,
 )
 
+# Zip sizes for sending a track (MB = 1,000,000 bytes): warn from 25 MB, error from 28 MB.
+ZIP_WARN_MB = 25.0
+ZIP_ERROR_MB = 28.0
+
+
+def check_zip_size(zip_path: Path) -> float:
+    """Print the zip's size; warn at >= `ZIP_WARN_MB`, error (exit 1) at >= `ZIP_ERROR_MB`.
+    Returns the size in MB."""
+    mb = Path(zip_path).stat().st_size / 1e6
+    typer.echo(f"zip      {zip_path} ({mb:.1f} MB)")
+    if mb >= ZIP_ERROR_MB:
+        typer.echo(
+            f"error: {zip_path} is {mb:.1f} MB, over the {ZIP_ERROR_MB:.0f} MB limit; build with "
+            "fewer trees (--scenery-density 0.5) or without buildings",
+            err=True,
+        )
+        raise typer.Exit(1)
+    if mb >= ZIP_WARN_MB:
+        typer.echo(
+            f"warning: {zip_path} is {mb:.1f} MB, close to the {ZIP_ERROR_MB:.0f} MB limit",
+            err=True,
+        )
+    return mb
+
 
 @app.command()
 def spike(
@@ -181,8 +205,13 @@ def build(
     buildings: bool = typer.Option(True, help="Buildings from OSM + Microsoft footprints."),
     guardrails: bool = typer.Option(
         True,
-        help="Guardrails where OSM or guardrails.json has them, and on bridge approaches "
-        "(bridges always keep their parapets).",
+        help="Guardrails only where OSM or guardrails.json has them (bridges keep their "
+        "parapets; at-grade culverts have none).",
+    ),
+    bridge_approach_rails: bool = typer.Option(
+        False,
+        help="Also put 20 m of guardrail on both sides of each bridge approach (invented: "
+        "no source says they exist).",
     ),
     scenery_density: float = typer.Option(
         1.0, min=0.0, max=2.0, help="Tree budget multiplier (0 = no trees, 1 = default cap)."
@@ -191,8 +220,9 @@ def build(
         None,
         exists=True,
         dir_okay=False,
-        help="Guardrail spans JSON ([{side, from_m, to_m}], metres from A). Default: "
-        "guardrails.json next to --route, if there is one.",
+        help="Guardrail spans JSON ([{side, from_m, to_m}], metres from A as driven in the "
+        "route's own direction; with --reverse they are mirrored). Default: guardrails.json "
+        "next to --route, if there is one.",
     ),
     cache_dir: Path = _CACHE,
     osm_json: Path = _OSM_JSON,
@@ -246,8 +276,10 @@ def build(
         trees=trees,
         buildings=buildings,
         guardrails=guardrails,
+        bridge_approach_rails=bridge_approach_rails,
         scenery_density=scenery_density,
         guardrails_file=guardrails_file,
+        route_reversed=reverse,
         offline=offline,
     )
     if dem_file is not None:
@@ -262,6 +294,6 @@ def build(
         typer.echo(f"debug    {image}")
     if zip_path:
         zip_tracks([result.track_dir], zip_path)
-        typer.echo(f"zip      {zip_path}")
+        check_zip_size(zip_path)
     if ac_tracks is not None:
         typer.echo(f"install  {install_track(result.track_dir, ac_tracks, force=force)}")

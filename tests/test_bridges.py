@@ -102,14 +102,24 @@ def test_no_piers_where_the_gap_is_small_and_solid_when_ground_never_clears():
     ((s0, s1),) = bridge_spans(m)
     plan = plan_bridge(m, s0, s1, valley_ground(depth=4.0))
     assert not plan.solid and plan.piers == ()  # underside only ~3 m up at the deepest
+    assert plan.railing and plan.height == pytest.approx(4.0, abs=0.3)
     flat = plan_bridge(m, s0, s1, valley_ground(depth=0.5))
-    assert flat.solid and flat.piers == ()
+    assert flat.solid and flat.piers == () and not flat.railing
+    # An at-grade culvert is just road: structure, but no parapets and no railing collision.
     pieces, _ = bridge_pieces(m, [(s0, s1)], valley_ground(depth=0.5))
-    assert {p.name for p in pieces} == {
-        "bridge00_concrete",
-        "1WALL_BRIDGE00_L00",
-        "1WALL_BRIDGE00_R00",
-    }
+    assert {p.name for p in pieces} == {"bridge00_concrete"}
+
+
+def test_low_open_bridge_is_a_culvert_without_parapets():
+    m = valley_model(depth=1.8)  # clears the abutments in the middle, but under 2 m up
+    ((s0, s1),) = bridge_spans(m)
+    plan = plan_bridge(m, s0, s1, valley_ground(depth=1.8))
+    assert not plan.solid and plan.height < 2.0 and not plan.railing
+    pieces, plans = bridge_pieces(m, [(s0, s1)], valley_ground(depth=1.8))
+    assert [p.name for p in pieces] == ["bridge00_concrete"]
+    assert bridge_railing_spans(plans) == []
+    # Nothing invented around it either, and a real rail may run over the culvert.
+    assert plan_barriers(m, bridges=[(p.s0, p.s1) for p in plans if p.railing]) == []
 
 
 def test_deck_slab_faces_point_outward_and_down():
@@ -163,7 +173,8 @@ def test_railing_and_collision_on_both_sides_of_the_whole_deck(railing):
 def test_approach_guardrails_meet_the_parapet_collision():
     m = valley_model()
     spans = bridge_spans(m)
-    planned = plan_barriers(m, bridges=spans)
+    assert plan_barriers(m, bridges=spans) == []  # invented rails are opt-in
+    planned = plan_barriers(m, bridges=spans, approach_m=20.0)
     (s0, s1) = spans[0]
     left = sorted((sp.s0, sp.s1) for sp in planned if sp.side == "left")
     assert left == [(s0 - 20.0, s0), (s1, s1 + 20.0)]  # continuous with the railing [s0, s1]

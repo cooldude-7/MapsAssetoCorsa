@@ -970,9 +970,24 @@ DATA_SOURCES: dict[str, str] = {
     ),
 }
 
+# One OSM credit when the buildings and barriers come from OSM too (their ways are listed in
+# route_osm.geojson next to the road's).
+DATA_SOURCES["osm_scenery"] = (
+    DATA_SOURCES["osm"]
+    .replace("Road data:", "Road, barrier and building data:")
+    .replace(
+        "The route data used to build this track (geometry, OSM way IDs and tags)",
+        "The OSM data used to build this track (the road, buildings and barriers: geometry, "
+        "OSM IDs and tags)",
+    )
+)
+
 # ASCII one-liners for ui_track.json descriptions.
 _SHORT_CREDITS: dict[str, str] = {
     "osm": "Road data (c) OpenStreetMap contributors, ODbL (openstreetmap.org/copyright).",
+    "osm_scenery": (
+        "Road and building data (c) OpenStreetMap contributors, ODbL (openstreetmap.org/copyright)."
+    ),
     "copernicus": (
         "Elevation produced using Copernicus WorldDEM-30 (c) DLR e.V. 2010-2014 and (c) Airbus "
         "Defence and Space GmbH 2014-2018 provided under COPERNICUS by the European Union and "
