@@ -176,7 +176,9 @@ pyz = PYZ(a.pure)  # noqa: F821
 exe = EXE(  # noqa: F821
     pyz,
     a.scripts,
-    [],
+    # UTF-8 mode, as on Linux where the code is developed: files written without an explicit
+    # encoding (road names like "Chemin de la Côte") come out UTF-8, not the Windows code page.
+    [("X utf8", None, "OPTION")],
     exclude_binaries=True,
     name=APP_NAME,
     debug=False,

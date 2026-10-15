@@ -17,9 +17,7 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
-  APP: AssettoCorsaMapGenerator
   ZIP: AssettoCorsaMapGenerator-windows.zip
-  PYTHONUTF8: "1"
 
 jobs:
   windows-app:
@@ -59,16 +57,16 @@ jobs:
         run: uv run --locked pyinstaller --noconfirm --clean packaging/acmg.spec
 
       - name: Self-test the app (modules, map page, rasterio/GDAL/PROJ, Pillow)
-        run: '& "dist\$env:APP\$env:APP.exe" --self-test'
+        run: .\dist\AssettoCorsaMapGenerator\AssettoCorsaMapGenerator.exe --self-test
 
       # Informational: can the frozen app reach OpenStreetMap and the elevation tiles?
       - name: Self-test the app online
         continue-on-error: true
-        run: '& "dist\$env:APP\$env:APP.exe" --self-test --network'
+        run: .\dist\AssettoCorsaMapGenerator\AssettoCorsaMapGenerator.exe --self-test --network
 
       - name: Smoke-test the app (start, GET /api/status and /, stop)
         run: |
-          $exe = "dist\$env:APP\$env:APP.exe"
+          $exe = ".\dist\AssettoCorsaMapGenerator\AssettoCorsaMapGenerator.exe"
           $data = Join-Path $env:RUNNER_TEMP "acmg-data"
           $out = Join-Path $env:RUNNER_TEMP "acmg-out.txt"
           $err = Join-Path $env:RUNNER_TEMP "acmg-err.txt"
@@ -95,7 +93,7 @@ jobs:
           $global:LASTEXITCODE = 0
 
       - name: Zip the app folder
-        run: Compress-Archive -Path "dist\$env:APP" -DestinationPath $env:ZIP -CompressionLevel Optimal
+        run: Compress-Archive -Path dist\AssettoCorsaMapGenerator -DestinationPath $env:ZIP -CompressionLevel Optimal
 
       # GitHub wraps every artifact in a zip of its own, so the artifact is the app folder itself:
       # the download (AssettoCorsaMapGenerator-windows.zip) unzips straight to the .exe.

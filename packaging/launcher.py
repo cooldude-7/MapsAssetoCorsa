@@ -246,6 +246,10 @@ def self_test(network: bool = False) -> int:
     if network:
         checks.append(("HTTPS (Python)", _check_https_python))
         checks.append(("HTTPS (GDAL)", _check_https_gdal))
+    _say(
+        f"{APP_TITLE} self-test (Python {sys.version.split()[0]}, frozen={frozen()}, "
+        f"UTF-8 mode={bool(sys.flags.utf8_mode)})"
+    )
     failed = 0
     for label, fn in checks:
         try:
@@ -288,7 +292,8 @@ def main(argv: list[str] | None = None) -> int:
 
     already = _already_running() if args.port is None else None
     if already:
-        _say(f"{APP_TITLE} is already open - showing it in your web browser again.")
+        if not args.no_browser:
+            _say(f"{APP_TITLE} is already open - showing it in your web browser again.")
     else:
         _say("=" * len(BANNER))
         _say(BANNER)
