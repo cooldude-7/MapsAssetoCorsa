@@ -144,6 +144,12 @@ def test_script_follows_the_api_contract_and_map_sources():
         assert re.search(rf"\b{field}\b", js), f"app.js never sends/reads {field}"
 
 
+def test_markers_keep_maplibre_classes():
+    # Replacing a marker element's className drops MapLibre's `maplibregl-marker` class (its
+    # position: absolute), and every point after A is then drawn a pin's height too low.
+    assert not re.search(r"\bpin\.el\.className\s*=", read("app.js"))
+
+
 def test_local_storage_is_always_guarded():
     lines = [ln for ln in read("app.js").splitlines() if "localStorage" in ln]
     assert lines, "expected the guarded store helper"

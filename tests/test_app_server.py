@@ -262,6 +262,10 @@ def test_route(env, forks_route):
     # The route is kept on disk for builds after a restart.
     saved = Route.load(env.settings.routes_dir / f"{body['route_id']}.json")
     assert saved.length_m == pytest.approx(forks_route.length_m)
+    # The page then sends its points where they snapped to: the same route, not routed again.
+    status, again = env.client.post("/api/route", {"pins": body["snapped"]})
+    assert status == 200 and again["route_id"] == body["route_id"]
+    assert len(env.route_calls) == 1
 
 
 def test_route_reverse(env):
@@ -806,6 +810,24 @@ def test_route_options(env, monkeypatch):
     for fwd, back in zip(options, rev["alternatives"], strict=True):
         assert back["length_m"] == pytest.approx(fwd["length_m"], abs=0.1)
         assert back["line"][0] == pytest.approx(fwd["line"][0], abs=1e-6)
+
+    # Each option's profile runs from A's height to B's: here the ground rises 1 m for every
+    # 10 m north (A at 0 m, B 400 m north at 40 m), whichever way the option goes.
+    def ground(lon, lat, cache_dir=None, **kw):
+        _, north = proj.to_enu(np.asarray(lon, float), np.asarray(lat, float))
+        n = len(north)
+        info = SourceInfo("hrdem-1m", "NRCan HRDEM 1 m", 1.0, "DTM", "OGL", "NRCan")
+        z = 100.0 + np.asarray(north, float) / 10.0
+        return ElevationSample(z, np.array(["hrdem-1m"] * n), np.ones(n), {"hrdem-1m": info})
+
+    monkeypatch.setattr(elevation_sources, "sample_elevation", ground)
+    for opt in options:
+        status, prof = env.client.post("/api/profile", {"route_id": opt["route_id"]})
+        assert status == 200, prof
+        assert prof["s"][-1] == pytest.approx(opt["length_m"], abs=1.0)
+        assert prof["z"][0] == pytest.approx(100.0, abs=0.2)  # A
+        assert prof["z"][-1] == pytest.approx(140.0, abs=0.2)  # B
+        assert min(prof["z"]) >= 100.0 - 0.2 and max(prof["z"]) <= 140.0 + 0.2
 
     # Building option 2 builds that route, not the best one.
     status, res = env.client.post(

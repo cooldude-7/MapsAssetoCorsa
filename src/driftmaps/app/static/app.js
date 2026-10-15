@@ -1203,7 +1203,12 @@ function renderPins() {
     const role = pinRole(i, n, loop);
     const label = pinLetter(i);
     const title = pinTitle(role, loop);
-    pin.el.className = `dm-pin dm-pin--${role}${loop && role === "start" ? " dm-pin--loop" : ""}`;
+    // Only our own classes change: MapLibre's (maplibregl-marker: position absolute) stay, or
+    // every point after A is drawn a pin's height lower than where it is.
+    const cls = pin.el.classList;
+    for (const c of [...cls]) if (c.startsWith("dm-pin--")) cls.remove(c);
+    cls.add("dm-pin", `dm-pin--${role}`);
+    if (loop && role === "start") cls.add("dm-pin--loop");
     pin.el.querySelector(".dm-pin-label").textContent = label;
     pin.el.title = `${label}: ${title}. Drag to move, right-click to remove.`;
     const coords = `${pin.lngLat[1].toFixed(5)}, ${pin.lngLat[0].toFixed(5)}`;

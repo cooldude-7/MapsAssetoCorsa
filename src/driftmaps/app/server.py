@@ -477,8 +477,13 @@ class App:
                 raise ApiError(502, MAP_SERVERS_MESSAGE) from None
             notes.append(STALE_MAP_WARNING)
             return route, notes  # not remembered: try the map servers again next time
+        # The page moves its points onto the road (`snapped`) and sends those next time: the
+        # same route, so no new download for it (e.g. after Undo).
+        on_road = tuple((round(p.snap_lat, 7), round(p.snap_lon, 7)) for p in route.pins)
         with self._lock:
             self._by_pins[key] = route
+            if len(route.pins) >= len(pins):
+                self._by_pins.setdefault((on_road[: len(pins)], loop), route)
             while len(self._by_pins) > ROUTE_MEMORY:
                 self._by_pins.popitem(last=False)
         return route, notes

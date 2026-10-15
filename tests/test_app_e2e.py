@@ -26,6 +26,12 @@ start", checks the loop on the map (closed line, labels, toggling back to A to B
 in between and Undo), creates the map with the real builder into a fake Assetto Corsa
 (DRIFTMAPS_AC_ROOT) and checks it is a circuit. Screenshots go to out/app_screens/loop_*.png,
 the route and the result to loop_route.json / loop_result.json beside them.
+
+The route options scenario (`test_browser_route_options`, opt-in with DRIFTMAPS_E2E_OPTIONS=1
+as well) is live too (real router and elevation, fake build): A and B on Snake Road, the points
+move onto the road, at least two route options, each profile from A's height to B's, picking
+option 2 (list, [ and ], clicking its grey line) and building it, dragging the line to add a
+point, and a click far from any road that is refused. Screenshots: out/app_screens/options_*.png.
 """
 
 from __future__ import annotations
@@ -729,13 +735,13 @@ def _far_from(line, other, min_m: float = 150.0) -> list[float] | None:
     return None
 
 
-def test_browser_route_options(browser_page, tmp_path, monkeypatch):
+def test_browser_route_options(browser_page, tmp_path):
     if os.environ.get("DRIFTMAPS_E2E_OPTIONS") != "1":
         pytest.skip("live route options test: set DRIFTMAPS_E2E_OPTIONS=1 (downloads map data)")
     page, problems = browser_page
     ac = make_ac(tmp_path / "assettocorsa")
-    # Real routing (Overpass, cached in DRIFTMAPS_CACHE_DIR if set); fake elevation and build.
-    monkeypatch.setattr(elevation_sources, "sample_elevation", fake_sample)
+    # Real routing and elevation profiles (downloads cached in DRIFTMAPS_CACHE_DIR if set); the
+    # build itself is a fake (this test checks which route it gets).
     app = App(Settings(tmp_path / "appdata", discover=lambda: ac), build_fn=fake_build)
     srv = AppServer(app, port=0).start()
     SCREENS.mkdir(parents=True, exist_ok=True)
@@ -775,6 +781,21 @@ def test_browser_route_options(browser_page, tmp_path, monkeypatch):
     def selected_id() -> str:
         return page.evaluate(f"() => {js_state}.route.route_id")
 
+    def assert_pins_drawn_where_they_are() -> None:
+        """Each marker's tip is on its point (every marker, not just A)."""
+        off = page.evaluate(
+            """() => {
+              const s = window.acmg.state, m = window.acmg.map;
+              const box = document.getElementById('map').getBoundingClientRect();
+              return s.pins.map(p => {
+                const r = p.el.getBoundingClientRect(), q = m.project(p.lngLat);
+                return [r.left + r.width / 2 - box.left - q.x, r.bottom - box.top - q.y];
+              });
+            }"""
+        )
+        for dx, dy in off:
+            assert abs(dx) < 2 and abs(dy) < 3, off
+
     try:
         page.goto(srv.url)
         page.wait_for_function("() => window.acmg && window.acmg.state.mapReady", timeout=60_000)
@@ -798,6 +819,18 @@ def test_browser_route_options(browser_page, tmp_path, monkeypatch):
         for (lon, lat), (slat, slon) in zip(pins, snapped, strict=True):
             assert (lon, lat) == pytest.approx((slon, slat), abs=1e-6)
         assert abs(pins[0][0] - (a[1] + 0.0003)) > 1e-4  # moved: it was clicked off the road
+        assert_pins_drawn_where_they_are()
+        # Every option's elevation profile runs from A's height to B's (Snake Road climbs the
+        # escarpment, about 95 m).
+        (lat_a, lon_a), (lat_b, lon_b) = snapped
+        ends = elevation_sources.sample_elevation(
+            [lon_a, lon_b], [lat_a, lat_b], cache_dir=app.settings.cache_dir
+        ).heights
+        assert ends[1] - ends[0] > 60.0, ends
+        for opt in options[:2]:
+            prof = app.profile({"route_id": opt["route_id"]})
+            assert prof["z"][0] == pytest.approx(ends[0], abs=4.0), (opt["names"], prof["z"][:3])
+            assert prof["z"][-1] == pytest.approx(ends[1], abs=4.0), (opt["names"], prof["z"][-3:])
         assert page.is_visible("#route-options")
         labels = page.eval_on_selector_all(
             "#route-option-list button", "els => els.map(e => e.textContent)"
@@ -885,6 +918,7 @@ def test_browser_route_options(browser_page, tmp_path, monkeypatch):
         ) == ["A", "B", "C"]
         assert pins[1] == pytest.approx(drop, abs=5e-4)  # the new B, snapped onto that road
         assert _dist_to_line(st["route"]["line"], pins[1]) < 5.0
+        assert_pins_drawn_where_they_are()
         assert st["route"]["route_id"] not in {o["route_id"] for o in options}
         idle()
         shot("06_dragged_line_new_point")
