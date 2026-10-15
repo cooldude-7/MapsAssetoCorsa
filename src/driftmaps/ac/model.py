@@ -10,6 +10,7 @@ Conventions:
 - `Dummy.transform` is a 4x4 matrix in DirectX row-vector convention: rows 0-2 are the node's
   local X, Y, Z axes in parent space, row 3 is the translation (floats 12-14 when flattened).
 - Index buffers are uint16, so a mesh holds at most 65,535 vertices (`MAX_MESH_VERTICES`).
+- `SkinnedMesh` (class 3) exists only so Kunos files can be read and rewritten; we don't make them.
 """
 
 from __future__ import annotations
@@ -122,7 +123,51 @@ class Mesh:
         return int(self.positions.shape[0])
 
 
-Node = Dummy | Mesh
+@dataclass
+class Bone:
+    """One bone of a `SkinnedMesh`: a node name and its 4x4 bind transform (same layout as
+    `Dummy.transform`)."""
+
+    name: str
+    transform: np.ndarray = field(default_factory=identity_transform)
+
+
+@dataclass
+class SkinnedMesh:
+    """A skinned mesh (KN5 node class 3), e.g. animated flags, crowds or drivers in Kunos files.
+
+    We never generate these. The reader keeps them so real files can be inspected and rewritten
+    byte for byte. Arrays are as in `Mesh`, plus per-vertex `bone_weights` (N, 4) and
+    `bone_indices` (N, 4). Bone indices are stored as float32 in the file (-1 = no bone).
+    Unlike `Mesh`, the record has no bounding sphere and no isRenderable flag.
+    """
+
+    name: str
+    positions: np.ndarray
+    normals: np.ndarray
+    uvs: np.ndarray
+    tangents: np.ndarray
+    bone_weights: np.ndarray
+    bone_indices: np.ndarray
+    indices: np.ndarray
+    material_id: int
+    bones: list[Bone] = field(default_factory=list)
+    cast_shadows: bool = True
+    is_visible: bool = True
+    is_transparent: bool = False
+    layer: int = 0
+    # The last 8 bytes of the record. AcTools' full reader decodes them as lodIn/lodOut floats;
+    # its writer calls them "MisteryBytes". ASSUMED to be LOD distances.
+    lod_in: float = 0.0
+    lod_out: float = 0.0
+    active: bool = True
+
+    @property
+    def vertex_count(self) -> int:
+        return int(self.positions.shape[0])
+
+
+Node = Dummy | Mesh | SkinnedMesh
 
 
 @dataclass

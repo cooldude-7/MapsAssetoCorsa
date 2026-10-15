@@ -33,6 +33,12 @@ addopts = "-q"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Throwaway research spikes are kept as found, not maintained code.
+extend-exclude = ["docs/research/spikes"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# Typer declares CLI options as call defaults by design.
+"src/driftmaps/cli.py" = ["B008"]
