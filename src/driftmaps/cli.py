@@ -177,6 +177,23 @@ def build(
     ),
     dds: bool = typer.Option(False, help="Embed DDS textures instead of PNG."),
     debug_png: bool = typer.Option(True, help="Write top-down debug images to <out>/debug."),
+    trees: bool = typer.Option(True, help="Trees from the lidar canopy (NRCan, Canada only)."),
+    buildings: bool = typer.Option(True, help="Buildings from OSM + Microsoft footprints."),
+    guardrails: bool = typer.Option(
+        True,
+        help="Guardrails where OSM or guardrails.json has them, and on bridge approaches "
+        "(bridges always keep their parapets).",
+    ),
+    scenery_density: float = typer.Option(
+        1.0, min=0.0, max=2.0, help="Tree budget multiplier (0 = no trees, 1 = default cap)."
+    ),
+    guardrails_file: Path = typer.Option(
+        None,
+        exists=True,
+        dir_okay=False,
+        help="Guardrail spans JSON ([{side, from_m, to_m}], metres from A). Default: "
+        "guardrails.json next to --route, if there is one.",
+    ),
     cache_dir: Path = _CACHE,
     osm_json: Path = _OSM_JSON,
     buffer_m: float = _BUFFER,
@@ -188,6 +205,7 @@ def build(
     from driftmaps.ac.track_files import make_track_id, validate_track_id
     from driftmaps.build import BuildOptions, build_track
     from driftmaps.config import find_ac_root, tracks_dir
+    from driftmaps.geo.barriers import USER_SPANS_FILE
     from driftmaps.geo.router import Route
 
     # Refuse to overwrite somebody else's track before any download or build work.
@@ -210,6 +228,8 @@ def build(
 
     if route_json is not None:
         r = Route.load(route_json)
+        if guardrails_file is None and (route_json.parent / USER_SPANS_FILE).is_file():
+            guardrails_file = route_json.parent / USER_SPANS_FILE
     else:
         r = _route(_pins(start, end, via), cache_dir, osm_json, buffer_m, offline, refresh)
     if reverse:
@@ -223,6 +243,12 @@ def build(
         texture_format="dds" if dds else "png",
         debug_png=debug_png,
         force=force,
+        trees=trees,
+        buildings=buildings,
+        guardrails=guardrails,
+        scenery_density=scenery_density,
+        guardrails_file=guardrails_file,
+        offline=offline,
     )
     if dem_file is not None:
         from driftmaps.elevation.sources import local_dem_source

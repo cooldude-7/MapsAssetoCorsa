@@ -80,6 +80,12 @@ def fixture_options(cache_dir: Path, **kw) -> BuildOptions:
         elevation_chain=["hrdem-fixture"],
         terrain=TEST_TERRAIN,
         debug_png=False,
+        # Offline: no lidar trees or buildings here (tests/test_build_scenery.py injects them);
+        # no OSM barriers, so the only rails are the bridge approaches'.
+        trees=False,
+        buildings=False,
+        osm_barriers=(),
+        offline=True,
     )
     return BuildOptions(**(args | kw))
 
@@ -252,7 +258,7 @@ def test_terrain_hole_matches_road(kn5, built):
 
 
 def test_walls_do_not_cross_road(kn5, built):
-    walls = meshes(kn5, r"1WALL_")
+    walls = meshes(kn5, r"1WALL_c")  # the corridor walls (rails/parapets stand at the edge)
     road = triangles(meshes(kn5, r"(1ROAD|1GRAVEL)_"))
     foot = shapely.union_all(shapely.polygons(road[:, :, [0, 2]]))
     verge = 4.0
@@ -414,6 +420,10 @@ def test_cli_route_and_build(tmp_path, monkeypatch):
             "--dem-file",
             str(FIXTURES / "dem" / "hrdem_forks_5m.tif"),
             "--no-debug-png",
+            "--no-trees",
+            "--no-buildings",
+            "--no-guardrails",
+            "--offline",
             "--zip",
             str(tmp_path / "t.zip"),
         ],
@@ -459,7 +469,7 @@ def test_wall_tops_stand_above_the_road(kn5, built):
     road runs on a bridge or a fill high above the ground the wall stands on."""
     model = built.geometry.model
     tree = cKDTree(model.centre[:, [0, 2]])
-    for w in meshes(kn5, r"1WALL_"):
+    for w in meshes(kn5, r"1WALL_c"):
         pairs = w.positions.astype(np.float64).reshape(-1, 2, 3)  # (top, bottom) per row
         top = pairs[np.arange(len(pairs)), np.argmax(pairs[:, :, 1], axis=1)]
         _, i = tree.query(top[:, [0, 2]])

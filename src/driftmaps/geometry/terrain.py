@@ -17,7 +17,11 @@ Design (PLAN §5.2 "Terrain", §5.3; docs/research/geo.md §2.5, §3.4, §3.5):
   so the clamp fades out with distance. Taking the max/min over all nearby stations handles
   hairpins: legs share one terrain, and where two legs disagree (stacked switchbacks) the
   midpoint is used. Bridge stations put no hole in the terrain, never pull terrain up (no fill
-  under a deck) and push it at least `bridge_clearance_m` below the deck.
+  under a deck) and push it at least `bridge_clearance_m` below the deck, so under a bridge
+  the real (lidar) ground shows wherever it lies lower: the creek valley, not a dug pit.
+- **Deck safety net:** `clamp_heights` lowers terrain points to a ceiling (e.g.
+  `geometry.bridges.deck_ceiling`) and recomputes normals and materials, so no terrain can
+  rise into a bridge deck whatever the DEM says.
 - **Materials by slope:** near triangles steeper than `dirt_slope_deg` are dirt/rock, the rest
   grass. Near terrain (within `near_m` of the road) is physical (`1GRASS_t###`, `1DIRT_t###`);
   far terrain is visual only.
@@ -27,6 +31,7 @@ Works in the AC horizontal plane (X = east, Z = south); heights are AC Y.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -38,7 +43,7 @@ from scipy.spatial import Delaunay, cKDTree
 from driftmaps.geometry.primitives import MeshData, compute_tangents
 from driftmaps.geometry.road import RoadModel, footprint_polygon
 
-__all__ = ["Terrain", "TerrainOptions", "build_terrain", "terrain_points"]
+__all__ = ["Terrain", "TerrainOptions", "build_terrain", "clamp_heights", "terrain_points"]
 
 HeightFn = Callable[[np.ndarray, bool], np.ndarray]
 
@@ -60,7 +65,11 @@ class TerrainOptions:
     batter_free_m: float = 20.0
     batter_widen: float = 0.05  # 1/m: quadratic widening of the batter bounds beyond free_m
     influence_m: float = 120.0
-    bridge_clearance_m: float = 3.0
+    # Terrain under a bridge deck stays this far below the road surface: the deck
+    # (geometry.bridges, 1.0 m) + 0.3 m air + the cut batter over the 0.35 m railing overhang
+    # (1.2 x 0.35), so the slab and its fascias never touch the ground. The real ground shows
+    # wherever it lies lower (it was 3.0 m, which dug a pit under every bridge end).
+    bridge_clearance_m: float = 1.8
     dirt_slope_deg: float = 35.0
     max_edge_m: float = 100.0
     station_step: int = 2  # use every n-th station for the cut/fill bounds
@@ -314,17 +323,7 @@ def build_terrain(
     n = np.cross(pos[tris[:, 1]] - pos[tris[:, 0]], pos[tris[:, 2]] - pos[tris[:, 0]])
     flip = n[:, 1] < 0
     tris[flip] = tris[flip][:, [0, 2, 1]]
-    n[flip] *= -1
-    vnorm = np.zeros_like(pos)
-    for k in range(3):
-        np.add.at(vnorm, tris[:, k], n)
-    length = np.linalg.norm(vnorm, axis=1)
-    vnorm = np.where(
-        length[:, None] > 1e-12, vnorm / np.maximum(length, 1e-12)[:, None], [0.0, 1.0, 0.0]
-    )
-
-    tri_n = n / np.maximum(np.linalg.norm(n, axis=1), 1e-12)[:, None]
-    dirt = tri_n[:, 1] < math.cos(math.radians(options.dirt_slope_deg))
+    vnorm, dirt = _shading(pts, heights, tris, options.dirt_slope_deg)
     tcent = (pts[tris[:, 0]] + pts[tris[:, 1]] + pts[tris[:, 2]]) / 3.0
     xz = model.centre[:, [0, 2]]
     d, i = cKDTree(xz).query(tcent)
@@ -341,6 +340,47 @@ def build_terrain(
         delaunay=tri,
         kept=keep,
     )
+
+
+def _shading(
+    pts: np.ndarray, heights: np.ndarray, tris: np.ndarray, dirt_slope_deg: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """(vertex normals (M, 3), dirt flag per triangle (T,)) of up-facing triangles."""
+    pos = np.stack([pts[:, 0], heights, pts[:, 1]], axis=1)
+    n = np.cross(pos[tris[:, 1]] - pos[tris[:, 0]], pos[tris[:, 2]] - pos[tris[:, 0]])
+    vnorm = np.zeros_like(pos)
+    for k in range(3):
+        np.add.at(vnorm, tris[:, k], n)
+    length = np.linalg.norm(vnorm, axis=1)
+    vnorm = np.where(
+        length[:, None] > 1e-12, vnorm / np.maximum(length, 1e-12)[:, None], [0.0, 1.0, 0.0]
+    )
+    tri_n = n / np.maximum(np.linalg.norm(n, axis=1), 1e-12)[:, None]
+    dirt = tri_n[:, 1] < math.cos(math.radians(dirt_slope_deg))
+    return vnorm, dirt
+
+
+def clamp_heights(
+    terrain: Terrain, ceiling: np.ndarray, options: TerrainOptions | None = None
+) -> tuple[Terrain, int]:
+    """Lower every grid point above `ceiling` (M,) (one value per `terrain.points`; +inf = no
+    limit, e.g. `geometry.bridges.deck_ceiling(model, plans, terrain.points)`) to it.
+
+    The road's shoulder-edge points are never moved (they must meet the road mesh). Normals
+    and the grass/dirt split are recomputed; triangle winding stays valid because lowering
+    a point does not change a triangle's orientation seen from above. Returns the new terrain
+    and how many points moved."""
+    options = options or TerrainOptions()
+    ceiling = np.asarray(ceiling, np.float64).reshape(-1)
+    if ceiling.shape != terrain.heights.shape:
+        raise ValueError(f"need one ceiling per terrain point, got {ceiling.shape}")
+    move = (terrain.heights > ceiling) & ~terrain.is_edge
+    if not move.any():
+        return terrain, 0
+    heights = np.where(move, ceiling, terrain.heights)
+    normals, dirt = _shading(terrain.points, heights, terrain.triangles, options.dirt_slope_deg)
+    out = dataclasses.replace(terrain, heights=heights, normals=normals, dirt=dirt)
+    return out, int(move.sum())
 
 
 def tile_keys(terrain: Terrain, select: np.ndarray, tile_m: float) -> np.ndarray:

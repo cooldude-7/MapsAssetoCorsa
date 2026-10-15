@@ -23,8 +23,25 @@ Pipeline (PLAN §5.1-§5.5, docs/research/geo.md §1-§3, ac_format.md §2, §3,
    nearest road, so they hold on fills and bridges too. The AI line follows the centre of
    the driving lane (right in Canada/US/France, left in Japan/UK) from the start of the run-up
    to `ai_past_b_m` past B; the run-off road ends in the corridor's end wall.
-6. **Files** (`ac.track_files`): surfaces (ROAD, GRASS, GRAVEL, DIRT), map, cameras, UI, credits
-   (`LICENSE-DATA.txt`, `route_osm.geojson`, `route.json`).
+6. **Scenery** (M2, docs/research/scenery.md §7), every part optional (`trees`, `buildings`,
+   `guardrails`) and failing soft (a download error becomes a warning, never a failed build):
+   - **Bridges** (`geometry.bridges`, always): deck slab, concrete parapets with hidden
+     collision, abutments and piers under every OSM bridge span. The terrain under a deck is
+     the real lidar ground, kept `TerrainOptions.bridge_clearance_m` below the road and, as a
+     safety net, clamped under `bridges.deck_ceiling` (no terrain through a deck).
+   - **Guardrails** (`geo.barriers`, `geometry.barriers`): only real ones: OSM
+     `barrier=guard_rail|jersey_barrier|wall|retaining_wall` beside the road, the user's
+     `guardrails.json` (`guardrails_file`), and rails on bridge approaches.
+   - **Buildings** (`geo.buildings`, `geometry.buildings`): OSM + Microsoft footprints, lidar
+     heights, outside the wall corridor.
+   - **Trees** (`geometry.vegetation`): lidar tree tops (DSM - DTM) with NRCan land cover
+     kinds, trunks kept outside the hidden walls (a car can never drive through a tree) and off
+     building footprints; `scenery_density` scales the tree budget.
+   All of it goes into the one KN5 (tree and building atlases as DDS); the trees' and
+   buildings' data sources are credited in LICENSE-DATA.txt.
+7. **Files** (`ac.track_files`): surfaces (ROAD, GRASS, GRAVEL, DIRT), map, cameras, UI, credits
+   (`LICENSE-DATA.txt`, `route_osm.geojson`, `route.json`, and `guardrails.json` if one was
+   used).
 
 `build_track(route, out_dir, options)` writes `<out_dir>/<track_id>/` (replacing an existing
 folder only if drift-maps made it, or with `options.force`) and returns a
@@ -34,23 +51,28 @@ bytes (no clocks or random numbers in the output).
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import json
+import shutil
 import time
+import urllib.error
 import warnings
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 import numpy as np
+import shapely
 from PIL import Image, ImageDraw
 from scipy.spatial import cKDTree
 
 from driftmaps.ac.ai_line import AiLine, build_ai_line
+from driftmaps.ac.building_textures import building_atlas_texture
 from driftmaps.ac.coords import WORLD_UP
 from driftmaps.ac.kn5 import write_kn5
-from driftmaps.ac.model import Dummy, Kn5, Texture
+from driftmaps.ac.model import Dummy, Kn5, Mesh, Texture
 from driftmaps.ac.scene import (
     DECAL_FLAGS,
     HIDDEN_WALL_FLAGS,
@@ -89,12 +111,56 @@ from driftmaps.ac.track_files import (
     write_surfaces_ini,
     write_ui_track_json,
 )
+from driftmaps.ac.tree_textures import tree_atlas_texture
 from driftmaps.elevation import road_profile, sample_elevation
-from driftmaps.elevation.sources import ElevationSource, SourceInfo, default_sources, region_of
+from driftmaps.elevation.sources import (
+    ElevationSource,
+    SourceInfo,
+    SourceUnavailable,
+    default_sources,
+    region_of,
+)
 from driftmaps.geo.attributes import MAX_WIDTH_M, MIN_DRIVE_WIDTH_M, region_for
-from driftmaps.geo.overpass import OSM_ATTRIBUTION
+from driftmaps.geo.barriers import (
+    BarrierSpan,
+    OsmBarrier,
+    fetch_barriers,
+    load_user_spans,
+    match_barriers,
+)
+from driftmaps.geo.buildings import (
+    BuildingFootprints,
+    Footprint,
+    fetch_buildings,
+    fetch_ms_buildings,
+)
+from driftmaps.geo.overpass import OSM_ATTRIBUTION, OverpassError
 from driftmaps.geo.project import LocalProjection
 from driftmaps.geo.router import Route
+from driftmaps.geometry.barriers import (
+    ScenePiece,
+    barrier_pieces,
+    concrete_texture,
+    plan_barriers,
+    steel_texture,
+)
+from driftmaps.geometry.bridges import (
+    BridgeOptions,
+    BridgePlan,
+    bridge_pieces,
+    bridge_spans,
+    deck_ceiling,
+    deck_half_width,
+    plan_bridge,
+    terrain_through_deck,
+)
+from driftmaps.geometry.buildings import (
+    Building,
+    BuildingStats,
+    building_scene,
+    buildings_polygon,
+    place_buildings,
+)
 from driftmaps.geometry.primitives import MeshData, split
 from driftmaps.geometry.road import (
     RoadMeshes,
@@ -102,10 +168,30 @@ from driftmaps.geometry.road import (
     build_road_meshes,
     extend_straight,
     fillet_corners,
+    road_columns,
     simplify,
     smooth_centreline,
 )
-from driftmaps.geometry.terrain import Terrain, TerrainOptions, build_terrain, tile_keys
+from driftmaps.geometry.terrain import (
+    Terrain,
+    TerrainOptions,
+    build_terrain,
+    clamp_heights,
+    tile_keys,
+)
+from driftmaps.geometry.vegetation import (
+    BUSH,
+    CONIFER,
+    CanopyFn,
+    CanopySampler,
+    LandcoverFn,
+    LandcoverSampler,
+    TreeSet,
+    TreeStats,
+    VegetationOptions,
+    place_trees,
+    tree_scene,
+)
 from driftmaps.geometry.walls import WallLines, corridor_polygon, wall_lines, wall_meshes
 
 __all__ = [
@@ -216,6 +302,22 @@ class BuildOptions:
     elevation_prefer: str | Sequence[str] | None = None
     debug_png: bool = True
     force: bool = False  # replace an existing <id> folder even if drift-maps did not make it
+    # Scenery (M2). Bridges always get their structure and parapets.
+    trees: bool = True
+    buildings: bool = True
+    guardrails: bool = True  # OSM barriers, guardrails.json and bridge-approach rails
+    scenery_density: float = 1.0  # scales the tree budget (0 = no trees, 2 = twice the cap)
+    guardrails_file: Path | None = None  # user spans (route metres from A); see geo.barriers
+    microsoft_buildings: bool = True  # add Microsoft footprints where OSM has none
+    offline: bool = False  # scenery downloads (Overpass, Microsoft) come from the cache only
+    bridge: BridgeOptions = field(default_factory=BridgeOptions)
+    vegetation: VegetationOptions = field(default_factory=VegetationOptions)
+    # Data hooks for tests and power users; None = the live sources (NRCan lidar + land cover,
+    # Overpass, Microsoft). Factories get the build's projection (AC XZ <-> lon/lat).
+    canopy_source: Callable[[LocalProjection], CanopyFn] | None = None
+    landcover_source: Callable[[LocalProjection], LandcoverFn] | None = None
+    osm_barriers: Sequence[OsmBarrier] | None = None
+    building_footprints: Sequence[Footprint] | None = None
 
 
 @dataclass
@@ -226,6 +328,7 @@ class BuildResult:
     warnings: list[str]
     geometry: TrackGeometry | None = field(default=None, repr=False)
     debug_images: list[Path] = field(default_factory=list)
+    scenery: _Scenery | None = field(default=None, repr=False)  # trees, buildings, rails, bridges
 
     def summary(self) -> str:
         s = self.stats
@@ -236,10 +339,38 @@ class BuildResult:
             f"climb    {s['elevation_min_m']:.1f} .. {s['elevation_max_m']:.1f} m, max grade "
             f"{100 * s['max_grade']:.1f}%",
             f"DEM      {s['elevation_source']} (road coverage {s['elevation_coverage']})",
-            f"KN5      {s['kn5_bytes'] / 1e6:.1f} MB, {s['mesh_count']} meshes, vertices "
+            f"KN5      {s['kn5_bytes'] / 1e6:.1f} MB, {s['mesh_count']} meshes "
+            f"({s['draw_meshes']} drawn, {s['collision_meshes']} hidden walls), vertices "
             + ", ".join(f"{k} {v:,}" for k, v in s["vertices"].items()),
-            f"time     {s['build_s']:.1f} s",
         ]
+        sc = s.get("scenery") or {}
+        if sc:
+            tr = sc["trees"]
+            lines.append(
+                f"trees    {tr['total']:,} (near {tr['near']:,}, far {tr['far']:,}; deciduous "
+                f"{tr['deciduous']:,}, conifer {tr['conifer']:,}, bush {tr['bush']:,}) in "
+                f"{tr['meshes']} meshes"
+            )
+            bd = sc["buildings"]
+            lines.append(
+                f"houses   {bd['buildings']} buildings ({bd['footprints_osm']} OSM + "
+                f"{bd['footprints_microsoft']} Microsoft footprints found), heights "
+                + (", ".join(f"{k} {v}" for k, v in sorted(bd["height_source"].items())) or "-")
+            )
+            rails = ", ".join(f"{k} {v:.0f} m" for k, v in sorted(sc["barriers_m"].items()))
+            lines.append(
+                f"rails    {rails or 'none'} (OSM barriers found: {sc['osm_barriers']}, "
+                f"guardrails.json spans: {sc['user_spans']})"
+            )
+            for b in sc["bridges"]:
+                lines.append(
+                    f"bridge   {b['length_m']:.0f} m at {b['from_a_m']:.0f} m from A, deck up to "
+                    f"{b['max_height_m']:.1f} m above ground, {b['piers']} piers"
+                    + (" (solid: culvert/embankment)" if b["solid"] else "")
+                )
+            if sc["deck_intrusion_m"] > 0:
+                lines.append(f"warning  terrain {sc['deck_intrusion_m']:.2f} m into a bridge deck")
+        lines.append(f"time     {s['build_s']:.1f} s")
         lines += [f"warning  {w}" for w in self.warnings]
         return "\n".join(lines)
 
@@ -648,6 +779,8 @@ _IMAGES = {
     "paint_white": lambda: solid_texture((235, 235, 230), 16),
     "paint_yellow": lambda: solid_texture((235, 180, 20), 16),
     "wall_hidden": lambda: solid_texture((255, 0, 255), 16),
+    "concrete": concrete_texture,  # bridges, parapets, jersey barriers, walls
+    "steel": steel_texture,  # W-beam guardrails, steel bridge rails
 }
 
 
@@ -659,6 +792,17 @@ def _texture_data(name: str) -> bytes:
 
 def _texture(name: str) -> Texture:
     return Texture(name=name, data=_texture_data(name))
+
+
+# The scenery atlases take seconds to paint and never change: one copy per process. Always DDS:
+# the tree atlas needs its coverage-preserving alpha mips (scenery.md §4.1, §6).
+TREE_ATLAS = "dm_trees.dds"
+BUILDING_ATLAS = "dm_buildings.dds"
+
+
+@functools.cache
+def _atlas(name: str) -> Texture:
+    return tree_atlas_texture(name) if name == TREE_ATLAS else building_atlas_texture(name)
 
 
 def _tiles(terrain: Terrain, select: np.ndarray, tile_m: float) -> list[np.ndarray]:
@@ -697,7 +841,12 @@ def _assemble_kn5(
     walls: list[MeshData],
     dummies: list[Dummy],
     ext: str,
-) -> tuple[Kn5, dict[str, int]]:
+    scenery: _Scenery | None = None,
+    ground: Callable[[np.ndarray], np.ndarray] | None = None,
+) -> tuple[Kn5, dict[str, int], dict[str, object]]:
+    """The track's one KN5: road, terrain, hidden walls, then the scenery (bridges, barriers,
+    buildings, trees) and the dummies. Returns it with vertex counts per category and the
+    tree/building statistics."""
     scene = Scene(track_id, _texture)
     mats = {
         name: scene.material(name, f"{tex}{ext}")
@@ -759,8 +908,303 @@ def _assemble_kn5(
             "walls",
             **HIDDEN_WALL_FLAGS,
         )
+    extra: dict[str, object] = {"trees": TreeStats(), "buildings": BuildingStats()}
+    if scenery is not None:
+        for piece in scenery.pieces:
+            if piece.physical:
+                key = "scenery_collision"
+            elif piece.name.startswith("bridge"):
+                key = "bridges"
+            else:
+                key = "barriers"
+            mat = scene.material(piece.material, f"{piece.texture}{ext}")
+            _add_split(scene, piece.mesh, piece.name, mat, counts, key, **piece.flags)
+        if scenery.buildings:
+            scene.textures.setdefault(BUILDING_ATLAS, _atlas(BUILDING_ATLAS))
+            stats = building_scene(scene, scenery.buildings, texture_format="dds")
+            counts["buildings"] = stats.vertices
+            extra["buildings"] = stats
+        if scenery.trees is not None and len(scenery.trees) and ground is not None:
+            scene.textures.setdefault(TREE_ATLAS, _atlas(TREE_ATLAS))
+            stats = tree_scene(scene, scenery.trees, ground, texture_format="dds")
+            counts["trees"] = stats.vertices
+            extra["trees"] = stats
     scene.add(*dummies)
-    return scene.kn5(), counts
+    return scene.kn5(), counts, extra
+
+
+# --------------------------------------------------------------------------------------------
+# Scenery: bridges, guardrails, buildings, trees (scenery.md §7)
+# --------------------------------------------------------------------------------------------
+
+# Tree trunks stay this far outside the hidden walls' corridor (road + shoulder + verge), so a
+# car can never reach a tree card, which has no collision (scenery.md §4.1).
+TREE_WALL_MARGIN_M = 0.5
+APPROACH_RAIL_M = 20.0  # guard rail on both sides this far before and after each bridge
+BUILDINGS_AROUND_M = 150.0  # footprints this close to the road (= BuildingOptions.max_distance_m)
+_DATA_ERRORS = (OverpassError, SourceUnavailable, OSError, urllib.error.URLError, EOFError)
+
+
+@dataclass
+class _Scenery:
+    """What the scenery step made, for the KN5, the debug images, the stats and credits."""
+
+    pieces: list[ScenePiece] = field(default_factory=list)  # bridges + barriers
+    plans: list[BridgePlan] = field(default_factory=list)
+    spans: list[BarrierSpan] = field(default_factory=list)  # roadside barriers built
+    trees: TreeSet | None = None
+    buildings: list[Building] = field(default_factory=list)
+    footprints: BuildingFootprints | None = None
+    attributions: list[str] = field(default_factory=list)
+    osm_barriers: int = 0
+    user_spans: int = 0
+    user_file: Path | None = None
+    deck_intrusion_m: float = 0.0
+    terrain_clamped: int = 0
+    ground: Callable[[np.ndarray], np.ndarray] | None = field(default=None, repr=False)
+
+
+def _ground_fn(terrain: Terrain, road_height: Callable[[np.ndarray], np.ndarray]):
+    """The visible terrain height under XZ points; the road height where there is none."""
+
+    def ground(xz: np.ndarray) -> np.ndarray:
+        h = terrain.height_at(xz)
+        bad = ~np.isfinite(h)
+        if bad.any():
+            h[bad] = road_height(np.asarray(xz, np.float64).reshape(-1, 2)[bad])
+        return h
+
+    return ground
+
+
+def _route_lonlat(geo: TrackGeometry, step: int = 5) -> np.ndarray:
+    """The built centreline (with run-up and run-off) as (N, 2) lon/lat, every `step` m."""
+    c = geo.model.centre[::step]
+    lon, lat = geo.projection.to_lonlat(c[:, 0], -c[:, 2])
+    return np.stack([np.asarray(lon), np.asarray(lat)], axis=1)
+
+
+def _bridges(
+    geo: TrackGeometry,
+    terrain: Terrain,
+    options: BuildOptions,
+    road_height: Callable[[np.ndarray], np.ndarray],
+    sc: _Scenery,
+) -> Terrain:
+    """Plan every OSM bridge, keep the terrain out of the decks (clamping it under
+    `deck_ceiling` if it still pokes in) and add the bridge pieces. Returns the terrain."""
+    m, bopt = geo.model, options.bridge
+    spans = bridge_spans(m)
+    if not spans:
+        return terrain
+    ground = _ground_fn(terrain, road_height)
+    plans = [plan_bridge(m, s0, s1, ground, bopt, k) for k, (s0, s1) in enumerate(spans)]
+    ceiling = deck_ceiling(m, plans, terrain.points, bopt)
+    terrain, sc.terrain_clamped = clamp_heights(terrain, ceiling, options.terrain)
+    ground = _ground_fn(terrain, road_height)
+    pieces, sc.plans = bridge_pieces(m, spans, ground, bopt)
+    sc.pieces += pieces
+    checks = [terrain_through_deck(m, p, ground, bopt) for p in sc.plans]
+    sc.deck_intrusion_m = max((c.max_intrusion for c in checks), default=0.0)
+    if sc.deck_intrusion_m > 0.05:
+        warnings.warn(f"terrain rises {sc.deck_intrusion_m:.2f} m into a bridge deck", stacklevel=2)
+    return terrain
+
+
+def _barriers(
+    geo: TrackGeometry,
+    ground: Callable[[np.ndarray], np.ndarray],
+    options: BuildOptions,
+    sc: _Scenery,
+) -> None:
+    """Real roadside barriers only: OSM ways, the user's guardrails.json, bridge approaches."""
+    m = geo.model
+    decks = [(p.s0, p.s1) for p in sc.plans]
+    osm_spans: list[BarrierSpan] = []
+    if options.osm_barriers is not None:
+        osm = list(options.osm_barriers)
+    else:
+        try:
+            osm = fetch_barriers(
+                _route_lonlat(geo), cache_dir=options.cache_dir, offline=options.offline
+            )
+        except _DATA_ERRORS as e:
+            warnings.warn(f"OSM guardrails unavailable ({_short(e)}); none built", stacklevel=2)
+            osm = []
+    sc.osm_barriers = len(osm)
+    if osm:
+        osm_spans = match_barriers(osm, geo.projection, m.centre[:, [0, 2]], m.s)
+    user: list[BarrierSpan] = []
+    if options.guardrails_file is not None and Path(options.guardrails_file).is_file():
+        user = load_user_spans(options.guardrails_file, s_origin=geo.s_a)
+        sc.user_file = Path(options.guardrails_file)
+    sc.user_spans = len(user)
+    sc.spans = plan_barriers(m, osm=osm_spans, user=user, bridges=decks, approach_m=APPROACH_RAIL_M)
+    sc.pieces += barrier_pieces(m, sc.spans, ground, options.bridge.barrier, bridges=decks)
+
+
+def _buildings(
+    geo: TrackGeometry,
+    ground: Callable[[np.ndarray], np.ndarray],
+    corridor: shapely.Geometry,
+    canopy: CanopyFn | None,
+    options: BuildOptions,
+    track_id: str,
+    sc: _Scenery,
+) -> None:
+    if options.building_footprints is not None:
+        fps = list(options.building_footprints)
+        osm_n = sum(f.source == "osm" for f in fps)
+        res = BuildingFootprints(fps, osm_count=osm_n, ms_count=len(fps) - osm_n)
+    else:
+        try:
+            res = fetch_buildings(
+                _route_lonlat(geo),
+                cache_dir=options.cache_dir,
+                microsoft=options.microsoft_buildings,
+                offline=options.offline,
+            )
+        except _DATA_ERRORS as e:
+            res = _microsoft_only(geo, options, e)
+            if res is None:
+                return
+        for note in res.notes:
+            warnings.warn(note, stacklevel=2)
+    sc.footprints = res
+
+    def place(c: CanopyFn | None) -> list[Building]:
+        return place_buildings(
+            res.footprints, geo.projection, geo.model, ground,
+            corridor=corridor, canopy=c, seed=track_id,
+        )  # fmt: skip
+
+    try:
+        sc.buildings = place(canopy)
+    except _DATA_ERRORS as e:
+        warnings.warn(f"lidar unavailable for building heights ({_short(e)})", stacklevel=2)
+        sc.buildings = place(None)
+    if sc.buildings:
+        sc.attributions += [a for a in res.attributions if a not in sc.attributions]
+
+
+def _short(e: Exception) -> str:
+    text = str(e).strip().splitlines()
+    return text[0][:160] if text else type(e).__name__
+
+
+def _microsoft_only(
+    geo: TrackGeometry, options: BuildOptions, error: Exception
+) -> BuildingFootprints | None:
+    """Overpass failed: fall back to the Microsoft footprints alone (place_buildings keeps
+    those near the road), or give up with a warning."""
+    if not options.microsoft_buildings:
+        warnings.warn(
+            f"building footprints unavailable ({_short(error)}); none built", stacklevel=3
+        )
+        return None
+    ll = _route_lonlat(geo)
+    pad_lat = BUILDINGS_AROUND_M / M_PER_DEG
+    pad_lon = pad_lat / max(np.cos(np.radians(float(ll[:, 1].mean()))), 0.1)
+    bbox = (
+        float(ll[:, 0].min() - pad_lon),
+        float(ll[:, 1].min() - pad_lat),
+        float(ll[:, 0].max() + pad_lon),
+        float(ll[:, 1].max() + pad_lat),
+    )
+    try:
+        ms = fetch_ms_buildings(bbox, cache_dir=options.cache_dir, offline=options.offline)
+    except _DATA_ERRORS as e2:
+        warnings.warn(
+            f"building footprints unavailable (OSM: {_short(error)}; Microsoft: {_short(e2)}); "
+            "none built",
+            stacklevel=3,
+        )
+        return None
+    warnings.warn(
+        f"OSM buildings unavailable ({_short(error)}); using Microsoft footprints only",
+        stacklevel=3,
+    )
+    return BuildingFootprints(list(ms), osm_count=0, ms_count=len(ms))
+
+
+def _trees(
+    geo: TrackGeometry,
+    canopy: CanopyFn | None,
+    options: BuildOptions,
+    track_id: str,
+    sc: _Scenery,
+) -> None:
+    density = max(0.0, float(options.scenery_density))
+    if canopy is None or density <= 0.0:
+        return
+    vopt = options.vegetation
+    vopt = dataclasses.replace(
+        vopt,
+        clearance_m=max(vopt.clearance_m, options.verge_m + TREE_WALL_MARGIN_M),
+        max_trees=int(round(vopt.max_trees * density)),
+        max_trees_per_km=vopt.max_trees_per_km * density,
+    )
+    if options.landcover_source is not None:
+        landcover = options.landcover_source(geo.projection)
+    else:
+        landcover = LandcoverSampler(geo.projection, cache_dir=options.cache_dir)
+    exclude = buildings_polygon(sc.buildings) if sc.buildings else None
+    try:
+        sc.trees = place_trees(
+            geo.model, canopy, landcover=landcover, exclude=exclude, seed=track_id, options=vopt
+        )
+    except _DATA_ERRORS as e:
+        warnings.warn(f"lidar canopy unavailable ({_short(e)}); no trees", stacklevel=2)
+        return
+    if len(sc.trees) == 0 and region_of(
+        np.array([geo.route.pins[0].snap_lon]), np.array([geo.route.pins[0].snap_lat])
+    )[0] not in ("CA", "CA-border"):
+        warnings.warn("no trees: lidar canopy heights exist only in Canada", stacklevel=2)
+    sc.attributions += [a for a in sc.trees.attributions if a not in sc.attributions]
+
+
+def _scenery_stats(sc: _Scenery, geo: TrackGeometry, extra: Mapping[str, object]) -> dict:
+    m = geo.model
+    tree_stats: TreeStats = extra["trees"]  # type: ignore[assignment]
+    bld_stats: BuildingStats = extra["buildings"]  # type: ignore[assignment]
+    trees = sc.trees.counts() if sc.trees is not None else TreeSet.empty().counts()
+    trees.update(meshes=tree_stats.meshes, vertices=tree_stats.vertices, built=tree_stats.trees)
+    barriers: dict[str, float] = {}
+    for span in sc.spans:
+        key = f"{span.kind} ({span.source})"
+        barriers[key] = barriers.get(key, 0.0) + span.length
+    bridges = []
+    for p in sc.plans:
+        s = np.linspace(p.s0, p.s1, 50)
+        c = np.stack([np.interp(s, m.s, m.centre[:, k]) for k in range(3)], axis=1)
+        bridges.append(
+            {
+                "from_a_m": p.s0 - geo.s_a,
+                "length_m": p.length,
+                "piers": len(p.piers),
+                "solid": p.solid,
+                "max_height_m": float(np.nanmax(c[:, 1] - sc.ground(c[:, [0, 2]]), initial=0.0)),
+            }
+        )
+    return {
+        "trees": trees,
+        "buildings": {
+            "buildings": bld_stats.buildings,
+            "meshes": bld_stats.meshes,
+            "vertices": bld_stats.vertices,
+            "colliding": bld_stats.colliding,
+            "height_source": dict(bld_stats.by_height_source),
+            "roofs": dict(bld_stats.by_roof),
+            "footprints_osm": sc.footprints.osm_count if sc.footprints else 0,
+            "footprints_microsoft": sc.footprints.ms_count if sc.footprints else 0,
+        },
+        "barriers_m": barriers,
+        "osm_barriers": sc.osm_barriers,
+        "user_spans": sc.user_spans,
+        "bridges": bridges,
+        "deck_intrusion_m": sc.deck_intrusion_m,
+        "terrain_points_clamped": sc.terrain_clamped,
+    }
 
 
 # --------------------------------------------------------------------------------------------
@@ -848,21 +1292,36 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
         def road_height(xz: np.ndarray) -> np.ndarray:
             return m.centre[centre_tree.query(xz)[1], 1]
 
-        def ground(xz: np.ndarray) -> np.ndarray:
-            h = terrain.height_at(xz)
-            bad = ~np.isfinite(h)
-            if bad.any():
-                h[bad] = road_height(xz[bad])
-            return h
-
+        # Scenery (scenery.md §7): bridges first (they may lower the terrain under a deck).
+        sc = _Scenery()
+        terrain = _bridges(geo, terrain, options, road_height, sc)
+        ground = _ground_fn(terrain, road_height)
+        sc.ground = ground
         walls = wall_meshes(lines, ground, road_fn=road_height)
+        if options.guardrails:
+            _barriers(geo, ground, options, sc)
+        canopy: CanopyFn | None = None
+        if options.trees or options.buildings:
+            if options.canopy_source is not None:
+                canopy = options.canopy_source(geo.projection)
+            else:
+                canopy = CanopySampler(geo.projection, cache_dir=options.cache_dir)
+        if options.buildings:
+            _buildings(geo, ground, corridor, canopy, options, track_id, sc)
+        if options.trees:
+            _trees(geo, canopy, options, track_id, sc)
+        for line in getattr(canopy, "attributions", None) or []:
+            if line not in sc.attributions:  # lidar used for building heights only
+                sc.attributions.append(line)
         dummies = _dummies(geo, options)
         ai, ai_slice = _ai_line(geo, options)
     for w in caught:
         notes.append(str(w.message))
 
     ext = ".dds" if options.texture_format == "dds" else ".png"
-    kn5, counts = _assemble_kn5(track_id, roads, terrain, walls, dummies.nodes, ext)
+    kn5, counts, kn5_extra = _assemble_kn5(
+        track_id, roads, terrain, walls, dummies.nodes, ext, sc, ground
+    )
 
     clear_track_folder(track_dir, force=options.force)
     data_dir, ui_dir = track_dir / "data", track_dir / "ui"
@@ -884,12 +1343,19 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
     region = geo.elevation.region
     country = options.country if options.country is not None else _COUNTRIES.get(region, "")
     keys, extra = _licence(geo)
+    extra += [a for a in sc.attributions if a not in extra]
     pin_a = route.pins[0]
     dem_titles = ", ".join(geo.elevation.info[n].title for n in sorted(geo.elevation.info))
+    scenery_text = ""
+    if sc.trees is not None and len(sc.trees):
+        scenery_text += " Trees placed from NRCan lidar."
+    if sc.buildings:
+        scenery_text += " Buildings from OpenStreetMap"
+        scenery_text += " and Microsoft footprints." if sc.footprints.ms_count else "."
     description = options.description or (
         f"{options.name}: {geo.length_m / 1000:.1f} km A to B on a real road, generated by "
-        f"drift-maps. Road data (c) OpenStreetMap contributors, ODbL. Elevation: {dem_titles}. "
-        "See LICENSE-DATA.txt. Not affiliated with Kunos Simulazioni."
+        f"drift-maps. Road data (c) OpenStreetMap contributors, ODbL. Elevation: {dem_titles}."
+        f"{scenery_text} See LICENSE-DATA.txt. Not affiliated with Kunos Simulazioni."
     )
     ui = UiTrack(
         name=options.name,
@@ -909,15 +1375,19 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
     write_data_license(track_dir, keys, track_name=options.name, extra_notices=extra)
     (track_dir / "route_osm.geojson").write_text(_geojson(geo), encoding="utf-8", newline="\n")
     route.save(track_dir / "route.json")
+    if sc.user_file is not None:
+        shutil.copyfile(sc.user_file, track_dir / sc.user_file.name)
 
     images: list[Path] = []
     if options.debug_png:
         images = render_debug_png(
-            out_dir / "debug" / f"{track_id}.png", geo, roads, terrain, lines, ai, dummies
-        )
+            out_dir / "debug" / f"{track_id}.png", geo, roads, terrain, lines, ai, dummies,
+            scenery=sc,
+        )  # fmt: skip
 
     z = m.centre[:, 1]
     grade = np.abs(np.diff(z) / np.diff(m.s))
+    kn5_meshes = [n for n in kn5.iter_nodes() if isinstance(n, Mesh)]
     stats: dict[str, object] = {
         "length_m": geo.length_m,
         "road_length_m": float(m.s[-1]),
@@ -936,8 +1406,12 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
             np.sqrt(np.nanmean((z - geo.raw_z)[~(m.bridge | geo.tunnel)] ** 2))
         ),
         "kn5_bytes": kn5_path.stat().st_size,
-        "mesh_count": sum(1 for n in kn5.iter_nodes() if not isinstance(n, Dummy)),
+        "mesh_count": len(kn5_meshes),
+        "draw_meshes": sum(1 for n in kn5_meshes if n.is_renderable),
+        "collision_meshes": sum(1 for n in kn5_meshes if n.name.startswith("1WALL")),
         "vertices": counts,
+        "vertices_total": int(sum(counts.values())),
+        "scenery": _scenery_stats(sc, geo, kn5_extra),
         "triangles_terrain": int(len(terrain.triangles)),
         "wall_length_m": lines.length,
         "ai_points": ai.n_points,
@@ -950,7 +1424,7 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
         )
     if route.repeated_nodes():
         notes.append("the route passes the same junction twice (it crosses itself)")
-    return BuildResult(track_dir, track_id, stats, notes, geo, images)
+    return BuildResult(track_dir, track_id, stats, notes, geo, images, sc)
 
 
 # --------------------------------------------------------------------------------------------
@@ -974,11 +1448,15 @@ def render_debug_png(
     ai: AiLine,
     dummies: _Dummies,
     *,
+    scenery: _Scenery | None = None,
     max_px: int = 2000,
 ) -> list[Path]:
-    """Top-down debug images: `<path>` (whole terrain, north up) and `<stem>_detail.png`
-    (300 m around the tightest curve). Terrain coloured by material and hill-shaded; road dark
-    grey, gravel tan, paint white/yellow, walls red, AI line blue, gates green/red, spawns cyan.
+    """Top-down debug images: `<path>` (whole terrain, north up), `<stem>_detail.png` (300 m
+    around the tightest curve) and `<stem>_bridge<k>.png` (200 m around each bridge). Terrain
+    coloured by material and hill-shaded; road dark grey, gravel tan, paint white/yellow, walls
+    red, AI line blue, gates green/red, spawns cyan. Scenery: trees as crown discs (green
+    deciduous, dark green conifer, olive bush), buildings brick red, guardrails orange, bridge
+    decks light grey with white parapets, brown abutments and black piers.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1002,12 +1480,20 @@ def render_debug_png(
         np.where(terrain.dirt[:, None], _COLOURS["far_dirt"], _COLOURS["far_grass"]),
     )
     simplex_rgb = np.full((len(terrain.kept) + 1, 3), 255.0)  # last row: outside the hull
-    simplex_rgb[np.flatnonzero(terrain.kept)] = base * (0.35 + 0.75 * shade)
+    rgb = base * (0.35 + 0.75 * shade)
+    sc = scenery or _Scenery()
+    if sc.buildings or (sc.trees is not None and len(sc.trees)):
+        rgb = 0.55 * rgb + 0.45 * 235.0  # paler ground so trees and buildings stand out
+    simplex_rgb[np.flatnonzero(terrain.kept)] = rgb
     out = []
-    for target, (a, b) in (
+    views = [
         (path, (lo, hi)),
         (path.with_name(path.stem + "_detail.png"), (c - 150.0, c + 150.0)),
-    ):
+    ]
+    for k, plan in enumerate(sc.plans):
+        bc = m.at(0.5 * (plan.s0 + plan.s1))[0][[0, 2]]
+        views.append((path.with_name(f"{path.stem}_bridge{k}.png"), (bc - 100.0, bc + 100.0)))
+    for target, (a, b) in views:
         scale = max(float(np.max(b - a)) / max_px, 0.15)
         w, h = (np.ceil((b - a) / scale).astype(int) + 1).tolist()
         xs = a[0] + (np.arange(w) + 0.5) * scale
@@ -1029,6 +1515,7 @@ def render_debug_png(
                     px(np.stack([left[i], left[i + 1], right[i + 1], right[i]])), fill=colour
                 )
 
+        _draw_scenery_under(dr, px, a, b, scale, m, sc)
         hw = m.half_width
         strip(roads.left_outer, roads.right_outer, (196, 176, 140))
         strip(m.centre + hw[:, None] * m.left, m.centre - hw[:, None] * m.left, (70, 70, 74))
@@ -1040,6 +1527,7 @@ def render_debug_png(
         for run in np.split(on, np.flatnonzero(np.diff(on) > 1) + 1):
             if len(run) > 1:
                 dr.line(px(m.centre[run]), fill=centre_colour, width=1)
+        _draw_scenery_over(dr, px, m, sc)
         for ring in lines.rings:
             dr.line(px(ring), fill=(220, 30, 30), width=2)
         dr.line(px(ai.positions.astype(np.float64)), fill=(40, 90, 230), width=2)
@@ -1052,6 +1540,95 @@ def render_debug_png(
             elif name.startswith("AC_AB_FINISH"):
                 colour = (230, 40, 40)
             dr.ellipse((x - r, y - r, x + r, y + r), fill=colour)
+        _legend(dr, sc)
         im.save(target, format="PNG", optimize=False)
         out.append(target)
     return out
+
+
+_TREE_RGB = {CONIFER: (18, 72, 46), BUSH: (122, 140, 48)}  # anything else: deciduous
+_DECIDUOUS_RGB = (46, 122, 40)
+_BUILDING_RGB = (165, 62, 48)
+_RAIL_RGB = (255, 150, 0)
+_PARAPET_RGB = (250, 250, 250)
+_ABUTMENT_RGB = (125, 95, 60)
+
+
+def _span_points(m: RoadModel, lateral: np.ndarray, s0: float, s1: float) -> np.ndarray:
+    pts = road_columns(m, lateral)
+    sel = (m.s >= s0) & (m.s <= s1)
+    return pts[sel]
+
+
+def _draw_scenery_under(dr, px, a, b, scale: float, m: RoadModel, sc: _Scenery) -> None:
+    """Buildings, trees and bridge decks, drawn before the road."""
+    for bld in sc.buildings:
+        if np.any(bld.ring.max(axis=0) < a) or np.any(bld.ring.min(axis=0) > b):
+            continue
+        dr.polygon(px(bld.ring), fill=_BUILDING_RGB, outline=(60, 20, 15))
+    trees = sc.trees
+    if trees is not None and len(trees):
+        inside = np.all((trees.xz > a - 10.0) & (trees.xz < b + 10.0), axis=1)
+        for i in np.flatnonzero(inside):
+            (x, y), r = px(trees.xz[i])[0], max(0.8, 0.8 * float(trees.radius[i]) / scale)
+            colour = _TREE_RGB.get(int(trees.kind[i]), _DECIDUOUS_RGB)
+            dr.ellipse((x - r, y - r, x + r, y + r), fill=colour)
+    if sc.plans:
+        half = deck_half_width(m)
+        lc, rc = road_columns(m, half), road_columns(m, -half)
+        for plan in sc.plans:
+            sel = (m.s >= plan.s0 - 4.0) & (m.s <= plan.s1 + 4.0)
+            ring = np.concatenate([lc[sel], rc[sel][::-1]])
+            if len(ring) >= 3:
+                dr.polygon(px(ring), fill=(205, 205, 205), outline=(90, 90, 90))
+
+
+def _draw_scenery_over(dr, px, m: RoadModel, sc: _Scenery) -> None:
+    """Guardrails, bridge parapets, abutments and piers, drawn over the road."""
+    edge = m.outer
+    for span in sc.spans:
+        sign = 1.0 if span.side == "left" else -1.0
+        pts = _span_points(m, sign * edge, span.s0, span.s1)
+        if len(pts) >= 2:
+            dr.line(px(pts), fill=_RAIL_RGB, width=3)
+    half = deck_half_width(m)
+    for plan in sc.plans:
+        for sign in (1.0, -1.0):
+            pts = _span_points(m, sign * (edge + 0.15), plan.s0, plan.s1)
+            if len(pts) >= 2:
+                dr.line(px(pts), fill=_PARAPET_RGB, width=3)
+        blocks = [(plan.s0 - 4.0, plan.s1 + 4.0)] if plan.solid else [
+            (plan.s0 - 4.0, plan.face0), (plan.face1, plan.s1 + 4.0)
+        ]  # fmt: skip
+        for s0, s1 in blocks:
+            lc = _span_points(m, half + 0.4, s0, s1)
+            rc = _span_points(m, -(half + 0.4), s0, s1)
+            if len(lc) >= 2:
+                dr.polygon(px(np.concatenate([lc, rc[::-1]])), outline=_ABUTMENT_RGB, width=3)
+        for sp in plan.piers:
+            pos, fwd, left = m.at(sp)
+            w = float(np.interp(sp, m.s, half))
+            quad = np.array(
+                [pos + w * left + 0.6 * fwd, pos + w * left - 0.6 * fwd,
+                 pos - w * left - 0.6 * fwd, pos - w * left + 0.6 * fwd]
+            )  # fmt: skip
+            dr.polygon(px(quad), fill=(15, 15, 15))
+
+
+def _legend(dr, sc: _Scenery) -> None:
+    items = [
+        ("deciduous tree", _DECIDUOUS_RGB),
+        ("conifer", _TREE_RGB[CONIFER]),
+        ("bush", _TREE_RGB[BUSH]),
+        ("building", _BUILDING_RGB),
+        ("guardrail", _RAIL_RGB),
+        ("bridge parapet", _PARAPET_RGB),
+        ("abutment", _ABUTMENT_RGB),
+        ("pier", (15, 15, 15)),
+        ("hidden wall", (220, 30, 30)),
+    ]
+    dr.rectangle((4, 4, 130, 8 + 13 * len(items)), fill=(255, 255, 255), outline=(0, 0, 0))
+    for k, (label, colour) in enumerate(items):
+        y = 8 + 13 * k
+        dr.rectangle((8, y + 1, 18, y + 10), fill=colour, outline=(0, 0, 0))
+        dr.text((24, y), label, fill=(0, 0, 0))
