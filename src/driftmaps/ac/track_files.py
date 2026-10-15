@@ -35,6 +35,7 @@ __all__ = [
     "DATA_SOURCES",
     "DEFAULT_SURFACES",
     "DEFAULT_TAGS",
+    "GENERATOR_NAME",
     "KUNOS_NOTICE",
     "MAP_INI_MAX_SIZE",
     "OUTLINE_SIZE",
@@ -255,6 +256,9 @@ def write_surfaces_ini(path: Path, surfaces: Sequence[Surface] = DEFAULT_SURFACE
 # ui/ui_track.json
 # ---------------------------------------------------------------------------------------------
 
+# Credited as the author in ui_track.json and in LICENSE-DATA.txt (the "drift-maps" ui tag and the
+# .driftmaps marker stay as they are: they are how our own tracks are recognised).
+GENERATOR_NAME = "Assetto Corsa Map Generator"
 DEFAULT_TAGS: tuple[str, ...] = ("A2B", "touge", "point-to-point", "generated")
 
 
@@ -278,7 +282,7 @@ class UiTrack:
     width: str | float = ""
     pitboxes: int = 1
     run: str = "A2B"
-    author: str = "drift-maps"
+    author: str = GENERATOR_NAME
     version: str = "1.0"
     year: int | None = None
     url: str = ""
@@ -1005,7 +1009,7 @@ def _check_sources(sources: Sequence[str]) -> list[str]:
     return list(dict.fromkeys(sources))
 
 
-def attribution_text(sources: Sequence[str], generator: str = "drift-maps") -> str:
+def attribution_text(sources: Sequence[str], generator: str = GENERATOR_NAME) -> str:
     """ASCII credit line for the ui_track.json description, e.g. for ["osm", "usgs_3dep"]."""
     parts = [_SHORT_CREDITS[s] for s in _check_sources(sources)]
     parts.append(f"Generated with {generator}. Not affiliated with Kunos Simulazioni.")
@@ -1017,7 +1021,7 @@ def write_data_license(
     sources: Sequence[str],
     *,
     track_name: str | None = None,
-    generator: str = "drift-maps",
+    generator: str = GENERATOR_NAME,
     extra_notices: Sequence[str] = (),
 ) -> Path:
     """Write `<track_dir>/LICENSE-DATA.txt` (UTF-8) with every required notice.

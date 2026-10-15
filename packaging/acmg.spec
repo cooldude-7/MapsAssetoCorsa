@@ -12,6 +12,7 @@
 # - rasterio's Cython modules import each other from C, and GDAL/PROJ need their data folders
 #   (rasterio/gdal_data, rasterio/proj_data, found next to rasterio's own files); on Windows the
 #   GDAL DLLs live in site-packages/rasterio.libs (a delvewheel folder);
+# - certifi (imported from rasterio's C code): the CA bundle GDAL uses for HTTPS downloads;
 # - driftmaps' metadata, so /api/status reports the real version.
 # numpy, scipy, shapely and Pillow come with hooks (PyInstaller, pyinstaller-hooks-contrib).
 #
@@ -96,11 +97,13 @@ def make_icon(path: Path) -> None:
     # The map pin, its tip where the road meets the horizon.
     cx, cy, r = 600, 330, 150
     pin = (229, 57, 53, 255)
-    d.polygon([(cx - r * 0.86, cy + r * 0.5), (cx + r * 0.86, cy + r * 0.5), (cx, horizon - 20)],
-              fill=pin)
+    d.polygon(
+        [(cx - r * 0.86, cy + r * 0.5), (cx + r * 0.86, cy + r * 0.5), (cx, horizon - 20)], fill=pin
+    )
     d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=pin)
-    d.ellipse((cx - r * 0.42, cy - r * 0.42, cx + r * 0.42, cy + r * 0.42),
-              fill=(255, 255, 255, 255))
+    d.ellipse(
+        (cx - r * 0.42, cy - r * 0.42, cx + r * 0.42, cy + r * 0.42), fill=(255, 255, 255, 255)
+    )
     # Rounded-square tile.
     mask = Image.new("L", (s, s), 0)
     ImageDraw.Draw(mask).rounded_rectangle((24, 24, s - 24, s - 24), radius=200, fill=255)
@@ -147,6 +150,9 @@ hiddenimports = collect_submodules("driftmaps", filter=lambda name: name not in 
 hiddenimports += collect_submodules(
     "rasterio", filter=lambda name: not name.startswith(SKIP_RASTERIO)
 )
+# rasterio's compiled _env module imports certifi to hand GDAL's curl a CA bundle; without it
+# the elevation downloads (/vsicurl/ over HTTPS) can't verify certificates on a player's PC.
+hiddenimports += ["certifi"]
 
 datas = [(str(STATIC), "driftmaps/app/static")]
 datas += collect_data_files(

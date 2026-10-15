@@ -90,11 +90,25 @@ def _pause(seconds: float | None = None) -> None:
         pass
 
 
+def port_free(port: int) -> bool:
+    """True if nothing listens on 127.0.0.1:`port` (instant, unlike an HTTP probe, which on
+    Windows takes a second or two to be refused)."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
 def _already_running() -> str | None:
+    """The URL of this app if it already runs on its usual port."""
     try:
         from driftmaps.app.server import DEFAULT_PORT, running_instance
 
-        return running_instance(DEFAULT_PORT)
+        return None if port_free(DEFAULT_PORT) else running_instance(DEFAULT_PORT)
     except Exception:
         return None
 
@@ -217,7 +231,11 @@ def _check_rasterio() -> str:
         xs, ys = warp_transform(CRS.from_epsg(4326), CRS.from_epsg(code), [-79.38], [43.65])
         if not (np.isfinite(xs[0]) and np.isfinite(ys[0]) and abs(xs[0]) > 1000):
             raise RuntimeError(f"reprojecting to EPSG:{code} failed")
-    return f"rasterio {rasterio.__version__}, GDAL {rasterio.__gdal_version__}"
+    # rasterio points GDAL's curl at certifi's CA bundle (elevation tiles come over HTTPS).
+    ca_bundle = os.environ.get("GDAL_CURL_CA_BUNDLE", "")
+    if not os.path.isfile(ca_bundle):
+        raise RuntimeError("GDAL has no CA bundle for HTTPS downloads (is certifi bundled?)")
+    return f"rasterio {rasterio.__version__}, GDAL {rasterio.__gdal_version__}, CA bundle ok"
 
 
 def _check_https_python() -> str:

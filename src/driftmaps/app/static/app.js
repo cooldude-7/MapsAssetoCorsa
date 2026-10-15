@@ -221,6 +221,64 @@ function photonLabel(props) {
   return { title, subtitle: parts.join(", ") };
 }
 
+/** The texts to search for. People type "<road> <town>", but OpenStreetMap often files a road
+ * under a different town (Snake Road near Waterdown is in Burlington), so a query of 3+ words is
+ * also searched without its last word. */
+function searchQueries(q) {
+  const words = String(q || "").trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return [];
+  const out = [words.join(" ")];
+  if (words.length >= 3) out.push(words.slice(0, -1).join(" "));
+  return out;
+}
+
+/** Photon extent [minLon, maxLat, maxLon, minLat] of an item (its point if it has none). */
+function itemExtent(item) {
+  const e = item.props && Array.isArray(item.props.extent) ? item.props.extent.map(Number) : null;
+  if (e && e.length === 4 && e.every(Number.isFinite)) return e;
+  const [lon, lat] = item.center;
+  return [lon, lat, lon, lat];
+}
+
+/** Search results from each query (`groups[i]` = results for `searchQueries(q)[i]`), merged:
+ * one entry per title + subtitle (a road split into several OSM ways becomes one result whose
+ * extent covers every piece), ranked by how many of the typed words they contain (a word in the
+ * name counts double). Ties keep the road-name-only search first, then Photon's order. */
+function mergeSearchResults(groups, q, limit = 6) {
+  const words = String(q || "").toLowerCase().split(/[\s,]+/).filter(Boolean);
+  const merged = new Map();
+  groups.forEach((items, g) => {
+    (items || []).forEach((item, i) => {
+      if (!item || !isLngLat(item.center)) return;
+      const key = `${item.title}\u0000${item.subtitle || ""}`.toLowerCase();
+      const seen = merged.get(key);
+      if (!seen) {
+        merged.set(key, { item: { ...item, props: { ...(item.props || {}) } }, group: g, order: i });
+        return;
+      }
+      const a = itemExtent(seen.item);
+      const b = itemExtent(item);
+      seen.item.props.extent = [
+        Math.min(a[0], b[0]),
+        Math.max(a[1], b[1]),
+        Math.max(a[2], b[2]),
+        Math.min(a[3], b[3]),
+      ];
+      seen.group = Math.max(seen.group, g);
+    });
+  });
+  const score = (it) => {
+    const title = String(it.title || "").toLowerCase();
+    const rest = String(it.subtitle || "").toLowerCase();
+    return words.reduce((n, w) => n + (title.includes(w) ? 2 : rest.includes(w) ? 1 : 0), 0);
+  };
+  return [...merged.values()]
+    .map((m) => ({ ...m, score: score(m.item) }))
+    .sort((x, y) => y.score - x.score || y.group - x.group || x.order - y.order)
+    .slice(0, limit)
+    .map((m) => m.item);
+}
+
 function formatDate(v) {
   if (v == null || v === "") return "";
   const d = typeof v === "number" ? new Date(v < 1e12 ? v * 1000 : v) : new Date(v);
@@ -1188,15 +1246,23 @@ async function runSearch(q) {
   const ctrl = new AbortController();
   state.search.abort = ctrl;
   const c = state.map ? state.map.getCenter() : { lng: HOME_VIEW.center[0], lat: HOME_VIEW.center[1] };
-  const params = new URLSearchParams({ q, limit: "5", lat: c.lat.toFixed(4), lon: c.lng.toFixed(4), lang: "en" });
-  try {
+  const fetchOne = async (text) => {
+    const params = new URLSearchParams({ q: text, limit: "8", lat: c.lat.toFixed(4), lon: c.lng.toFixed(4), lang: "en" });
     const res = await fetch(`${PHOTON_URL}?${params}`, { signal: ctrl.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    if (ctrl !== state.search.abort || $("search").value.trim() !== q) return;
-    const items = (data.features || [])
+    return (data.features || [])
       .filter((f) => f && f.geometry && isLngLat(f.geometry.coordinates))
       .map((f) => ({ ...photonLabel(f.properties), center: f.geometry.coordinates, props: f.properties || {} }));
+  };
+  try {
+    const [first, ...rest] = searchQueries(q).map(fetchOne);
+    // The extra (road name only) search is a bonus: if it fails, show the main results.
+    const extra = rest.map((p) => p.catch(() => []));
+    const groups = [await first];
+    for (const p of extra) groups.push(await p);
+    if (ctrl !== state.search.abort || $("search").value.trim() !== q) return;
+    const items = mergeSearchResults(groups, q);
     renderResults(items, items.length ? "" : "No places found. Try a road name and a town.");
   } catch (err) {
     if (err && err.name === "AbortError") return;
@@ -1728,6 +1794,9 @@ function initialStyleKey() {
 }
 
 function boot() {
+  // Read-only handle for troubleshooting from the browser console and for the end-to-end test
+  // (tests/test_app_e2e.py clicks map positions through map.project).
+  window.acmg = Object.freeze({ state, get map() { return state.map; } });
   setMapStyle(initialStyleKey());
   bindUi();
   initMap();

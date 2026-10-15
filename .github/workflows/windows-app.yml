@@ -18,6 +18,10 @@ concurrency:
 
 env:
   ZIP: AssettoCorsaMapGenerator-windows.zip
+  # Use the official CPython from setup-python (PyInstaller's best-supported build), never a
+  # uv-downloaded one.
+  UV_PYTHON: "3.12"
+  UV_PYTHON_PREFERENCE: only-system
 
 jobs:
   windows-app:
@@ -31,7 +35,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python 3.12
-        id: py
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -42,8 +45,6 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        env:
-          UV_PYTHON: ${{ steps.py.outputs.python-path }}
         run: uv sync --locked
 
       # A failing test doesn't stop the build (the player can still get a working app while a

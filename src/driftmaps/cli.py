@@ -1,4 +1,6 @@
-"""Command-line entry point: `drift-maps ...` (or `python -m driftmaps ...`)."""
+"""Assetto Corsa Map Generator's command line: `drift-maps ...` (or `python -m driftmaps ...`).
+
+`drift-maps ui` starts the map app; the other commands are the same steps, one at a time."""
 
 from __future__ import annotations
 
@@ -11,7 +13,8 @@ if TYPE_CHECKING:
     from driftmaps.geo.router import Route
 
 app = typer.Typer(
-    help="Turn real roads into Assetto Corsa tracks.",
+    help="Assetto Corsa Map Generator: turn real roads into Assetto Corsa tracks. "
+    "Run `drift-maps ui` to pick a road on a map.",
     no_args_is_help=True,
     add_completion=False,
 )
@@ -39,6 +42,22 @@ def check_zip_size(zip_path: Path) -> float:
             err=True,
         )
     return mb
+
+
+@app.command()
+def ui(
+    port: int = typer.Option(
+        None, help="Port on 127.0.0.1 (default: 8765, or the next free one)."
+    ),
+    browser: bool = typer.Option(True, help="Open the page in your web browser."),
+    data_dir: Path = typer.Option(
+        None, help="App data folder (default: the per-user app folder)."
+    ),
+) -> None:
+    """Start the map app: click two points on a map, get the track built and installed."""
+    from driftmaps.app import run
+
+    run(port=port, open_browser=browser, data_dir=data_dir)
 
 
 @app.command()
@@ -188,7 +207,7 @@ def build(
     ),
     force: bool = typer.Option(
         False,
-        help="Replace an existing track folder of that id even if drift-maps did not make it.",
+        help="Replace an existing track folder of that id even if this tool did not make it.",
     ),
     splits: int = typer.Option(
         0, min=0, max=1, clamp=True, help="Intermediate timing splits (AC_TIME_0): 0 or 1."

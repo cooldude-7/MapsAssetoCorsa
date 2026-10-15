@@ -416,6 +416,29 @@ def test_launcher_passes_exit_codes_through(
     assert launcher.main(["--no-browser", "--port", "1"]) == 0
 
 
+def test_port_free(launcher: ModuleType) -> None:
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        s.listen()
+        port = s.getsockname()[1]
+        assert not launcher.port_free(port)
+
+
+def test_already_running_finds_the_app(
+    launcher: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import driftmaps.app.server as server
+
+    monkeypatch.setattr(launcher, "port_free", lambda port: True)
+    assert launcher._already_running() is None  # nothing listening: no HTTP probe at all
+    seen: list[int] = []
+    monkeypatch.setattr(launcher, "port_free", lambda port: False)
+    monkeypatch.setattr(server, "running_instance", lambda port: seen.append(port) or "url")
+    assert launcher._already_running() == "url" and seen == [server.DEFAULT_PORT]
+
+
 def test_self_test_passes_here(launcher: ModuleType, capsys) -> None:
     assert launcher.main(["--self-test"]) == 0
     out = capsys.readouterr().out
@@ -546,6 +569,19 @@ def test_guide_covers_the_player_steps(launcher: ModuleType) -> None:
         assert phrase in text, phrase
     steps_section = text.split("## 4.", 1)[1].split("\n## ", 1)[0]
     assert re.findall(r"^\d\. ", steps_section, re.M) == [f"{i}. " for i in range(1, 7)]
+
+
+def test_spec_windows_version_info() -> None:
+    pytest.importorskip("pefile")  # PyInstaller's Windows-only dependency
+    fn = next(
+        n
+        for n in spec_tree().body
+        if isinstance(n, ast.FunctionDef) and n.name == "_windows_version_info"
+    )
+    namespace: dict = {"APP_NAME": APP_NAME, "APP_TITLE": "Assetto Corsa Map Generator"}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(SPEC), "exec"), namespace)
+    info = namespace["_windows_version_info"]("0.1.0")
+    assert info.toRaw() and "AssettoCorsaMapGenerator.exe" in str(info)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows console only")
