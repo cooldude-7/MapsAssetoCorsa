@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Assetto Corsa Map Generator</title>
+  <meta name="description" content="Click two points on a map and turn the real road into an Assetto Corsa track.">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="favicon.svg" alt="" width="28" height="28">
+      <h1>Assetto Corsa Map Generator</h1>
+    </div>
+    <div class="topbar-right">
+      <button id="ac-pill" class="pill" type="button" data-kind="pending" aria-controls="ac-panel"
+              aria-expanded="false">Checking for Assetto Corsa…</button>
+      <button id="style-toggle" class="btn ghost small" type="button">Dark map</button>
+    </div>
+  </header>
+
+  <section id="ac-panel" class="ac-panel" hidden>
+    <form id="ac-form" class="ac-form" autocomplete="off">
+      <p id="ac-message" class="ac-message"></p>
+      <label for="ac-root">Your <strong>assettocorsa</strong> folder</label>
+      <div class="row">
+        <input id="ac-root" type="text" spellcheck="false"
+               placeholder="C:\Program Files (x86)\Steam\steamapps\common\assettocorsa">
+        <button id="ac-save" class="btn primary" type="submit">Save</button>
+        <button id="ac-cancel" class="btn ghost" type="button">Not now</button>
+      </div>
+      <p class="hint">Find it in Steam: right-click Assetto Corsa, then Manage, then Browse local
+        files. Copy the path from the top of the window and paste it here.</p>
+      <p id="ac-error" class="error-text" role="alert" hidden></p>
+    </form>
+  </section>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <section class="card" aria-labelledby="route-title">
+        <div class="card-head">
+          <h2 id="route-title"><span class="step">1</span> Pick your road</h2>
+        </div>
+        <p id="route-hint" class="hint">Click the map to drop the start (A), then click again for
+          the finish (B).</p>
+        <ol id="pin-list" class="pin-list"></ol>
+        <div class="toolbar" role="toolbar" aria-label="Route tools">
+          <button id="btn-waypoint" class="btn small" type="button" aria-pressed="false"
+                  title="Add a waypoint between pins (W). Shift+click also works.">+ Waypoint</button>
+          <button id="btn-undo" class="btn small" type="button" title="Undo (Ctrl+Z)">Undo</button>
+          <button id="btn-reverse" class="btn small" type="button"
+                  title="Drive the same road the other way">Reverse</button>
+          <button id="btn-clear" class="btn small" type="button" title="Remove all pins">Clear</button>
+        </div>
+        <p id="route-status" class="status-line" role="status" aria-live="polite"></p>
+        <div id="route-info" class="route-info" hidden>
+          <div class="stat-row">
+            <div class="stat">
+              <span class="stat-label">Length</span>
+              <span id="route-length" class="stat-value">–</span>
+            </div>
+            <button id="btn-fit" class="btn ghost small" type="button">Zoom to route</button>
+          </div>
+          <ul id="route-names" class="chips" aria-label="Roads on this route"></ul>
+          <ul id="route-warnings" class="warnings"></ul>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="build-title">
+        <div class="card-head">
+          <h2 id="build-title"><span class="step">2</span> Build it</h2>
+        </div>
+        <label class="field-label" for="track-name">Track name</label>
+        <input id="track-name" type="text" maxlength="60" placeholder="Snake Road" autocomplete="off">
+        <div class="toggles">
+          <label class="switch"><input id="opt-trees" type="checkbox" checked><span>Trees</span></label>
+          <label class="switch"><input id="opt-buildings" type="checkbox" checked><span>Buildings</span></label>
+          <label class="switch"><input id="opt-guardrails" type="checkbox" checked><span>Guardrails</span></label>
+        </div>
+        <div class="range-field">
+          <label class="field-label" for="opt-density">Scenery density
+            <output id="density-out" for="opt-density">Normal</output></label>
+          <input id="opt-density" type="range" min="0" max="2" step="0.1" value="1">
+        </div>
+        <details class="advanced">
+          <summary>More options</summary>
+          <label class="field-label" for="track-id">Folder name <span class="muted">(optional)</span></label>
+          <input id="track-id" type="text" maxlength="60" placeholder="picked for you" spellcheck="false"
+                 autocomplete="off">
+          <label class="switch"><input id="opt-install" type="checkbox" checked>
+            <span>Install into Assetto Corsa when done</span></label>
+        </details>
+        <button id="btn-build" class="btn primary block" type="button" disabled>Build track</button>
+        <p id="build-hint" class="hint">Drop a start and a finish on the map first.</p>
+
+        <div id="job" class="job" hidden>
+          <div class="job-head">
+            <span id="job-step" class="job-step">Starting…</span>
+            <span id="job-pct" class="job-pct">0%</span>
+          </div>
+          <div id="job-progress" class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+               aria-valuenow="0" aria-labelledby="job-step">
+            <div id="job-bar" class="progress-bar"></div>
+          </div>
+          <div id="job-result" class="job-result" hidden></div>
+          <details id="job-log-wrap" class="job-log-wrap" hidden>
+            <summary>Show log</summary>
+            <pre id="job-log" class="job-log"></pre>
+          </details>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="tracks-title">
+        <div class="card-head">
+          <h2 id="tracks-title">My tracks</h2>
+          <button id="btn-tracks-refresh" class="icon-btn" type="button" aria-label="Refresh my tracks"
+                  title="Refresh">&#x21bb;</button>
+        </div>
+        <ul id="track-list" class="track-list"></ul>
+        <p id="tracks-empty" class="hint">Tracks you build show up here.</p>
+      </section>
+    </aside>
+
+    <section class="main">
+      <div class="map-wrap">
+        <div id="map" class="map" role="region" aria-label="Map. Click to drop pins."></div>
+        <div class="search">
+          <input id="search" type="search" role="combobox" aria-autocomplete="list" aria-expanded="false"
+                 aria-controls="search-results" autocomplete="off" spellcheck="false"
+                 placeholder="Search a road or town  ( / )" aria-label="Search for a place">
+          <ul id="search-results" class="search-results" role="listbox" hidden></ul>
+        </div>
+        <div id="map-mode" class="map-banner" hidden>Click the map to add a waypoint. Press Esc to stop.</div>
+        <div id="map-busy" class="map-busy" hidden><span class="spinner" aria-hidden="true"></span>Finding the road…</div>
+        <div id="map-error" class="map-error" role="alert" hidden></div>
+      </div>
+      <section class="profile" aria-labelledby="profile-title">
+        <div class="profile-head">
+          <h2 id="profile-title">Elevation</h2>
+          <span id="profile-stats" class="profile-stats"></span>
+          <span id="profile-source" class="muted profile-source"></span>
+        </div>
+        <div id="profile-body" class="profile-body">
+          <canvas id="profile-canvas" aria-label="Elevation profile of the route"></canvas>
+          <div id="profile-tip" class="profile-tip" hidden></div>
+          <p id="profile-empty" class="profile-empty">Drop two pins to see the elevation profile.</p>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <footer class="footer">
+    Road data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap
+    contributors</a>. Not affiliated with Kunos Simulazioni.
+  </footer>
+
+  <dialog id="confirm-dialog" class="dialog">
+    <form method="dialog">
+      <h3 id="confirm-title">Are you sure?</h3>
+      <p id="confirm-text"></p>
+      <div class="row end">
+        <button class="btn ghost" value="cancel" type="submit">Cancel</button>
+        <button id="confirm-ok" class="btn danger" value="ok" type="submit">Delete</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

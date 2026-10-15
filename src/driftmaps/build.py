@@ -324,6 +324,9 @@ class BuildOptions:
     landcover_source: Callable[[LocalProjection], LandcoverFn] | None = None
     osm_barriers: Sequence[OsmBarrier] | None = None
     building_footprints: Sequence[Footprint] | None = None
+    # Called at each major step with a short plain-English step name and the overall progress
+    # (0..1), e.g. for the local app's progress bar. None: no reports.
+    progress: Callable[[str, float], None] | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -1402,10 +1405,17 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
     track_dir = out_dir / track_id
     check_track_folder(track_dir, force=options.force)  # fail before the slow part
     notes: list[str] = []
+
+    def progress(step: str, fraction: float) -> None:
+        if options.progress is not None:
+            options.progress(step, fraction)
+
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
+        progress("Getting elevation and shaping the road", 0.0)
         geo = prepare_geometry(route, options)
         m = geo.model
+        progress("Building the road and terrain", 0.35)
         roads = build_road_meshes(m, chunk_m=options.chunk_m)
         terrain = build_terrain(
             m, roads.left_outer, roads.right_outer, _terrain_height_fn(geo), options.terrain
@@ -1419,6 +1429,7 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
             return m.centre[centre_tree.query(xz)[1], 1]
 
         # Scenery (scenery.md §7): bridges first (they may lower the terrain under a deck).
+        progress("Adding bridges, walls and guardrails", 0.45)
         sc = _Scenery()
         terrain = _bridges(geo, terrain, options, road_height, sc)
         ground = _ground_fn(terrain, road_height)
@@ -1433,17 +1444,21 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
             else:
                 canopy = CanopySampler(geo.projection, cache_dir=options.cache_dir)
         if options.buildings:
+            progress("Placing buildings", 0.55)
             _buildings(geo, ground, corridor, canopy, options, track_id, sc)
         if options.trees:
+            progress("Planting trees", 0.7)
             _trees(geo, canopy, options, track_id, sc)
         for line in getattr(canopy, "attributions", None) or []:
             if line not in sc.attributions:  # lidar used for building heights only
                 sc.attributions.append(line)
+        progress("Adding the start, timing gates and AI line", 0.82)
         dummies = _dummies(geo, options)
         ai, ai_slice = _ai_line(geo, options)
     for w in caught:
         notes.append(str(w.message))
 
+    progress("Writing the track files", 0.87)
     ext = ".dds" if options.texture_format == "dds" else ".png"
     kn5, counts, kn5_extra = _assemble_kn5(
         track_id, roads, terrain, walls, dummies.nodes, ext, sc, ground
@@ -1549,6 +1564,7 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
         )
     if route.repeated_nodes():
         notes.append("the route passes the same junction twice (it crosses itself)")
+    progress("Track built", 1.0)
     return BuildResult(track_dir, track_id, stats, notes, geo, images, sc)
 
 
