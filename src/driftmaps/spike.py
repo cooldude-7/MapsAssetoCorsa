@@ -36,27 +36,25 @@ from __future__ import annotations
 
 import functools
 import shutil
-import zipfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Unpack
 
 import numpy as np
 from PIL import Image
 
-from driftmaps.ac.ai_line import AiLine, build_ai_line, write_ai
-from driftmaps.ac.coords import WORLD_UP, frame_transform, left_of, translation_transform
+from driftmaps.ac.ai_line import AiLine, build_ai_line
+from driftmaps.ac.coords import WORLD_UP, left_of, translation_transform
 from driftmaps.ac.kn5 import write_kn5
-from driftmaps.ac.model import (
-    Dummy,
-    Kn5,
-    Material,
-    MaterialProperty,
-    Mesh,
-    Node,
-    Texture,
-    TextureMapping,
+from driftmaps.ac.model import Dummy, Kn5, Node, Texture
+from driftmaps.ac.scene import (
+    DECAL_FLAGS,
+    HIDDEN_WALL_FLAGS,
+    Scene,
+    gate_dummies,
+    spawn_dummy,
+    write_ai_files,
+    zip_tracks,
 )
 from driftmaps.ac.textures import (
     Color,
@@ -297,70 +295,20 @@ def _texture(name: str) -> Texture:
     return Texture(name=name, data=_texture_bytes(name))
 
 
-def _ks_per_pixel(name: str, texture_name: str, *, bright: bool = False) -> Material:
-    """A `ksPerPixel` material with one diffuse texture (ac_format.md §5 "v1" values).
-
-    `bright` lifts ambient so signs and markers read well in shadow.
-    """
-    return Material(
-        name=name,
-        shader="ksPerPixel",
-        properties=[
-            MaterialProperty("ksAmbient", a=0.6 if bright else 0.45),
-            MaterialProperty("ksDiffuse", a=0.6),
-            MaterialProperty("ksSpecular", a=0.08),
-            MaterialProperty("ksSpecularEXP", a=12.0),
-            MaterialProperty("ksEmissive", c=(0.0, 0.0, 0.0)),
-            MaterialProperty("ksAlphaRef", a=0.0),
-        ],
-        textures=[TextureMapping("txDiffuse", 0, texture_name)],
-    )
-
-
 # --------------------------------------------------------------------------------------------
 # Scene builder (one KN5)
 # --------------------------------------------------------------------------------------------
 
 
-class _Scene:
-    """Collects the textures, materials and root children of one KN5 file."""
+class _Scene(Scene):
+    """A `Scene` whose textures come from this module's test-texture table."""
 
     def __init__(self, root_name: str) -> None:
-        self.root_name = root_name
-        self.textures: dict[str, Texture] = {}
-        self.materials: list[Material] = []
-        self.nodes: list[Node] = []
-
-    def material(self, name: str, texture_name: str, *, bright: bool = False) -> int:
-        """Index of material `name` (one diffuse texture), adding it on first use."""
-        for i, mat in enumerate(self.materials):
-            if mat.name == name:
-                return i
-        if texture_name not in self.textures:
-            self.textures[texture_name] = _texture(texture_name)
-        self.materials.append(_ks_per_pixel(name, texture_name, bright=bright))
-        return len(self.materials) - 1
-
-    def mesh(self, data: MeshData, name: str, material: int, **flags: Unpack[MeshFlags]) -> Mesh:
-        mesh = to_kn5_mesh(data, name, material, **flags)
-        self.nodes.append(mesh)
-        return mesh
-
-    def add(self, *nodes: Node) -> None:
-        self.nodes.extend(nodes)
-
-    def kn5(self, version: int = 5) -> Kn5:
-        return Kn5(
-            root=Dummy(self.root_name, children=list(self.nodes)),
-            textures=list(self.textures.values()),
-            materials=list(self.materials),
-            version=version,
-            extra=0,
-        )
+        super().__init__(root_name, _texture)
 
 
-_HIDDEN_WALL_FLAGS: MeshFlags = {"is_renderable": False, "cast_shadows": False}
-_DECAL_FLAGS: MeshFlags = {"cast_shadows": False}
+_HIDDEN_WALL_FLAGS: MeshFlags = HIDDEN_WALL_FLAGS
+_DECAL_FLAGS: MeshFlags = DECAL_FLAGS
 
 
 def _add_ground(
@@ -415,7 +363,7 @@ def _post_at(base: np.ndarray, height: float, width: float) -> MeshData:
 def _spawn(name: str, road: Road, s: float, lateral: float, height: float) -> Dummy:
     """A spawn dummy facing down the road (+Z forward, +X = driver's left), `height` up."""
     pos, fwd, left = road.at(s)
-    return Dummy(name, frame_transform(pos + lateral * left + height * WORLD_UP, fwd))
+    return spawn_dummy(name, pos + lateral * left + height * WORLD_UP, fwd)
 
 
 @dataclass
@@ -460,11 +408,7 @@ def _gate(prefix: str, road: Road, s: float, *, swapped: bool = False) -> list[D
     each road half-width + 5 m from the centreline, oriented along the road."""
     pos, fwd, left = road.at(s)
     reach = road.half_width + GATE_EXTRA_M
-    up = GATE_HEIGHT_M * WORLD_UP
-    sides = {"L": pos + reach * left + up, "R": pos - reach * left + up}
-    if swapped:
-        sides = {"L": sides["R"], "R": sides["L"]}
-    return [Dummy(f"{prefix}_{k}", frame_transform(sides[k], fwd)) for k in ("L", "R")]
+    return gate_dummies(prefix, pos, fwd, left, reach, GATE_HEIGHT_M, swapped=swapped)
 
 
 def _gate_posts(scene: _Scene, road: Road, s: float, colour: str, name: str) -> None:
@@ -1116,41 +1060,8 @@ def write_spike_track(track: SpikeTrack, out_dir: Path) -> Path:
     write_data_license(track_dir, [], track_name=track.name)
 
     if track.ai_line is not None:
-        ai_path = write_ai(track.ai_line, track_dir / "ai" / "fast_lane.ai")
-        # COMMUNITY: data/ideal_line.ai is "the preferred ideal line shown in-game" (ai_line.md
-        # §2.2). Same bytes as fast_lane.ai.
-        (data_dir / "ideal_line.ai").write_bytes(ai_path.read_bytes())
+        write_ai_files(track.ai_line, track_dir)
     return track_dir
-
-
-# Fixed metadata so the zip is byte-identical on every build and platform.
-_ZIP_DATE = (2026, 1, 1, 0, 0, 0)
-_ZIP_FILE_MODE = 0o100644
-
-
-def zip_tracks(track_dirs: Sequence[Path], zip_path: Path) -> Path:
-    """Zip track folders with each folder at the zip root, so extracting the zip into
-    `content/tracks/` installs them. Deterministic: sorted entries, fixed dates and modes."""
-    zip_path = Path(zip_path)
-    zip_path.parent.mkdir(parents=True, exist_ok=True)
-    entries: list[tuple[str, Path]] = []
-    for track_dir in track_dirs:
-        track_dir = Path(track_dir)
-        for file in track_dir.rglob("*"):
-            if file.is_file():
-                rel = file.relative_to(track_dir.parent).as_posix()
-                entries.append((rel, file))
-    entries.sort(key=lambda e: e[0])
-    tmp = zip_path.with_name(zip_path.name + ".tmp")
-    with zipfile.ZipFile(tmp, "w") as zf:
-        for rel, file in entries:
-            info = zipfile.ZipInfo(rel, date_time=_ZIP_DATE)
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.create_system = 3  # Unix, so the mode below means the same everywhere
-            info.external_attr = _ZIP_FILE_MODE << 16
-            zf.writestr(info, file.read_bytes(), compresslevel=6)
-    tmp.replace(zip_path)
-    return zip_path
 
 
 def build_spike_tracks(
