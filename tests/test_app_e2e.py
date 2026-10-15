@@ -932,10 +932,10 @@ def test_browser_route_options(browser_page, tmp_path):
             timeout=300_000,
         )
         assert "point D" in page.text_content("#toast")
+        shot("07_far_click_refused")
         st = wait_route()
         assert len(page.evaluate(f"() => {js_state}.pins")) == 3
         assert st["route"]["route_id"] == before
-        shot("07_far_click_refused")
         assert problems == []
     finally:
         try:
