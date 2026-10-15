@@ -17,7 +17,8 @@ Design (PLAN §5.2 "Terrain", §5.3; docs/research/geo.md §2.5, §3.4, §3.5):
   so the clamp fades out with distance. Taking the max/min over all nearby stations handles
   hairpins: legs share one terrain, and where two legs disagree (stacked switchbacks) the
   midpoint is used. Bridge stations put no hole in the terrain, never pull terrain up (no fill
-  under a deck) and push it at least `bridge_clearance_m` below the deck, so under a bridge
+  under a deck: where the nearest station is on a bridge, the approaches' fill batters do not
+  apply either) and push it at least `bridge_clearance_m` below the deck, so under a bridge
   the real (lidar) ground shows wherever it lies lower: the creek valley, not a dug pit.
 - **Deck safety net:** `clamp_heights` lowers terrain points to a ceiling (e.g.
   `geometry.bridges.deck_ceiling`) and recomputes normals and materials, so no terrain can
@@ -255,6 +256,10 @@ def _batter_bounds(
         )
         lower = np.where(valid, lower, -np.inf)
         upper = np.where(valid, upper, np.inf)
+        # Under a deck (nearest station on a bridge) nothing fills the ground up: the
+        # approaches' fill batters would otherwise raise the valley floor under short bridges.
+        under_deck = valid[:, 0] & br[:, 0]
+        lower[under_deck] = -np.inf
         lo[c0 : c0 + len(p)] = lower.max(axis=1)
         hi[c0 : c0 + len(p)] = upper.min(axis=1)
     return lo, hi

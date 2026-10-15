@@ -1454,7 +1454,8 @@ def render_debug_png(
     """Top-down debug images: `<path>` (whole terrain, north up), `<stem>_detail.png` (300 m
     around the tightest curve) and `<stem>_bridge<k>.png` (200 m around each bridge). Terrain
     coloured by material and hill-shaded; road dark grey, gravel tan, paint white/yellow, walls
-    red, AI line blue, gates green/red, spawns cyan. Scenery: trees as crown discs (green
+    red, AI line blue, gates green/red, spawns cyan, distance from A every 250 m (black ticks
+    on the driver's left). Scenery: trees as crown discs (green
     deciduous, dark green conifer, olive bush), buildings brick red, guardrails orange, bridge
     decks light grey with white parapets, brown abutments and black piers.
     """
@@ -1540,6 +1541,13 @@ def render_debug_png(
             elif name.startswith("AC_AB_FINISH"):
                 colour = (230, 40, 40)
             dr.ellipse((x - r, y - r, x + r, y + r), fill=colour)
+        # Distance from A every 250 m (to place user feedback such as guardrails.json spans).
+        for d in np.arange(0.0, geo.length_m + 1.0, 250.0):
+            pos, _, left = m.at(geo.s_a + float(d))
+            reach = float(np.interp(geo.s_a + d, m.s, m.outer)) + 6.0
+            (x0, y0), (x1, y1) = px(np.stack([pos + reach * left, pos + (reach + 4) * left]))
+            dr.line((x0, y0, x1, y1), fill=(0, 0, 0), width=2)
+            dr.text((x1 + 2, y1 - 5), f"{d / 1000:.2f} km", fill=(0, 0, 0))
         _legend(dr, sc)
         im.save(target, format="PNG", optimize=False)
         out.append(target)

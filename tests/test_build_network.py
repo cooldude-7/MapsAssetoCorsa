@@ -1,4 +1,6 @@
-"""Live end-to-end build: Overpass + the real elevation chain (NRCan HRDEM in Ontario).
+"""Live end-to-end build: Overpass + the real elevation chain (NRCan HRDEM in Ontario), with
+the live scenery sources (HRDEM lidar DSM trees, NRCan land cover, OSM/Microsoft buildings,
+OSM barriers).
 
 Skipped unless run with `-m network` or DRIFTMAPS_NETWORK=1. Uses the normal download cache
 (`DRIFTMAPS_CACHE_DIR` or .cache/), so a second run is offline-fast.
@@ -44,3 +46,13 @@ def test_live_build_ontario(request, tmp_path):
     # The Credit River valley: the road drops and climbs by tens of metres, gently.
     z = result.geometry.model.centre[:, 1]
     assert np.ptp(z) > 5.0 and result.stats["max_grade"] < 0.2
+    # Scenery from the live sources: lidar trees (forested valley), the river bridge with its
+    # structure and no terrain in the deck; credits for the lidar and the land cover.
+    sc = result.stats["scenery"]
+    assert sc["trees"]["total"] > 1000
+    assert sc["bridges"] and sc["deck_intrusion_m"] == 0.0
+    names = {n.name for n in kn5.root.children}
+    assert any(n.startswith("trees_near_") for n in names)
+    assert "bridge00_concrete" in names
+    lic = (result.track_dir / "LICENSE-DATA.txt").read_text(encoding="utf-8")
+    assert "lidar DSM" in lic and "Land Cover of Canada 2020" in lic
