@@ -1,4 +1,4 @@
-# Drift Maps clone: build plan
+# Assetto Corsa Map Generator: build plan
 
 *Real roads → Assetto Corsa tracks, with AI line, traffic and touge battles.*
 

@@ -1,4 +1,4 @@
-# Drift Maps (working title)
+# Assetto Corsa Map Generator
 
 Turn real roads into Assetto Corsa tracks: pick a start and an end point, and get a driveable
 track built from OpenStreetMap road data and real elevation.
