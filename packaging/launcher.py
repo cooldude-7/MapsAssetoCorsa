@@ -185,9 +185,18 @@ def _check_rasterio() -> str:
 
     data = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
     profile = dict(
-        driver="GTiff", width=64, height=64, count=1, dtype="float32", nodata=-32767.0,
-        crs=CRS.from_epsg(3979), transform=from_origin(1_300_000, -300_000, 30, 30),
-        tiled=True, blockxsize=32, blockysize=32, compress="deflate",
+        driver="GTiff",
+        width=64,
+        height=64,
+        count=1,
+        dtype="float32",
+        nodata=-32767.0,
+        crs=CRS.from_epsg(3979),
+        transform=from_origin(1_300_000, -300_000, 30, 30),
+        tiled=True,
+        blockxsize=32,
+        blockysize=32,
+        compress="deflate",
     )
     with tempfile.TemporaryDirectory(prefix="acmg-selftest-") as tmp:
         path = os.path.join(tmp, "test.tif")
