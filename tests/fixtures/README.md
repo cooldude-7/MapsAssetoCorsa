@@ -62,3 +62,78 @@ bare ground 149.926 / 149.905 m.
 Licence and attribution: Contains information licensed under the Open Government Licence -
 Canada (https://open.canada.ca/en/open-government-licence-canada). Source: Natural Resources
 Canada, High Resolution Digital Elevation Model (HRDEM) - CanElevation Series.
+
+## OSM barriers + bridge (`osm/mill_st_waterdown_barriers.json`, used by `tests/test_barriers.py`)
+
+Raw Overpass API JSON (`out body geom`, 5.4 KB, `timestamp_osm_base` 2026-10-15T16:30:45Z),
+fetched on 2026-10-15 from maps.mail.ru/osm/tools/overpass with the query
+
+```
+[out:json][timeout:60];
+(way["barrier"~"^(guard_rail|jersey_barrier|retaining_wall|wall)$"](around:200,43.3306,-79.8866);
+ way["highway"~"^(primary|secondary|tertiary|unclassified|residential|trunk)$"](around:200,43.3306,-79.8866););
+out body geom;
+```
+
+It holds Mill Street South in Waterdown (Hamilton, Ontario), where it drops off the Niagara
+Escarpment: three road ways in driving order 34632407 -> 24486613 (`bridge=yes`, ~30 m) ->
+24486612, and three mapped `barrier=guard_rail` ways (427465490, 427465491, 427465492, each
+tagged `height=1`), all on the south/west side of the road (the driver's right heading
+south-east). None of the three test tracks has a mapped guard rail (docs/research/scenery.md
+§5), so this nearby road is the real-data fixture for barrier matching.
+
+Licence and attribution: map data (c) OpenStreetMap contributors, available under the Open
+Database Licence (ODbL) 1.0, https://www.openstreetmap.org/copyright. The file is an unmodified
+extract of the OSM database, so it stays under the ODbL.
+
+## Land cover (`landcover/landcover2020_snake_30m.tif`, used by `tests/test_vegetation.py`)
+
+A 48 x 48 px (1.44 x 1.44 km) window cut on 2026-10-15 at
+`col_off=128174,row_off=146858,width=48,height=48` from NRCan's Land Cover of Canada 2020 COG
+`https://datacube-prod-data-public.s3.ca-central-1.amazonaws.com/store/land/landcover/landcover-2020-classification.tif`
+(EPSG:3979, 30 m, uint8, NoData 0), centred on the same Snake Road house as the DSM/DTM pair
+above (-79.88979, 43.31024). Exact source pixels, written as a 16 x 16 tiled deflate GeoTIFF
+(1.9 KB); tags `SOURCE_URL` / `SOURCE_WINDOW` record the cut. Classes present: 1 (needleleaf
+forest), 5 (broadleaf deciduous), 6 (mixed forest, most common), 8 (shrubland), 15 (cropland),
+16 (barren), 17 (urban), 18 (water). The class codes are in NRCan's
+[ClassIndex_v2.pdf](https://datacube-prod-data-public.s3.ca-central-1.amazonaws.com/store/land/landcover/ClassIndex_v2.pdf).
+
+Licence and attribution: Contains information licensed under the Open Government Licence -
+Canada (https://open.canada.ca/en/open-government-licence-canada). Source: Natural Resources
+Canada, Land Cover of Canada 2020.
+
+## OSM + Microsoft buildings (`osm/buildings_snake_rd.json`, `osm/buildings_snake_rd_ms.geojsonl.gz`, used by `tests/test_buildings.py`)
+
+`osm/buildings_snake_rd.json`: raw Overpass API JSON (`out body geom`, 12.7 KB,
+`timestamp_osm_base` 2026-10-15T17:04:49Z), fetched on 2026-10-15 from
+maps.mail.ru/osm/tools/overpass with the query
+
+```
+[out:json][timeout:60];
+(way["building"](around:120,43.31024,-79.88979);
+ relation["building"]["type"="multipolygon"](around:120,43.31024,-79.88979);
+ way["highway"~"^(secondary|tertiary|unclassified|residential)$"](around:120,43.31024,-79.88979););
+out body geom;
+```
+
+It holds three `building=yes` ways beside Snake Road, Flamborough (Hamilton, Ontario): 832043557
+(the 10-corner house at the centre of the `dem/hrdem_snake_{dsm,dtm}_1m.tif` lidar windows),
+832043679 and 832043713, plus the Snake Road (24233890, 121184920) and Old York Road (23810117)
+ways. No building has `height` or `building:levels` (as on all three test roads, scenery.md §3).
+
+Licence and attribution: map data (c) OpenStreetMap contributors, available under the Open
+Database Licence (ODbL) 1.0, https://www.openstreetmap.org/copyright. The file is an unmodified
+extract of the OSM database, so it stays under the ODbL.
+
+`osm/buildings_snake_rd_ms.geojsonl.gz`: 6 lines (670 bytes gzipped) cut unmodified from the
+Microsoft Global ML Building Footprints release 2026-08-13, tile `RegionName=Canada/quadkey=
+030223132/part-00000-110f5303-ff85-4c71-a2bf-c6070024fec8.c000.csv.gz` (listed in
+`https://bfppub.blob.core.windows.net/%24web/2026-08-13/dataset-links.csv`), keeping every
+feature whose outline touches lon -79.89149..-79.88809, lat 43.30904..43.31144 (about +-140 m
+around the same point). Each line is a GeoJSON `Feature` with a `Polygon` and properties
+`height` (m, -1 = unknown) and `confidence`. Three of them trace the three OSM buildings above;
+the other three are not in OSM (the merge rule keeps those).
+
+Licence and attribution: Microsoft Global ML Building Footprints, licensed under the Community
+Data License Agreement - Permissive, Version 2.0 (CDLA-Permissive-2.0,
+https://cdla.dev/permissive-2-0/), which allows sharing the data with that licence notice.
