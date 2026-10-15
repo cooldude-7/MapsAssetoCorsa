@@ -368,7 +368,7 @@ class BuildResult:
                     f"{b['max_height_m']:.1f} m above ground, {b['piers']} piers"
                     + (" (solid: culvert/embankment)" if b["solid"] else "")
                 )
-            if sc["deck_intrusion_m"] > 0:
+            if sc["deck_intrusion_m"] > DECK_TOLERANCE_M:
                 lines.append(f"warning  terrain {sc['deck_intrusion_m']:.2f} m into a bridge deck")
         lines.append(f"time     {s['build_s']:.1f} s")
         lines += [f"warning  {w}" for w in self.warnings]
@@ -940,6 +940,7 @@ def _assemble_kn5(
 # Tree trunks stay this far outside the hidden walls' corridor (road + shoulder + verge), so a
 # car can never reach a tree card, which has no collision (scenery.md §4.1).
 TREE_WALL_MARGIN_M = 0.5
+DECK_TOLERANCE_M = 0.05  # terrain grazing a deck by less than this is not reported
 APPROACH_RAIL_M = 20.0  # guard rail on both sides this far before and after each bridge
 BUILDINGS_AROUND_M = 150.0  # footprints this close to the road (= BuildingOptions.max_distance_m)
 _DATA_ERRORS = (OverpassError, SourceUnavailable, OSError, urllib.error.URLError, EOFError)
@@ -1006,7 +1007,7 @@ def _bridges(
     sc.pieces += pieces
     checks = [terrain_through_deck(m, p, ground, bopt) for p in sc.plans]
     sc.deck_intrusion_m = max((c.max_intrusion for c in checks), default=0.0)
-    if sc.deck_intrusion_m > 0.05:
+    if sc.deck_intrusion_m > DECK_TOLERANCE_M:
         warnings.warn(f"terrain rises {sc.deck_intrusion_m:.2f} m into a bridge deck", stacklevel=2)
     return terrain
 

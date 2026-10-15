@@ -1,132 +1,192 @@
-# M1 in-game checklist: 3 Ontario roads
+# M2 in-game checklist: 3 Ontario roads, now with scenery
 
-Thanks for testing! These are the first **real roads** made by our track generator. Each
-track is a real Ontario road, built from OpenStreetMap and government elevation data. We need
-to know if they drive right before we add the touge mode.
+Thanks for driving the first versions! These are the same three roads, rebuilt with what you
+asked for:
+
+- **Trees where they really stand.** Every tree comes from government lidar scans (laser
+  scans from a plane): we find the real tree tops and give each one its real height. Leafy or
+  evergreen comes from a national land-cover map.
+- **Buildings** where the real houses, barns and sheds are, from OpenStreetMap and Microsoft's
+  building outlines, at their real (lidar) height.
+- **Real bridges** instead of floating road sheets: a concrete deck, concrete side walls you
+  can hit, solid ends (abutments) and support columns (piers) on the long one. The ground under
+  a bridge is now the real creek valley.
+- **Guardrails only where they really are.** No map we can use shows guardrails on these roads
+  (OpenStreetMap has none), so you get rails only next to each bridge for now. **Tell us where
+  the real ones are** (section 5) and the next build will have them.
 
 You need: Assetto Corsa on Windows, Content Manager (CM), Custom Shaders Patch (CSP), and
 about 45 minutes. At the end there is a reply template you can copy and fill in.
 
-| Track (name in CM) | Length | What it is |
+| Track (name in CM) | Length | What's new to look at |
 |---|---|---|
-| Snake Road (Waterdown) | 3.5 km | Climbs about 95 m up the Niagara Escarpment, Aldershot to Waterdown. A sharp left, then a bridge, right before the finish. |
-| Sydenham Road (Dundas) | 3.5 km | Bridge right after the start, then about 80 m of steep climb (up to 10%) in the first kilometre. Flat and straight on top. |
-| Forks of the Credit Road (Caledon) | 4.3 km | Twisty along the Credit River valley, river bridges around 1 km in, then a long rolling run. |
+| Snake Road (Waterdown) | 3.5 km | Forest on the escarpment climb (about 23,000 trees), houses in Waterdown at the top (144 buildings), the 20 m bridge just before the finish. |
+| Sydenham Road (Dundas) | 3.5 km | The 112 m bridge right after the start, about 10 m above the creek, on 4 piers. Forest on the climb, then farmland with houses and lines of trees between the fields (about 12,000 trees, 119 buildings). |
+| Forks of the Credit Road (Caledon) | 4.3 km | Thick forest in the river valley (about 28,000 trees), the river bridge about 1 km in, two small culvert bridges around 2.6 and 2.8 km, scattered houses (62). |
 
-All three are **A to B**: you start at A (a green gate you can't see) and finish at B (a red
-gate you can't see). They are not loops.
+**What it looks like on purpose (not bugs):**
+- Trees are flat pictures standing crossed in an X (the classic way, same as Kunos' own tracks).
+  From some angles you may see that they are flat.
+- Trees stop about 400 m from the road, and beyond 150 m there are fewer, bigger ones.
+- Right beside the road (about 5 m past the gravel) there are no tree trunks. That's where the
+  invisible walls are, and it keeps you from ever driving through a tree. Branches still hang
+  over the road.
+- Buildings are simple shapes (walls and a flat or pitched roof) with painted-on windows and
+  doors. No signs, mailboxes, fences, power lines or road signs yet.
+- Guardrails are only on the 20 m before and after each bridge (see section 5).
+- The walls are still invisible.
 
-**What they look like on purpose (not bugs):** plain textures only. Grey asphalt, white edge
-lines, a double yellow centre line, tan gravel shoulders, green grass, brown dirt on steep
-slopes. No trees, buildings, signs or guard rails yet. Hills far away are low detail. The
-walls are invisible.
-
-> For the developers: built with `uv run drift-maps build ... --out out/ontario` (pins in the
-> M1 task notes; Forks from `out/m1_tracks/dm_forks_of_the_credit/route.json`), zipped into
-> `out/drift-maps-ontario-tracks.zip`. Debug images: `out/ontario/debug/`.
+> For the developers: built with `uv run drift-maps build --route out/ontario/<id>/route.json
+> --name "<name>" --id <id> --out out/ontario_v2 --zip out/send_v2/drift-maps-<name>.zip`
+> (default scenery: trees, buildings, guardrails on, `--scenery-density 1`). Ids unchanged,
+> so the install replaces the M1 folders. Debug images (trees, buildings, rails, bridges,
+> distance ticks every 250 m from A): `out/ontario_v2/debug/`. Per-track stats are in the
+> build output (`trees`, `houses`, `rails`, `bridge` lines).
 
 ---
 
 ## 1. Install
 
-1. Put the three zips (`drift-maps-snake-road.zip`, `drift-maps-sydenham-road.zip`, `drift-maps-forks-of-the-credit.zip`) and `install_tracks.bat` **in the same folder** (for
+1. Put the three zips (`drift-maps-snake-road.zip`, `drift-maps-sydenham-road.zip`,
+   `drift-maps-forks-of-the-credit.zip`) and `install_tracks.bat` **in the same folder** (for
    example Downloads).
-   - The .bat installs **every** `drift-maps*.zip` in that folder. If an older drift-maps zip
-     is there too, move it out first.
+   - The .bat installs **every** `drift-maps*.zip` in that folder. Move the old (M1) zips out
+     first.
 2. Double-click `install_tracks.bat`. It finds AC through Steam. If it asks for your AC
    folder: in CM go to **Settings → Assetto Corsa**, copy the folder path at the top, and
    paste it in.
 3. When it says it's done, press a key to close it.
-4. Open CM → **Content → Tracks**. You should see the three tracks above. If CM was already
-   open, restart it.
-
-If you tested the earlier Forks of the Credit build, this one replaces it (same folder,
-`dm_forks_of_the_credit`).
+4. Open CM → **Content → Tracks**. The three tracks keep the same names and **replace** the
+   old versions. If CM was already open, restart it.
 
 ---
 
-## 2. Practice: drive each track from end to end
+## 2. Trees
 
-For each track: CM → **Drive** → pick the track → mode **Practice** → **Go**. Use any normal
-road car (the GT86 is great). Drive all the way past the finish to the end of the road. Then
-drive it once more and **try to leave the road** at a few spots.
+Drive each track in **Practice** (any normal road car; the GT86 is great). Look around while
+you drive, and stop a few times to look properly.
 
-Check these and write down anything wrong (where it was helps: "near the start", "after the
-bridge", "about halfway"):
-
-- [ ] **No falling through.** The car never drops through the road or the grass.
-- [ ] **Smooth road.** No sudden bumps, steps or jumps on the asphalt. Bridges should feel
-      like normal road.
-- [ ] **Turns look right.** Snake Road ends with a sharp left, then a short straight to the
-      finish. Sydenham Road climbs, then has a quick right-left jog on top. If the road looks
-      like a mirror image of the real road, write it down.
-- [ ] **Walls hold.** Leave the road on purpose. You should hit an invisible wall a few
-      metres past the gravel, on **both** sides. The car should never get past it, also on
-      the bridges and where the road is high above the ground. At the very end of the road
-      there is a wall too.
-- [ ] **Terrain looks right.** The ground meets the road edge. No grass or dirt sticking up
-      through the road. No big holes, spikes or floating pieces. Hills look like hills.
-- [ ] **Painted lines** sit on the road (white edges, yellow centre). They don't flicker
-      badly or float.
-- [ ] **No pink or black** surfaces anywhere.
+- [ ] **Trees are where the real forest is.** Wooded stretches look wooded, fields and lawns
+      are open. Where you know the real road well: does it feel like the same place?
+- [ ] **Trees stand on the ground.** No trees floating in the air or sunk deep into a hill.
+- [ ] **No tree on the road or in your way.** No trunk on the asphalt or the gravel, and no
+      tree inside a house.
+- [ ] **They look like trees, not boxes.** No solid black, white, pink or blocky squares
+      around the leaves. (Pink/black/white means a texture failed to load: tell us which.)
+- [ ] **Colour and brightness.** Too dark, too bright, or about right next to the grass?
+- [ ] **Distant trees.** As you drive, do trees pop in or vanish in a distracting way? Do
+      far-away hillsides look too bare?
 
 ---
 
-## 3. A → B timer
+## 3. Buildings
 
-1. CM → **Drive** → mode **Hotlap** → **Go**. You start behind A.
-2. Drive to the finish.
-
-- [ ] The timer **starts** when you pass A (shortly after you set off).
-- [ ] The timer **stops** at B, and a time is shown.
-- [ ] Now do the same in **Practice**. Does a time show there as well? (Just tell us yes or
-      no; both are useful to know.)
+- [ ] **Buildings are where real houses/barns are** (Waterdown at the top of Snake Road, the
+      houses along Sydenham Road on top, the farms and houses at Forks).
+- [ ] **They sit on the ground.** Not floating, not half-buried, not tilted.
+- [ ] **Size and roof look believable** (a house looks like a house, a barn like a barn).
+- [ ] **No building on the road** or blocking your way.
+- [ ] **Textures:** walls and roofs show siding/brick/roof patterns, no pink/black/white.
 
 ---
 
-## 4. Race with AI
+## 4. Bridges
 
-CM → **Drive** → mode **Race** → **1 lap**, **3 AI** opponents (any car) → **Go**. If CM
-warns "tag circuit is missing", that's expected for an A to B track. Start anyway.
+Drive over each bridge slowly, then stop just past it, get out of the car view (free camera
+or replay camera) and look at it from the side and from below if you can.
 
-- [ ] All 4 cars start **on the road**, side by side in rows, facing up the road. No car
-      starts inside another car or off the road.
-- [ ] The AI drives in the **right-hand lane** and follows the road through the corners.
-- [ ] The AI doesn't crash into the walls or get stuck before the finish.
-- [ ] Your timer/position works when you cross B.
+- [ ] **Not floating any more:** you see a concrete deck with a thickness, solid ends where
+      it meets the ground, and on Sydenham Road columns (piers) down to the creek.
+- [ ] **Concrete side walls** on both sides of the deck. Drive into one gently: you
+      **bounce off** it and never fall off the bridge.
+- [ ] **Ground under the bridge** looks like the real creek valley; no ground poking up
+      through the deck or the road.
+- [ ] **Driving over is smooth:** no bump where the bridge starts or ends.
+- [ ] **Forks culverts** (around 2.6 and 2.8 km): short concrete walls on both sides, nothing
+      odd.
+- [ ] The real bridges: do they have **concrete walls** (like ours) or **steel railings**? Do
+      the real roads have **guardrails on the bridge approaches** (we put 20 m on each side)?
 
-**Known, expected:** after the finish, the AI keeps driving past B and stops at the end of
-the road (it may pile up and honk). That's normal until we add the touge mode. Don't report it
-unless the AI stops **before** B.
+---
+
+## 5. Guardrails: where are the real ones?
+
+Our tracks now have rails only next to the bridges. You know these roads: please tell us
+where the **real** guardrails are, so we can add exactly those.
+
+For each stretch, write: which track, which side **when driving from the start (A) to the
+finish (B)**, and where it starts and ends, any way you can describe it (for example
+"Snake Road, right side, from the sharp left to about 200 m before the bridge" or "Sydenham,
+both sides, the whole first steep climb"). Rough is fine; we convert it into a small
+`guardrails.json` file for each track.
+
+- [ ] Also check: the rails we added at the bridges stand at the edge of the gravel, look
+      like a W-shaped steel rail on posts, and you bounce off them.
+
+---
+
+## 6. Smoothness (FPS)
+
+Use whatever FPS counter you normally use (or just tell us how it feels).
+
+- [ ] Your usual FPS on the old (M1) tracks, and on these, **in the thickest forest**
+      (Forks, the first kilometre; Snake, the climb).
+- [ ] Any stutter when trees or buildings appear?
+- [ ] If it's too slow, say so: we can build with fewer trees (`--scenery-density 0.5`), or
+      more if it runs fine and you want a denser forest.
+
+---
+
+## 7. Quick re-check of the basics
+
+These worked (or we're waiting for your M1 answers), but the scenery touched the bridges and
+the ground, so please re-check quickly:
+
+- [ ] No falling through the road or the grass anywhere, also at the bridges.
+- [ ] Invisible walls still hold on both sides (the trees are behind them).
+- [ ] Hotlap: the timer starts at A and stops at B.
+- [ ] Race with 3 AI: they still drive the road and cross the bridges without crashing.
 
 ---
 
 ## Reply template
 
-Copy this, fill it in, and send it back with screenshots of anything odd.
+Copy this, fill it in, and send it back with screenshots of anything odd (a screenshot of a
+good view helps too!).
 
 ```
 CSP version: ...
 Car used: ...
-Install (.bat worked, 3 tracks in CM): yes / no   note:
+Install (.bat worked, 3 tracks replaced in CM): yes / no   note:
+FPS: old tracks ... / new tracks ... (thickest forest: ...)   stutter: no / yes ...
 
 SNAKE ROAD (Waterdown)
-  Practice: fall-through no/yes   bumps/steps: ...   turns look right: yes/no
-            walls hold both sides: yes/no   terrain: ...   painted lines: ...   pink/black: no/yes
-  Hotlap timer start at A / stop at B: yes/no   time: ...   Practice timer: yes/no
-  Race 1 lap, 3 AI: grid ok: yes/no   AI right lane: yes/no   AI follows road: yes/no   note:
+  Trees: in the right places yes/no   on the ground yes/no   look ok yes/no   brightness: dark/ok/bright
+         pop-in: ...   any tree on the road/in a house: no/yes ...
+  Buildings: right places yes/no   on the ground yes/no   look ok: ...
+  Bridge: looks solid yes/no   side walls hold yes/no   ground under it ok yes/no   bump: no/yes
+          real bridge has: concrete walls / steel railing   real approach rails: yes/no
+  Real guardrails (side as driven A->B, where): ...
+  Basics (fall-through, walls, timer, AI): ok / ...
 
 SYDENHAM ROAD (Dundas)
-  Practice: fall-through no/yes   bumps/steps: ...   turns look right: yes/no
-            walls hold both sides: yes/no   terrain: ...   painted lines: ...   pink/black: no/yes
-  Hotlap timer start at A / stop at B: yes/no   time: ...   Practice timer: yes/no
-  Race 1 lap, 3 AI: grid ok: yes/no   AI right lane: yes/no   AI follows road: yes/no   note:
+  Trees: in the right places yes/no   on the ground yes/no   look ok yes/no   brightness: dark/ok/bright
+         pop-in: ...   any tree on the road/in a house: no/yes ...
+  Buildings: right places yes/no   on the ground yes/no   look ok: ...
+  Bridge: looks solid yes/no   piers ok yes/no   side walls hold yes/no   ground under it ok yes/no
+          bump: no/yes   real bridge has: concrete walls / steel railing   real approach rails: yes/no
+  Real guardrails (side as driven A->B, where): ...
+  Basics (fall-through, walls, timer, AI): ok / ...
 
 FORKS OF THE CREDIT ROAD (Caledon)
-  Practice: fall-through no/yes   bumps/steps: ...   turns look right: yes/no
-            walls hold both sides: yes/no   terrain: ...   painted lines: ...   pink/black: no/yes
-  Hotlap timer start at A / stop at B: yes/no   time: ...   Practice timer: yes/no
-  Race 1 lap, 3 AI: grid ok: yes/no   AI right lane: yes/no   AI follows road: yes/no   note:
+  Trees: in the right places yes/no   on the ground yes/no   look ok yes/no   brightness: dark/ok/bright
+         pop-in: ...   any tree on the road/in a house: no/yes ...
+  Buildings: right places yes/no   on the ground yes/no   look ok: ...
+  River bridge: looks solid yes/no   side walls hold yes/no   ground under it ok yes/no   bump: no/yes
+  Culverts (2.6 / 2.8 km): ok / ...
+  Real guardrails (side as driven A->B, where): ...
+  Basics (fall-through, walls, timer, AI): ok / ...
 
+More or fewer trees next time: more / same / fewer
 Anything else: ...
 ```
