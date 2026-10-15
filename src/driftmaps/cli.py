@@ -46,13 +46,9 @@ def check_zip_size(zip_path: Path) -> float:
 
 @app.command()
 def ui(
-    port: int = typer.Option(
-        None, help="Port on 127.0.0.1 (default: 8765, or the next free one)."
-    ),
+    port: int = typer.Option(None, help="Port on 127.0.0.1 (default: 8765, or the next free one)."),
     browser: bool = typer.Option(True, help="Open the page in your web browser."),
-    data_dir: Path = typer.Option(
-        None, help="App data folder (default: the per-user app folder)."
-    ),
+    data_dir: Path = typer.Option(None, help="App data folder (default: the per-user app folder)."),
 ) -> None:
     """Start the map app: click two points on a map, get the track built and installed."""
     from driftmaps.app import run

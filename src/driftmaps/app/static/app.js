@@ -240,12 +240,18 @@ function itemExtent(item) {
   return [lon, lat, lon, lat];
 }
 
+/** Lower-case words of a text ("Snake Rd, Burlington" -> ["snake", "rd", "burlington"]). */
+function wordsOf(text) {
+  return String(text || "").toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+}
+
 /** Search results from each query (`groups[i]` = results for `searchQueries(q)[i]`), merged:
  * one entry per title + subtitle (a road split into several OSM ways becomes one result whose
  * extent covers every piece), ranked by how many of the typed words they contain (a word in the
- * name counts double). Ties keep the road-name-only search first, then Photon's order. */
+ * name counts double, a name word nobody typed counts against). Ties keep the road-name-only
+ * search first, then Photon's order. */
 function mergeSearchResults(groups, q, limit = 6) {
-  const words = String(q || "").toLowerCase().split(/[\s,]+/).filter(Boolean);
+  const words = wordsOf(q);
   const merged = new Map();
   groups.forEach((items, g) => {
     (items || []).forEach((item, i) => {
@@ -268,15 +274,25 @@ function mergeSearchResults(groups, q, limit = 6) {
     });
   });
   const score = (it) => {
-    const title = String(it.title || "").toLowerCase();
-    const rest = String(it.subtitle || "").toLowerCase();
-    return words.reduce((n, w) => n + (title.includes(w) ? 2 : rest.includes(w) ? 1 : 0), 0);
+    const title = wordsOf(it.title);
+    const rest = wordsOf(it.subtitle);
+    const typed = words.reduce((n, w) => n + (title.includes(w) ? 2 : rest.includes(w) ? 1 : 0), 0);
+    return typed - 0.5 * title.filter((w) => !words.includes(w)).length;
   };
   return [...merged.values()]
     .map((m) => ({ ...m, score: score(m.item) }))
     .sort((x, y) => y.score - x.score || y.group - x.group || x.order - y.order)
     .slice(0, limit)
     .map((m) => m.item);
+}
+
+/** "Source: NRCan HRDEM (1.0 m)" for the profile; no resolution if the title already has one. */
+function sourceLabel(source, resolutionM) {
+  if (!source) return "";
+  const res = Number(resolutionM);
+  const hasRes = /\b\d+(?:\.\d+)?\s?m\b/.test(source);
+  const resText = Number.isFinite(res) && res > 0 && !hasRes ? ` (${res < 10 ? res.toFixed(1) : Math.round(res)} m)` : "";
+  return `Source: ${source}${resText}`;
 }
 
 function formatDate(v) {
@@ -422,6 +438,7 @@ const state = {
   jobFailures: 0,
   jobLogCount: -1,
   jobResumed: false, // polling a job started before this page loaded
+  resultTrackId: null, // track shown as built in the build panel
   search: { items: [], active: -1, timer: 0, abort: null },
 };
 
@@ -1007,10 +1024,7 @@ async function loadProfile(routeId) {
     $("profile-stats").textContent =
       `Climb ${formatInt(st.climb)} m · Drop ${formatInt(st.drop)} m · ` +
       `${formatInt(st.minZ)}–${formatInt(st.maxZ)} m · Steepest ${(st.maxGrade * 100).toFixed(0)}%`;
-    const res = Number(p.resolution_m);
-    $("profile-source").textContent = p.source
-      ? `Source: ${p.source}${Number.isFinite(res) && res > 0 ? ` (${res < 10 ? res.toFixed(1) : Math.round(res)} m)` : ""}`
-      : "";
+    $("profile-source").textContent = sourceLabel(p.source, p.resolution_m);
     showProfileMessage("");
     drawProfile();
   } catch (err) {
@@ -1089,7 +1103,8 @@ function drawProfile() {
   ctx.fillStyle = muted;
   ctx.strokeStyle = grid;
   ctx.lineWidth = 1;
-  const zStep = niceStep(hi - lo, 3);
+  let zStep = niceStep(hi - lo, 3);
+  if (Math.floor(hi / zStep) - Math.ceil(lo / zStep) < 1) zStep = niceStep(hi - lo, 6); // >= 2 labels
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
   for (let v = Math.ceil(lo / zStep) * zStep; v <= hi; v += zStep) {
@@ -1559,10 +1574,20 @@ function finishJob(job) {
     toast(job.result && job.result.installed_to ? "Track installed!" : "Track built!", "ok");
     loadTracks();
   }
+  if (job) revealJob();
+}
+
+/** Scroll the build panel so the progress (or result) is on screen: at 1280x800 it sits
+ * below the Build button, out of view. */
+function revealJob() {
+  const box = $("job");
+  if (box.hidden || typeof box.scrollIntoView !== "function") return;
+  requestAnimationFrame(() => box.scrollIntoView({ block: "nearest", behavior: "smooth" }));
 }
 
 function renderJob(job) {
   const box = $("job");
+  const appearing = box.hidden;
   box.hidden = false;
   box.dataset.state = job.state || "running";
   const done = job.state === "done";
@@ -1587,12 +1612,14 @@ function renderJob(job) {
   }
   $("job-log-wrap").hidden = lines.length === 0;
   renderJobResult(job);
+  if (appearing) revealJob();
 }
 
 function renderJobResult(job) {
   const el = $("job-result");
   el.replaceChildren();
   el.className = "job-result";
+  state.resultTrackId = job.state === "done" && job.result ? job.result.track_id || null : null;
   if (job.state === "done" && job.result) {
     const r = job.result;
     const name = r.name || state.jobName || "your track";
@@ -1708,6 +1735,11 @@ async function deleteTrack(t) {
   try {
     await api(API.tracks + "/" + encodeURIComponent(t.track_id), { method: "DELETE" });
     toast(`Deleted ${name}.`, "ok");
+    // Don't leave "Installed! Look for <name>" on screen for a track that's gone.
+    if (state.jobId == null && state.resultTrackId === t.track_id) {
+      $("job").hidden = true;
+      state.resultTrackId = null;
+    }
   } catch (err) {
     toast(err.message, "error");
   }
