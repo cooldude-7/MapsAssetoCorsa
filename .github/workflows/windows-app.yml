@@ -1,0 +1,128 @@
+# Builds the double-click Windows app "Assetto Corsa Map Generator" (packaging/acmg.spec) on
+# every push, smoke-tests the .exe and uploads it. Tags v* also get a GitHub Release with
+# AssettoCorsaMapGenerator-windows.zip attached. Player instructions: docs/INSTALL_APP.md.
+name: Windows app
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # attach the zip to a Release on v* tags
+
+concurrency:
+  group: windows-app-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  APP: AssettoCorsaMapGenerator
+  ZIP: AssettoCorsaMapGenerator-windows.zip
+  PYTHONUTF8: "1"
+
+jobs:
+  windows-app:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        id: py
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        env:
+          UV_PYTHON: ${{ steps.py.outputs.python-path }}
+        run: uv sync --locked
+
+      # A failing test doesn't stop the build (the player can still get a working app while a
+      # Windows-only test is fixed), but it fails the run at the end and blocks the Release.
+      - name: Run tests
+        id: tests
+        continue-on-error: true
+        run: uv run --locked pytest -m "not network"
+
+      - name: Build the app (PyInstaller)
+        run: uv run --locked pyinstaller --noconfirm --clean packaging/acmg.spec
+
+      - name: Self-test the app (modules, map page, rasterio/GDAL/PROJ, Pillow)
+        run: '& "dist\$env:APP\$env:APP.exe" --self-test'
+
+      # Informational: can the frozen app reach OpenStreetMap and the elevation tiles?
+      - name: Self-test the app online
+        continue-on-error: true
+        run: '& "dist\$env:APP\$env:APP.exe" --self-test --network'
+
+      - name: Smoke-test the app (start, GET /api/status and /, stop)
+        run: |
+          $exe = "dist\$env:APP\$env:APP.exe"
+          $data = Join-Path $env:RUNNER_TEMP "acmg-data"
+          $out = Join-Path $env:RUNNER_TEMP "acmg-out.txt"
+          $err = Join-Path $env:RUNNER_TEMP "acmg-err.txt"
+          $status = Join-Path $env:RUNNER_TEMP "status.json"
+          $page = Join-Path $env:RUNNER_TEMP "index.html"
+          $p = Start-Process -FilePath $exe -PassThru -NoNewWindow `
+            -ArgumentList "--no-browser", "--port", "8765", "--data-dir", "`"$data`"" `
+            -RedirectStandardOutput $out -RedirectStandardError $err
+          try {
+            curl.exe -fsS --retry 60 --retry-connrefused --retry-delay 1 -o $status http://127.0.0.1:8765/api/status
+            if ($LASTEXITCODE -ne 0) { throw "/api/status did not answer" }
+            $json = Get-Content $status -Raw
+            Write-Host "/api/status -> $json"
+            if (($json | ConvertFrom-Json).app -ne "Assetto Corsa Map Generator") { throw "unexpected /api/status" }
+            curl.exe -fsS -o $page http://127.0.0.1:8765/
+            if ($LASTEXITCODE -ne 0) { throw "GET / failed" }
+            if (-not (Select-String -Path $page -Pattern "<html" -Quiet)) { throw "GET / is not the map page" }
+            if ($p.HasExited) { throw "the app quit on its own (exit code $($p.ExitCode))" }
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Write-Host "--- app output ---"
+            Get-Content $out, $err -ErrorAction SilentlyContinue
+          }
+          $global:LASTEXITCODE = 0
+
+      - name: Zip the app folder
+        run: Compress-Archive -Path "dist\$env:APP" -DestinationPath $env:ZIP -CompressionLevel Optimal
+
+      # GitHub wraps every artifact in a zip of its own, so the artifact is the app folder itself:
+      # the download (AssettoCorsaMapGenerator-windows.zip) unzips straight to the .exe.
+      - name: Upload the app (workflow artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: AssettoCorsaMapGenerator-windows
+          path: dist/AssettoCorsaMapGenerator/
+          if-no-files-found: error
+
+      - name: Attach the zip to the GitHub Release (v* tags)
+        if: startsWith(github.ref, 'refs/tags/v') && steps.tests.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG $env:ZIP --clobber
+          } else {
+            gh release create $env:TAG $env:ZIP --title "Assetto Corsa Map Generator $env:TAG" `
+              --notes "Download $env:ZIP below, unzip it anywhere and double-click AssettoCorsaMapGenerator.exe. Step-by-step: docs/INSTALL_APP.md"
+          }
+
+      - name: Fail the run if the tests failed
+        if: steps.tests.outcome == 'failure'
+        run: |
+          Write-Host "::error::Tests failed (see the 'Run tests' step). The app was still built and uploaded."
+          exit 1
