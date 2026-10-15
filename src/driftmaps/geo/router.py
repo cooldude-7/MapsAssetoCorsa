@@ -12,6 +12,13 @@ Algorithm (docs/research/geo.md §1.3, PLAN §5.1):
   At junctions (nodes with 3+ neighbours) a turn costs `sharp_turn_penalty_m * (1 - cos a)^2`
   (5 m at 90 deg, 20 m at 180) plus `name_change_penalty_m` when the road's name/ref changes.
   Pins must be passed in order, in either direction; the result is the global optimum.
+- **Loops** (`loop=True`): the route goes through the pins and back to the first one, which
+  is routed as an extra last pin. It must arrive there the way it left (along the same
+  directed edge for a pin on a segment; with an allowed turn for a pin on a node), so the
+  closed path has no U-turn at the start either: one search per way of leaving pin A, the
+  cheapest wins. A loop that drives any stretch of road twice (back along the same road, or
+  round the same stretch again) is refused (`LOOP_MESSAGE`); crossing itself at a junction
+  (a figure 8) is fine. The route is `closed` and its first and last pins are the same.
 - **Determinism**: costs are integer millimetres, the heap orders ties by the state number
   (edge index, then pins passed), and edges are numbered in sorted way order. Same OSM snapshot
   + same pins + same options => identical `route.json` bytes. (ASSUMED across machines: the
@@ -20,8 +27,9 @@ Algorithm (docs/research/geo.md §1.3, PLAN §5.1):
 
 `Route.to_json()` is the contract: snapshot time and cache key, pins (as given and as snapped),
 the ordered directed edges `(way, u, v, dir)`, the coordinates of every node used, the tags of
-every way used, side-road stubs at route junctions, and the length. `Route.reverse()` drives
-the same edges the other way. `Route.polyline(step)` densifies it with per-point attributes.
+every way used, side-road stubs at route junctions, the length, and `closed` for a loop (only
+written when true). `Route.reverse()` drives the same edges the other way.
+`Route.polyline(step)` densifies it with per-point attributes.
 """
 
 from __future__ import annotations
@@ -53,6 +61,7 @@ from driftmaps.geo.overpass import DEFAULT_BUFFER_M, OSM_ATTRIBUTION, OsmData, f
 from driftmaps.geo.project import LocalProjection
 
 __all__ = [
+    "LOOP_MESSAGE",
     "ROUTE_VERSION",
     "Route",
     "RouteEdge",
@@ -67,6 +76,8 @@ __all__ = [
 
 ROUTE_VERSION = 1
 DEFAULT_MAX_LENGTH_M = 25_000.0  # PLAN §5.1: v1 warns above this
+# Why a loop was refused (the app shows it as is).
+LOOP_MESSAGE = "Can't make a loop here - add a point on a different road back to the start."
 
 # Highway class rank for snapping preference (higher wins).
 _CLASS_RANK = {
@@ -178,11 +189,12 @@ class Route:
     driving_side: str = "right"
     options: Mapping[str, object] = field(default_factory=dict)
     version: int = ROUTE_VERSION
+    closed: bool = False  # a loop: the last pin is the first, the end meets the start
 
     # -- serialisation -----------------------------------------------------------------------
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "version": self.version,
             "attribution": OSM_ATTRIBUTION,
             "osm_base": self.osm_base,
@@ -199,6 +211,9 @@ class Route:
             "ways": {str(k): dict(self.ways[k]) for k in sorted(self.ways)},
             "stubs": [list(s) for s in self.stubs],
         }
+        if self.closed:  # only for loops, so A->B route.json bytes stay as they were
+            d["closed"] = True
+        return d
 
     def to_json(self) -> str:
         """Canonical JSON text: sorted keys, one edge/node/way per line, trailing newline."""
@@ -223,6 +238,7 @@ class Route:
             driving_side=d.get("driving_side", "right"),
             options=dict(d.get("options", {})),
             version=int(d["version"]),
+            closed=bool(d.get("closed", False)),
         )
 
     @classmethod
@@ -258,6 +274,7 @@ class Route:
             driving_side=self.driving_side,
             options=self.options,
             version=self.version,
+            closed=self.closed,
         )
 
     def projection(self) -> LocalProjection:
@@ -330,13 +347,14 @@ class Route:
     def repeated_nodes(self) -> list[int]:
         """Node ids the route passes more than once (it overlaps or crosses itself at a node).
 
-        The outer nodes of partly driven first/last edges don't count as visited.
+        The outer nodes of partly driven first/last edges don't count as visited, nor does the
+        end of a loop (it is its start).
         """
         path = self.node_path()
         visited = path[1:-1]
         if self.start_t <= 0.0:
             visited.insert(0, path[0])
-        if self.end_t >= 1.0:
+        if self.end_t >= 1.0 and not (self.closed and self.start_t <= 0.0):
             visited.append(path[-1])
         seen: set[int] = set()
         dup: list[int] = []
@@ -456,6 +474,7 @@ class _Search:
 
     def __init__(self, graph: EdgeGraph, snaps: Sequence[_Snap], options: RouterOptions):
         self.g = graph
+        self.options = options
         self.snaps = snaps
         self.n = len(snaps)
         self.len_mm = graph.edge_len_mm.tolist()
@@ -519,8 +538,66 @@ class _Search:
                 cost += self.name_mm
         return cost
 
+    def seeds(self) -> list[tuple[int, float, int]]:
+        """(edge, start position on it, pins passed) for every way of leaving pin 0."""
+        n = self.n
+        s0 = self.snaps[0]
+        if s0.node >= 0:
+            k0 = 0
+            while k0 + 1 < n and self.snaps[k0 + 1].node == s0.node:
+                k0 += 1
+            if k0 == n - 1:
+                raise RouteError("all pins snapped to the same point")
+            return [(e, 0.0, k0) for e in self.out[s0.node]]
+        seeds = []
+        for e, pos in ((self.seg_fwd[s0.seg], s0.t), (self.seg_bwd[s0.seg], 1.0 - s0.t)):
+            if e >= 0:
+                seeds.append((int(e), pos, 0))
+        return seeds
+
     def run(self) -> tuple[list[int], float, float]:
         """Return (edge indices, start_t on the first, end_t on the last)."""
+        best = self.search(self.seeds())
+        if best is None:
+            raise RouteError(
+                "no route joins the pins in order without U-turns inside the fetched area"
+            )
+        return best[1:]
+
+    def run_loop(self) -> tuple[list[int], float, float]:
+        """The cheapest closed route: back at pin 0 the way it left, every road stretch once."""
+        found = []
+        for seed in self.seeds():
+            res = self.search([seed], closing=seed)
+            if res is not None:
+                found.append(res)
+        found.sort(key=lambda r: (r[0], r[1]))
+        for res in found:
+            if not self.drives_a_segment_twice(res[1]):
+                return res[1:]
+        if found:
+            raise RouteError(f"no loop: {LOOP_MESSAGE}")
+        # No way back to the start at all: say whether the pins themselves can be joined.
+        open_search = _Search(self.g, self.snaps[:-1], self.options)
+        if open_search.n >= 2 and open_search.search(open_search.seeds()) is None:
+            raise RouteError(
+                "no route joins the pins in order without U-turns inside the fetched area"
+            )
+        raise RouteError(f"no loop: {LOOP_MESSAGE}")
+
+    def drives_a_segment_twice(self, edges: list[int]) -> bool:
+        """True if a closed route uses a segment twice (either way). The first and last edges
+        of a loop that starts mid-segment are the same edge split at the start: one use."""
+        inner = edges[:-1] if len(edges) > 1 and edges[0] == edges[-1] else edges
+        segs = [self.edge_seg[e] for e in inner]
+        return len(set(segs)) != len(segs)
+
+    def search(
+        self, seeds: list[tuple[int, float, int]], closing: tuple[int, float, int] | None = None
+    ) -> tuple[int, list[int], float, float] | None:
+        """Dijkstra from `seeds`; (cost, edges, start_t, end_t) or None. With `closing` (the one
+        seed of a loop) the route must end back on that seed: on the same directed edge for a
+        pin on a segment, or turning into it without a U-turn for a pin on a node."""
         n = self.n
         best: dict[int, int] = {}
         pred: dict[int, int] = {}
@@ -530,23 +607,19 @@ class _Search:
 
         def offer_finish(cost: int, e: int, pos: float, prev: int, spos: float) -> None:
             nonlocal finish
+            if closing is not None:
+                if prev < 0:
+                    return  # a loop must leave the start edge and come back to it
+                if self.snaps[0].node >= 0:
+                    tc = self.turn_cost(e, closing[0])
+                    if tc is None:
+                        return
+                    cost += tc
+                elif e != closing[0]:
+                    return
             if finish is None or cost < finish[0]:
                 finish = (cost, e, pos, prev, spos)
 
-        # Seeds: leave pin 0 along its segment in each direction (or every edge from its node).
-        s0 = self.snaps[0]
-        if s0.node >= 0:
-            k0 = 0
-            while k0 + 1 < n and self.snaps[k0 + 1].node == s0.node:
-                k0 += 1
-            if k0 == n - 1:
-                raise RouteError("all pins snapped to the same point")
-            seeds = [(e, 0.0, k0) for e in self.out[s0.node]]
-        else:
-            seeds = []
-            for e, pos in ((self.seg_fwd[s0.seg], s0.t), (self.seg_bwd[s0.seg], 1.0 - s0.t)):
-                if e >= 0:
-                    seeds.append((int(e), pos, 0))
         for e, pos, k in seeds:
             k2, fin = self.advance(e, k, pos)
             if fin is not None:
@@ -583,17 +656,15 @@ class _Search:
                     heapq.heappush(heap, (c2, st2))
 
         if finish is None:
-            raise RouteError(
-                "no route joins the pins in order without U-turns inside the fetched area"
-            )
-        _, last_e, end_pos, prev, spos = finish
+            return None
+        total, last_e, end_pos, prev, spos = finish
         edges = [last_e]
         while prev >= 0:
             edges.append(prev // n)
             spos = start_pos.get(prev, spos)
             prev = pred.get(prev, -1)
         edges.reverse()
-        return edges, spos, end_pos
+        return total, edges, spos, end_pos
 
 
 def route_on_graph(
@@ -602,13 +673,20 @@ def route_on_graph(
     options: RouterOptions | None = None,
     osm_base: str | None = None,
     cache_key: str | None = None,
+    *,
+    loop: bool = False,
 ) -> Route:
-    """Snap (lat, lon) pins onto `graph` and route through them in order."""
+    """Snap (lat, lon) pins onto `graph` and route through them in order (`loop`: and back
+    to the first pin; the returned route's pins end with the first one again)."""
     options = options or RouterOptions()
     if len(pins) < 2:
         raise RouteError("need at least two pins")
+    pins = list(pins)
+    if loop:
+        pins.append(pins[0])
     snaps = [snap_pin(graph, lat, lon, options) for lat, lon in pins]
-    edges, start_t, end_t = _Search(graph, snaps, options).run()
+    search = _Search(graph, snaps, options)
+    edges, start_t, end_t = search.run_loop() if loop else search.run()
     g = graph
 
     total_mm = sum(int(g.edge_len_mm[e]) for e in edges)
@@ -651,7 +729,7 @@ def route_on_graph(
     # Side roads leaving interior route nodes (for junction stubs / walls).
     on_route = {int(g.edge_seg[e]) for e in edges}
     path_nodes = [int(g.edge_u[edges[0]])] + [int(g.edge_v[e]) for e in edges]
-    interior = sorted(set(path_nodes[1:-1]))
+    interior = sorted(set(path_nodes if loop else path_nodes[1:-1]))
     stubs: list[tuple[int, int, int]] = []
     for x in interior:
         if g.node_degree[x] <= 2:
@@ -683,6 +761,7 @@ def route_on_graph(
         cache_key=cache_key,
         driving_side=driving_side(lat0, lon0),
         options=options.to_dict(),
+        closed=loop,
     )
 
 
@@ -699,8 +778,12 @@ def route_from_pins(
     offline: bool = False,
     refresh: bool = False,
     max_length_m: float = DEFAULT_MAX_LENGTH_M,
+    loop: bool = False,
 ) -> Route:
     """Route through (lat, lon) pins on real roads. The CLI / web preview entry point.
+
+    `loop=True` comes back to the first pin and returns a closed route (see the module
+    docstring); a loop that can only come back along the same road raises `RouteError`.
 
     Fetches (or reads from the cache) the drivable ways within `buffer_m` of the pin chain; if
     no route exists the corridor is doubled once (up to `max_buffer_m`, default 2 x buffer).
@@ -723,7 +806,7 @@ def route_from_pins(
             osm
             if osm is not None
             else fetch_corridor(
-                pins,
+                pins + [pins[0]] if loop else pins,
                 cache_dir,
                 buffer_m=buf,
                 include_tracks=include_tracks,
@@ -734,7 +817,7 @@ def route_from_pins(
         )
         graph = build_graph(data, proj, respect_oneway=options.respect_oneway)
         try:
-            route = route_on_graph(graph, pins, options, data.osm_base, data.cache_key)
+            route = route_on_graph(graph, pins, options, data.osm_base, data.cache_key, loop=loop)
             break
         except RouteError as exc:
             last_error = exc

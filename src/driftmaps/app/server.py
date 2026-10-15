@@ -5,13 +5,17 @@ Binds 127.0.0.1 only. Endpoints (all JSON; errors are `{"error": "<plain English
 - `GET /` and other GETs: the single-page app from `driftmaps/app/static/` (read through
   `importlib.resources`, so it also works when frozen by PyInstaller).
 - `GET /api/status`, `POST /api/settings {ac_root}`: app name/version and where AC is.
-- `POST /api/route {pins: [[lat, lon], ...], reverse}`: route over real roads; the route is
-  kept by `route_id` (in memory and as `<app data>/routes/<route_id>.json`).
+- `POST /api/route {pins: [[lat, lon], ...], reverse, loop}`: route over real roads; the route
+  is kept by `route_id` (in memory and as `<app data>/routes/<route_id>.json`).
   `snapped[i]` is where request pin i landed on the road (request order, even with
-  `reverse`); `line` is the display line `[[lon, lat], ...]` in driving order.
+  `reverse`); `line` is the display line `[[lon, lat], ...]` in driving order. With
+  `loop: true` the route comes back to the first pin (a circuit; `line` ends where it
+  starts) and `loop` in the answer says so; `reverse` then drives the loop the other way
+  round from the same start. `loop` defaults to false (A to B), as before.
 - `POST /api/profile {route_id}`: ground height every ~20 m along the route.
-- `POST /api/build {...}` -> `{job_id}`; `GET /api/jobs/<job_id>`: one build at a time, the
-  rest queued (see `jobs.py`).
+- `POST /api/build {route_id, name, track_id, install, options, loop}` -> `{job_id}`;
+  `GET /api/jobs/<job_id>`: one build at a time, the rest queued (see `jobs.py`). A loop route
+  builds a circuit; `loop` is optional and, if sent, must match the route.
 - `GET /api/tracks`, `DELETE /api/tracks/<id>`: tracks this app made (marker file or the
   "drift-maps" tag), in AC's `content/tracks` and the app's output folder. Other tracks are
   never listed or touched.
@@ -69,6 +73,7 @@ MAX_BODY_BYTES = 1_000_000
 MAX_PINS = 50
 MAX_LINE_POINTS = 2000
 LONG_ROUTE_M = 25_000.0  # PLAN §5.1: warn above this
+MIN_LOOP_M = 250.0  # a lap needs room for the start grid (the builder refuses under 200 m)
 # ASSUMED: an Overpass corridor query over pins spread wider than this is too big to be useful.
 MAX_PIN_SPAN_M = 100_000.0
 PROFILE_STEP_M = 20.0
@@ -125,12 +130,18 @@ class ApiError(Exception):
 # ---------------------------------------------------------------------------------------------
 
 
+def pin_letter(i: int) -> str:
+    """The label of the i-th point in click order: A, B, ..., Z, AA, AB, ... (as on the map)."""
+    out = ""
+    i += 1
+    while i > 0:
+        i, r = divmod(i - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+
 def _pin_label(i: int, n: int) -> str:
-    if i == 0:
-        return "A"
-    if i == n - 1:
-        return "B"
-    return f"waypoint {i}"
+    return pin_letter(i)
 
 
 def _haversine_m(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -145,7 +156,7 @@ def _haversine_m(a: tuple[float, float], b: tuple[float, float]) -> float:
 def parse_pins(value: object) -> list[tuple[float, float]]:
     """Validate `[[lat, lon], ...]` from a request (2..MAX_PINS finite points)."""
     if not isinstance(value, list) or len(value) < 2:
-        raise ApiError(400, "Click at least two points on the map: a start and a finish.")
+        raise ApiError(400, "Click at least two points on the map: A (the start) and B.")
     if len(value) > MAX_PINS:
         raise ApiError(400, f"Too many points - use at most {MAX_PINS}.")
     pins = []
@@ -167,7 +178,11 @@ def parse_pins(value: object) -> list[tuple[float, float]]:
 
 def route_error_message(exc: Exception, pins: list[tuple[float, float]]) -> str:
     """A plain-English message for a `RouteError`."""
+    from driftmaps.geo.router import LOOP_MESSAGE
+
     text = str(exc)
+    if "no loop" in text:
+        return LOOP_MESSAGE
     m = re.search(r"pin \(([-\d.]+), ([-\d.]+)\) is (\d+) m from the nearest road", text)
     if m:
         lat, lon = float(m.group(1)), float(m.group(2))
@@ -183,7 +198,7 @@ def route_error_message(exc: Exception, pins: list[tuple[float, float]]) -> str:
     if "no road segments" in text:
         return "No drivable roads found around your points - click on or near a road."
     if "at least two" in text:
-        return "Click at least two points on the map: a start and a finish."
+        return "Click at least two points on the map: A (the start) and B."
     return f"Couldn't make a route: {text}"
 
 
@@ -238,13 +253,15 @@ def _iso(ts: float) -> str:
 
 
 def _track_info(folder: Path) -> dict[str, object]:
-    name, length = folder.name, 0.0
+    name, length, loop = folder.name, 0.0, False
     ui_path = folder / "ui" / "ui_track.json"
     try:
         ui = json.loads(ui_path.read_text(encoding="utf-8-sig"))
         if isinstance(ui, dict):
             name = str(ui.get("name") or name)
             length = float(re.sub(r"[^\d.]", "", str(ui.get("length") or "0")) or 0)
+            tags = ui.get("tags")
+            loop = isinstance(tags, list) and "circuit" in tags
     except (OSError, ValueError):
         pass
     built = 0.0
@@ -254,7 +271,13 @@ def _track_info(folder: Path) -> dict[str, object]:
             break
         except OSError:
             continue
-    return {"track_id": folder.name, "name": name, "length_m": length, "built_at": _iso(built)}
+    return {
+        "track_id": folder.name,
+        "name": name,
+        "length_m": length,
+        "built_at": _iso(built),
+        "loop": loop,
+    }
 
 
 def _json_default(o: object) -> object:
@@ -401,18 +424,22 @@ class App:
         # Our own warnings replace route_from_pins' length warning.
         return fn(pins, self.settings.cache_dir, max_length_m=math.inf, **kw)
 
-    def _base_route(self, pins: list[tuple[float, float]]) -> tuple[Route, list[str]]:
-        """The route through the pins as given (not reversed), and data warnings."""
+    def _base_route(
+        self, pins: list[tuple[float, float]], loop: bool = False
+    ) -> tuple[Route, list[str]]:
+        """The route through the pins as given (not reversed; with `loop`, back to the first
+        pin), and data warnings."""
         from driftmaps.geo.router import RouteError
 
-        key = tuple(pins)
+        key = (tuple(pins), loop)
+        kw = {"loop": True} if loop else {}  # A->B calls stay exactly as they were
         with self._lock:
             cached = self._by_pins.get(key)
         if cached is not None:
             return cached, []
         notes: list[str] = []
         try:
-            route = self._call_route(pins)
+            route = self._call_route(pins, **kw)
         except RouteError as exc:
             raise ApiError(400, route_error_message(exc, pins)) from None
         except Exception as exc:
@@ -421,7 +448,7 @@ class App:
             # Overpass trouble: route on map data saved by an earlier download, if any.
             log.warning("route download failed, trying saved map data: %s", exc)
             try:
-                route = self._call_route(pins, offline=True)
+                route = self._call_route(pins, offline=True, **kw)
             except RouteError as exc2:
                 raise ApiError(400, route_error_message(exc2, pins)) from None
             except Exception:
@@ -437,7 +464,9 @@ class App:
     def route(self, body: dict) -> dict:
         pins = parse_pins(body.get("pins"))
         reverse = bool(body.get("reverse", False))
-        span = sum(_haversine_m(a, b) for a, b in zip(pins, pins[1:], strict=False))
+        loop = bool(body.get("loop", False))
+        legs = pins + [pins[0]] if loop else pins
+        span = sum(_haversine_m(a, b) for a, b in zip(legs, legs[1:], strict=False))
         if span > MAX_PIN_SPAN_M:
             raise ApiError(
                 400,
@@ -445,13 +474,19 @@ class App:
                 f"Keep tracks under about {LONG_ROUTE_M / 1000:.0f} km.",
             )
         try:
-            base, notes = self._base_route(pins)
+            base, notes = self._base_route(pins, loop)
         except ApiError:
             raise
         except Exception as exc:
             log.exception("routing failed")
             raise ApiError(500, f"Something went wrong while finding the route: {exc}") from None
         route = base.reverse() if reverse else base
+        if route.closed and route.length_m < MIN_LOOP_M:
+            raise ApiError(
+                400,
+                f"That loop is only {route.length_m:.0f} m long - too short for a track. "
+                "Add a point further away to make it bigger.",
+            )
         route_id = self.routes.put(route)
 
         warnings_out = list(notes)
@@ -463,7 +498,9 @@ class App:
             )
         if route.repeated_nodes():
             warnings_out.append(
-                "The route crosses or runs over itself - check the line on the map."
+                "The loop crosses itself at a junction (a figure 8) - check the line on the map."
+                if route.closed
+                else "The route crosses or runs over itself - check the line on the map."
             )
         try:
             if _coarse_only(route):
@@ -474,9 +511,12 @@ class App:
             "route_id": route_id,
             "length_m": round(float(route.length_m), 1),
             "line": display_line(route),
-            "snapped": [[round(p.snap_lat, 7), round(p.snap_lon, 7)] for p in base.pins],
+            "snapped": [
+                [round(p.snap_lat, 7), round(p.snap_lon, 7)] for p in base.pins[: len(pins)]
+            ],
             "names": road_names(route),
             "warnings": warnings_out,
+            "loop": bool(route.closed),
         }
 
     def _route_for(self, body: dict) -> tuple[str, Route]:
@@ -536,6 +576,14 @@ class App:
 
     def build(self, body: dict) -> dict:
         route_id, route = self._route_for(body)
+        loop = body.get("loop")
+        if loop is not None and bool(loop) != bool(route.closed):
+            raise ApiError(
+                400,
+                "That route isn't a loop - press Back to start and wait for the route first."
+                if loop
+                else "That route is a loop - turn off Back to start and wait for the route first.",
+            )
         name = str(body.get("name") or "").strip()
         if not name:
             raise ApiError(400, "Give the track a name.")

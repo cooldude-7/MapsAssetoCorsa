@@ -8,8 +8,12 @@ Pipeline pieces (PLAN §5.3, docs/research/geo.md §3.2-§3.5, ac_format.md §3,
   (curvature-continuity) penalty, re-weighted until the curve stays within `max_deviation_m` of
   the OSM polyline, then resampled at 1 m. Each output point carries `param`, the distance along
   the original polyline it came from, so OSM attributes can be looked up per station.
+- `closed_centreline`: the same for a loop (a circuit): the corners at the join are filleted
+  like any other and the smoother is periodic, so there is no seam or kink where the lap
+  starts; the stations start at the loop's first point and end on it again.
 - `RoadModel`: per-station frame, height and cross-section in AC coordinates
-  (X = east, Y = up, Z = south; left = up x forward).
+  (X = east, Y = up, Z = south; left = up x forward). A `closed` model's last station is its
+  first one again; frames, curvature and offset columns wrap around the join.
 - `road_columns`: lateral offset polylines (road edges, shoulder edges, paint edges) with
   fold-over removed: on a tight inside curve an offset point that would move backwards is
   merged with its neighbours (geo.md §3.5), so no triangle ever flips.
@@ -43,6 +47,7 @@ __all__ = [
     "RoadMeshes",
     "RoadModel",
     "build_road_meshes",
+    "closed_centreline",
     "extend_straight",
     "fillet_corners",
     "fix_foldover",
@@ -50,6 +55,7 @@ __all__ = [
     "road_columns",
     "smooth_centreline",
     "whittaker",
+    "whittaker_periodic",
 ]
 
 # Painted lines (visual only) sit this far above the asphalt. ASSUMED enough to avoid
@@ -104,6 +110,28 @@ def whittaker(y: npt.ArrayLike, weights: npt.ArrayLike, lam: float, order: int =
     band = lam * _difference_band(n, order)
     band[order] += w
     return solveh_banded(band, (w[:, None] * y.reshape(n, -1)), check_finite=False).reshape(y.shape)
+
+
+def whittaker_periodic(
+    y: npt.ArrayLike, weights: npt.ArrayLike, lam: float, order: int = 3
+) -> np.ndarray:
+    """`whittaker` on a closed curve: the differences wrap around (point n-1 is followed by
+    point 0), so the result has no ends. `y` (n,) or (n, k), without a repeated first point."""
+    from scipy import sparse
+    from scipy.sparse.linalg import splu
+
+    y = np.asarray(y, np.float64)
+    w = np.asarray(weights, np.float64)
+    n = y.shape[0]
+    if n <= order + 1:
+        return y.copy()
+    coeffs = np.array([math.comb(order, k) * (-1) ** (order - k) for k in range(order + 1)], float)
+    rows = np.repeat(np.arange(n), order + 1)
+    cols = ((np.arange(n)[:, None] + np.arange(order + 1)[None, :]) % n).ravel()
+    d = sparse.csr_array((np.tile(coeffs, n), (rows, cols)), shape=(n, n))
+    a = sparse.diags_array(w) + lam * (d.T @ d)
+    solved = splu(sparse.csc_array(a)).solve(w[:, None] * y.reshape(n, -1))
+    return solved.reshape(y.shape)
 
 
 def _cumlen(xy: np.ndarray) -> np.ndarray:
@@ -290,6 +318,78 @@ def smooth_centreline(
     return out, oparam
 
 
+def closed_centreline(
+    xy: npt.ArrayLike,
+    param: npt.ArrayLike,
+    *,
+    max_deviation_m: float = 1.5,
+    cutoff_m: float = 40.0,
+    simplify_m: float = 0.3,
+    spacing_m: float = 2.0,
+    step_m: float = 1.0,
+    iterations: int = 12,
+) -> tuple[np.ndarray, np.ndarray]:
+    """`simplify` + `fillet_corners` + `smooth_centreline` for a loop.
+
+    `xy` (M, 2) goes round the loop from its start and back to it (last point == first);
+    `param` is the distance along it (0 .. L). The loop is opened in the middle of its longest
+    segment (no corner there), simplified and filleted, then smoothed with the periodic
+    Whittaker smoother (same cut-off and deviation rule as `smooth_centreline`). Returns
+    stations every ~`step_m` from the start round to the start again (the last point equals
+    the first exactly) and their `param`, rising from 0 to L.
+    """
+    xy, param = _dedupe(np.asarray(xy, np.float64), np.asarray(param, np.float64))
+    if np.linalg.norm(xy[-1] - xy[0]) > 1e-6:
+        raise ValueError("a closed centreline must end where it starts")
+    total = float(param[-1])
+    # Open the loop in the middle of its longest segment: [mid, ..., start, ..., mid].
+    seg = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+    k = int(np.argmax(seg))
+    mid, pm = 0.5 * (xy[k] + xy[k + 1]), 0.5 * (param[k] + param[k + 1])
+    ring, ring_p = xy[:-1], param[:-1]  # without the repeated start
+    order = np.r_[np.arange(k + 1, len(ring)), np.arange(0, k + 1)]
+    unwrap = np.where(order <= k, ring_p[order] + total, ring_p[order])
+    open_xy = np.vstack([mid, ring[order], mid])
+    open_p = np.concatenate([[pm], unwrap, [pm + total]])
+    f_xy, f_p = fillet_corners(*simplify(open_xy, open_p, simplify_m))
+
+    # Periodic smoothing of the (closed) filleted line, resampled at `spacing_m`.
+    dense, dparam = _resample(f_xy, f_p, spacing_m)  # first == last (both `mid`)
+    fine, _ = _resample(f_xy, f_p, min(0.25, spacing_m / 4))
+    tree = cKDTree(fine)
+    pts, pts_p = dense[:-1], dparam[:-1]
+    n = len(pts)
+    h = _cumlen(dense)[-1] / max(n, 1)
+    lam = (2.0 * math.pi * h / cutoff_m) ** -6
+    w = np.ones(n)
+    smooth = pts
+    for _ in range(iterations):
+        smooth = whittaker_periodic(pts, w, lam)
+        dev, _ = tree.query(smooth)
+        if dev.max() <= max_deviation_m:
+            break
+        over = (dev > 0.8 * max_deviation_m).astype(float)
+        bump = np.convolve(np.r_[over[-5:], over, over[:5]], np.ones(11), mode="valid") > 0
+        w = np.where(bump, w * 4.0, w)
+
+    # Resample from the start (param = total, where the loop was opened) once round.
+    curve = np.vstack([smooth, smooth[:1]])
+    cp = np.concatenate([pts_p, [pts_p[0] + total]])
+    sc = _cumlen(curve)
+    lap = sc[-1]
+    s2 = np.concatenate([sc, sc[1:] + lap])
+    xy2 = np.vstack([curve, curve[1:]])
+    p2 = np.concatenate([cp, cp[1:] + total])
+    s_start = float(np.interp(total, cp, sc))
+    count = max(3, math.ceil(lap / step_m - 1e-9))
+    t = s_start + np.linspace(0.0, lap, count + 1)
+    out = np.stack([np.interp(t, s2, xy2[:, c]) for c in range(2)], axis=1)
+    out[-1] = out[0]
+    oparam = np.interp(t, s2, p2) - total
+    oparam[0], oparam[-1] = 0.0, total
+    return out, np.clip(np.maximum.accumulate(oparam), 0.0, total)
+
+
 # --------------------------------------------------------------------------------------------
 # Road model
 # --------------------------------------------------------------------------------------------
@@ -304,6 +404,8 @@ class RoadModel:
     width, `shoulder` the gravel width beyond it on each side. `centre_line` says whether a
     centre line is painted at the station; `double_yellow` picks the North American style.
     `bridge` marks stations on a bridge deck. `s` is the arc length from the first station.
+    `closed`: a loop whose last station is the first one again (same position and frame);
+    `at` and `interp` then take any `s` modulo the lap length.
     """
 
     s: np.ndarray
@@ -313,6 +415,7 @@ class RoadModel:
     centre_line: np.ndarray
     bridge: np.ndarray
     double_yellow: bool = True
+    closed: bool = False
     forward: np.ndarray = field(init=False)
     left: np.ndarray = field(init=False)
     up: np.ndarray = field(init=False)
@@ -328,7 +431,16 @@ class RoadModel:
         self.bridge = np.broadcast_to(np.asarray(self.bridge, bool), (n,)).copy()
         seg = np.diff(self.centre, axis=0)
         seg /= np.linalg.norm(seg, axis=1)[:, None]
-        fwd = np.concatenate([seg[:1], seg[:-1] + seg[1:], seg[-1:]])
+        if self.closed:
+            if n < 4 or np.linalg.norm(self.centre[-1] - self.centre[0]) > 1e-6:
+                raise ValueError("a closed road model must end on its first station")
+            self.centre[-1] = self.centre[0]
+            for a in (self.half_width, self.shoulder, self.centre_line, self.bridge):
+                a[-1] = a[0]
+            ends = seg[-1:] + seg[:1]
+            fwd = np.concatenate([ends, seg[:-1] + seg[1:], ends])
+        else:
+            fwd = np.concatenate([seg[:1], seg[:-1] + seg[1:], seg[-1:]])
         fwd /= np.linalg.norm(fwd, axis=1)[:, None]
         left = np.cross(WORLD_UP, fwd)
         left /= np.linalg.norm(left, axis=1)[:, None]
@@ -337,8 +449,15 @@ class RoadModel:
         self.left = left
         self.up = up / np.linalg.norm(up, axis=1)[:, None]
         # Signed horizontal curvature (1/m, + = turning left): d(forward)/ds along left.
-        ds = np.gradient(self.s) if n > 1 else np.ones(n)
-        dfwd = np.gradient(self.forward, axis=0) / ds[:, None]
+        if self.closed:  # central differences round the join
+            lap = self.s[-1] - self.s[0]
+            s_ring, f_ring = self.s[:-1], self.forward[:-1]
+            ds = (np.roll(s_ring, -1) - np.roll(s_ring, 1)) % lap
+            dfwd = (np.roll(f_ring, -1, axis=0) - np.roll(f_ring, 1, axis=0)) / ds[:, None]
+            dfwd = np.vstack([dfwd, dfwd[:1]])
+        else:
+            ds = np.gradient(self.s) if n > 1 else np.ones(n)
+            dfwd = np.gradient(self.forward, axis=0) / ds[:, None]
         self.curvature = np.einsum("ij,ij->i", dfwd, self.left)
 
     def __len__(self) -> int:
@@ -349,11 +468,22 @@ class RoadModel:
         """Asphalt half width + shoulder: the edge of the drivable footprint."""
         return self.half_width + self.shoulder
 
+    @property
+    def length(self) -> float:
+        return float(self.s[-1] - self.s[0])
+
+    def wrap(self, s: float) -> float:
+        """`s` itself, or on a closed model `s` brought into [s0, s0 + lap)."""
+        if not self.closed:
+            return s
+        return float(self.s[0] + (s - self.s[0]) % self.length)
+
     def index_at(self, s: float) -> int:
-        return int(np.clip(np.searchsorted(self.s, s), 0, len(self.s) - 1))
+        return int(np.clip(np.searchsorted(self.s, self.wrap(s)), 0, len(self.s) - 1))
 
     def at(self, s: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """(position, forward, left) at arc length `s` (linear between stations)."""
+        s = self.wrap(s)
         i = int(np.clip(np.searchsorted(self.s, s, side="right") - 1, 0, len(self.s) - 2))
         t = float(np.clip((s - self.s[i]) / (self.s[i + 1] - self.s[i]), 0.0, 1.0))
         pos = self.centre[i] + t * (self.centre[i + 1] - self.centre[i])
@@ -363,7 +493,7 @@ class RoadModel:
         return pos, fwd, left / np.linalg.norm(left)
 
     def interp(self, values: np.ndarray, s: float) -> float:
-        return float(np.interp(s, self.s, values))
+        return float(np.interp(self.wrap(s), self.s, values))
 
 
 def fix_foldover(points: np.ndarray, tangents: np.ndarray, eps: float = 1e-9) -> np.ndarray:
@@ -400,10 +530,23 @@ def fix_foldover(points: np.ndarray, tangents: np.ndarray, eps: float = 1e-9) ->
 INSIDE_RADIUS_FRACTION = 0.9
 
 
-def _running_max(values: np.ndarray, half_window: int) -> np.ndarray:
+def _running_max(values: np.ndarray, half_window: int, closed: bool = False) -> np.ndarray:
+    if closed:  # the last value repeats the first
+        out = _running_max_ring(values[:-1], half_window)
+        return np.append(out, out[:1])
     padded = np.pad(values, half_window, mode="edge")
     windows = np.lib.stride_tricks.sliding_window_view(padded, 2 * half_window + 1)
     return windows.max(axis=1)
+
+
+def _running_max_ring(values: np.ndarray, half_window: int) -> np.ndarray:
+    padded = np.pad(values, half_window, mode="wrap")
+    windows = np.lib.stride_tricks.sliding_window_view(padded, 2 * half_window + 1)
+    return windows.max(axis=1)
+
+
+# Stations of context on each side of the join when fold-over is fixed on a closed model.
+_CLOSED_PAD = 64
 
 
 def road_columns(model: RoadModel, offsets: npt.ArrayLike) -> np.ndarray:
@@ -417,14 +560,23 @@ def road_columns(model: RoadModel, offsets: npt.ArrayLike) -> np.ndarray:
     off = np.broadcast_to(np.asarray(offsets, np.float64), (len(model),)).copy()
     if not np.any(off):
         return model.centre.copy()
-    k_left = _running_max(np.maximum(model.curvature, 0.0), 5)
-    k_right = _running_max(np.maximum(-model.curvature, 0.0), 5)
+    closed = model.closed
+    k_left = _running_max(np.maximum(model.curvature, 0.0), 5, closed)
+    k_right = _running_max(np.maximum(-model.curvature, 0.0), 5, closed)
     with np.errstate(divide="ignore"):
         lim_left = np.where(k_left > 0, INSIDE_RADIUS_FRACTION / k_left, np.inf)
         lim_right = np.where(k_right > 0, INSIDE_RADIUS_FRACTION / k_right, np.inf)
     off = np.clip(off, -lim_right, lim_left)
     raw = model.centre + off[:, None] * model.left
-    return fix_foldover(raw, model.forward)
+    if not closed:
+        return fix_foldover(raw, model.forward)
+    # A loop: fix fold-over on the ring with stations from across the join on both sides, so
+    # the start and the end see the same neighbours, then close it exactly.
+    n = len(model) - 1
+    pad = min(n, _CLOSED_PAD)
+    idx = np.r_[np.arange(n - pad, n), np.arange(n), np.arange(pad)]
+    ring = fix_foldover(raw[idx], model.forward[idx])[pad : pad + n]
+    return np.vstack([ring, ring[:1]])
 
 
 def footprint_polygon(

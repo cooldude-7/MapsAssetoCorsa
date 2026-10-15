@@ -72,16 +72,20 @@ The first time, the app looks for Assetto Corsa. The top bar says **Assetto Cors
 
 1. **Find your road.** Type a road or a town in the search box at the top of the map (or press
    `/`), or drag and zoom the map.
-2. **Drop the start, then the finish.** Click where the road should start (pin **A**), then
-   click where it should end (pin **B**). The app follows the real roads between them and
-   draws the route. To force it along a certain road, click **+ Waypoint** and click on that
-   road. **Undo**, **Reverse** (drive it the other way) and **Clear** fix mistakes.
-3. **Check the route.** Make sure the line follows the roads you want. The panel shows the
-   length and an elevation chart of the hills.
-4. **Name it and pick the scenery.** Type a **Track name** and tick **Trees**, **Buildings**,
-   **Guardrails** as you like. Keep **Install into Assetto Corsa when done** ticked.
-5. **Click "Build track".** A progress bar shows what it's doing. It takes a few minutes; the
-   first build in a new area takes longer because it downloads map and elevation data. Keep the
+2. **Click your points.** Click where the road should start (point **A**), then further along
+   the road (**B**), and more points if you like (**C**, **D**...): each click adds the next
+   letter at the end, and the last one is the finish. The app follows the real roads through
+   them in that order and draws the route. To force it along a certain road, **Shift+click**
+   on that road to add a point in between. Drag a point to move it, right-click it to remove
+   it; **Undo** and **Clear** are at the top of the panel.
+3. **A loop?** Click **Back to start** and the road comes back to A: a circuit you can race lap
+   after lap. Click it again for A to B. Check the line follows the roads you want; the panel
+   shows the length and an elevation chart of the hills.
+4. **Name it.** Type a **Track name**. Trees, buildings, guardrails, the scenery density,
+   **Drive it the other way** and **Install into Assetto Corsa when done** are under
+   **More options** (all on by default).
+5. **Click "Create map".** A progress bar shows what it's doing. It takes a few minutes; the
+   first map in a new area takes longer because it downloads map and elevation data. Keep the
    black window open until it's done.
 6. **Drive it.** When it says **Installed!**, open Content Manager, go to **Drive**, pick the
    track by its name in the track list, choose your car and go. If Content Manager was already
@@ -138,8 +142,8 @@ AssettoCorsaMapGenerator, and choose **Allow** or **Restore**. Then extract the 
 
 ### Map servers busy, or the route won't load
 Road data comes from free, shared OpenStreetMap servers, and elevation from government data
-servers. They are sometimes busy or slow. Wait a minute and try again (click the pins again or
-press **Build track** again). Also check that your internet works. Very long routes take longer;
+servers. They are sometimes busy or slow. Wait a minute and try again (move a point again or
+press **Create map** again). Also check that your internet works. Very long routes take longer;
 try a shorter one first.
 
 ### The browser didn't open, or the page won't load

@@ -50,7 +50,7 @@ def ui(
     browser: bool = typer.Option(True, help="Open the page in your web browser."),
     data_dir: Path = typer.Option(None, help="App data folder (default: the per-user app folder)."),
 ) -> None:
-    """Start the map app: click two points on a map, get the track built and installed."""
+    """Start the map app: click points on a map (A to B, or a loop), get the track installed."""
     from driftmaps.app import run
 
     run(port=port, open_browser=browser, data_dir=data_dir)
@@ -138,13 +138,14 @@ def _route(
     buffer_m: float,
     offline: bool,
     refresh: bool,
+    loop: bool = False,
 ) -> Route:
     from driftmaps.geo.overpass import parse_overpass
     from driftmaps.geo.router import route_from_pins
 
     osm = parse_overpass(osm_json.read_bytes()) if osm_json else None
     return route_from_pins(
-        pins, cache_dir, osm=osm, buffer_m=buffer_m, offline=offline, refresh=refresh
+        pins, cache_dir, osm=osm, buffer_m=buffer_m, offline=offline, refresh=refresh, loop=loop
     )
 
 
@@ -160,6 +161,7 @@ _OSM_JSON = typer.Option(
 _BUFFER = typer.Option(1500.0, help="Road corridor half-width fetched around the pins (m).")
 _OFFLINE = typer.Option(False, help="Use cached road data only; never hit the network.")
 _REFRESH = typer.Option(False, help="Re-download road data even if it is cached.")
+_LOOP = typer.Option(False, help="Come back to the start: a loop (circuit) instead of A to B.")
 
 
 @app.command()
@@ -169,6 +171,7 @@ def route(
     via: list[str] = _VIA,
     out: Path = typer.Option(Path("route.json"), help="Where to write route.json."),
     reverse: bool = typer.Option(False, help="Drive the route from B to A."),
+    loop: bool = _LOOP,
     cache_dir: Path = _CACHE,
     osm_json: Path = _OSM_JSON,
     buffer_m: float = _BUFFER,
@@ -176,7 +179,7 @@ def route(
     refresh: bool = _REFRESH,
 ) -> None:
     """Route between pins over real roads and write route.json (what `build` reads)."""
-    r = _route(_pins(start, end, via), cache_dir, osm_json, buffer_m, offline, refresh)
+    r = _route(_pins(start, end, via), cache_dir, osm_json, buffer_m, offline, refresh, loop)
     if reverse:
         r = r.reverse()
     r.save(out)
@@ -196,6 +199,7 @@ def build(
         None, "--id", help="Track folder id (a-z, 0-9, _). Default: from the name."
     ),
     reverse: bool = typer.Option(False, help="Drive the route from B to A."),
+    loop: bool = _LOOP,
     out: Path = typer.Option(Path("out/tracks"), help="Folder to write the track into."),
     zip_path: Path = typer.Option(None, "--zip", help="Also pack the track into this zip."),
     install: bool = typer.Option(
@@ -276,7 +280,7 @@ def build(
         if guardrails_file is None and (route_json.parent / USER_SPANS_FILE).is_file():
             guardrails_file = route_json.parent / USER_SPANS_FILE
     else:
-        r = _route(_pins(start, end, via), cache_dir, osm_json, buffer_m, offline, refresh)
+        r = _route(_pins(start, end, via), cache_dir, osm_json, buffer_m, offline, refresh, loop)
     if reverse:
         r = r.reverse()
     options = BuildOptions(

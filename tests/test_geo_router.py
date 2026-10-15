@@ -349,3 +349,101 @@ def test_forks_reverse_matches_rerouting(forks_osm, forks_route):
     rerouted = route_from_pins(FORKS_PINS[::-1], osm=forks_osm)
     assert rerouted.edges == forks_route.reverse().edges
     assert rerouted.length_m == pytest.approx(forks_route.length_m, abs=0.002)
+
+
+# ---------------------------------------------------------------------------------------------
+# Loops
+# ---------------------------------------------------------------------------------------------
+
+
+def assert_closed(route: Route) -> None:
+    """A proper closed path: contiguous edges, the end meets the start, no U-turn anywhere
+    (also where the end joins the start)."""
+    assert route.closed
+    e = route.edges
+    assert_no_u_turns(route)
+    if route.start_t > 0.0:  # starts mid-segment: ends on the same directed edge, same spot
+        assert e[0] == e[-1] and route.end_t == pytest.approx(route.start_t)
+    else:
+        assert e[-1].v == e[0].u and route.end_t == 1.0
+        assert not (e[-1].u == e[0].v and e[-1].v == e[0].u), "U-turn where the loop closes"
+    pl = route.polyline(step_m=5.0)
+    assert np.linalg.norm(pl.lonlat[0] - pl.lonlat[-1]) < 1e-9
+    assert route.pins[0] == route.pins[-1]
+
+
+def test_loop_around_a_block():
+    osm = grid()
+    # A on the bottom row, B on the right column, C on the top row: back to A round the block.
+    pins = [pin(50, 0), pin(100, 50), pin(50, 100)]
+    route = route_on_graph(build_graph(osm, PROJ), pins, loop=True)
+    assert_closed(route)
+    assert route.length_m == pytest.approx(400.0, abs=0.01)  # the 100 x 100 m block
+    assert len(route.pins) == 4
+    assert route.repeated_nodes() == []
+    # route.json round trip keeps the loop; A->B routes don't even write the key.
+    back = Route.from_json(route.to_json())
+    assert back == route and back.closed
+    assert '"closed": true' in route.to_json()
+    open_route = route_on_graph(build_graph(osm, PROJ), pins)
+    assert not open_route.closed and '"closed"' not in open_route.to_json()
+    # Driven the other way it is still a loop from the same start.
+    rev = route.reverse()
+    assert_closed(rev)
+    assert rev.pins[0] == route.pins[0] and rev.length_m == route.length_m
+
+
+def test_loop_from_a_pin_on_a_junction():
+    osm = grid()
+    pins = [pin(100, 100), pin(200, 150), pin(150, 200)]  # A on the centre node
+    route = route_on_graph(build_graph(osm, PROJ), pins, loop=True)
+    assert_closed(route)
+    assert route.start_t == 0.0 and route.edges[0].u == route.edges[-1].v == 22
+    assert route.repeated_nodes() == []
+    assert route.length_m == pytest.approx(400.0, abs=0.01)
+
+
+def test_loop_refused_when_the_only_way_back_is_the_same_road():
+    # A dead-end road with a turning loop at its west end: from A on the road the route can
+    # go round the loop, but it can only come back to A along Main again, the other way.
+    with pytest.raises(RouteError, match="Can't make a loop here"):
+        route_on_graph(build_graph(lollipop(), PROJ), [pin(250, 0), pin(-100, 0)], loop=True)
+    # On the turning loop itself it is a proper loop.
+    route = route_on_graph(build_graph(lollipop(), PROJ), [pin(-50, 50), pin(-100, 0)], loop=True)
+    assert_closed(route)
+    assert {e.way for e in route.edges} == {200}
+
+
+def test_loop_figure_eight_crosses_itself_at_a_junction():
+    # Two blocks sharing the centre column of a 3 x 2 grid... laid out as a figure 8: the
+    # route goes round the left block, through the centre junction, round the right block.
+    nodes = {
+        1: (0, 0), 2: (100, 0), 3: (200, 0),
+        4: (0, 100), 5: (100, 100), 6: (200, 100),
+        7: (0, 200), 8: (100, 200), 9: (200, 200),
+    }  # fmt: skip
+    ways = [
+        (1, [1, 2, 3], {"name": "South"}),
+        (2, [7, 8, 9], {"name": "North"}),
+        (3, [1, 4, 7], {"name": "West"}),
+        (4, [3, 6, 9], {"name": "East"}),
+        (5, [4, 5, 6], {"name": "Middle"}),
+        (6, [2, 5, 8], {"name": "Centre"}),
+    ]
+    osm = make_osm(nodes, ways)
+    # A south-west, B north-east, C south-east, D north-west: a figure 8 through node 5.
+    pins = [pin(0, 50), pin(150, 100), pin(200, 150), pin(150, 200), pin(100, 150),
+            pin(50, 100), pin(0, 50)][:-1]  # fmt: skip
+    route = route_on_graph(build_graph(osm, PROJ), pins, loop=True)
+    assert_closed(route)
+    assert 5 in route.repeated_nodes()
+
+
+def test_loop_where_the_pins_cannot_be_joined_says_so():
+    g = build_graph(lollipop(with_loop=False), PROJ)
+    # A dead end: A -> B is fine, only the way back fails...
+    with pytest.raises(RouteError, match="Can't make a loop here"):
+        route_on_graph(g, [pin(50, 0), pin(250, 0)], loop=True)
+    # ...but B -> C needs a U-turn, so the points themselves can't be joined.
+    with pytest.raises(RouteError, match="no route joins"):
+        route_on_graph(g, [pin(50, 0), pin(250, 0), pin(100, 0)], loop=True)

@@ -41,6 +41,7 @@ from driftmaps.geo.router import Route, RouteError
 FIXTURES = Path(__file__).parent / "fixtures"
 PIN_A = [43.80410, -79.99231]
 PIN_B = [43.81060, -79.98185]
+REAL_ROUTE_FROM_PINS = router.route_from_pins  # tests replace router.route_from_pins
 
 
 @pytest.fixture(scope="module")
@@ -235,7 +236,8 @@ def test_settings_validates_and_persists(env):
 
 def test_route(env, forks_route):
     body = make_route(env.client)
-    assert set(body) == {"route_id", "length_m", "line", "snapped", "names", "warnings"}
+    assert set(body) == {"route_id", "length_m", "line", "snapped", "names", "warnings", "loop"}
+    assert body["loop"] is False
     assert len(body["route_id"]) == 16
     assert body["length_m"] == pytest.approx(forks_route.length_m, abs=0.1)
     line = np.array(body["line"])
@@ -249,6 +251,7 @@ def test_route(env, forks_route):
     assert body["warnings"] == []
     call = env.route_calls[0]
     assert call["pins"] == [tuple(PIN_A), tuple(PIN_B)]
+    assert "loop" not in call  # A->B routing is called exactly as before
     assert Path(call["cache_dir"]) == env.settings.data_dir / "cache"
     # The route is kept on disk for builds after a restart.
     saved = Route.load(env.settings.routes_dir / f"{body['route_id']}.json")
@@ -346,7 +349,7 @@ def test_route_error_message_labels_waypoints():
     pins = [(43.0, -80.0), (43.1, -80.1), (43.2, -80.2)]
     exc = RouteError("pin (43.100000, -80.100000) is 300 m from the nearest road (max 150 m)")
     assert route_error_message(exc, pins) == (
-        "No road found near point waypoint 1 - click closer to a road."
+        "No road found near point B - click closer to a road."
     )
     assert "U-turns" in route_error_message(RouteError("no route joins the pins in order"), pins)
 
@@ -428,6 +431,7 @@ def test_build_installs_and_lists(env, forks_route):
         "kn5_mb": 2.5,
         "trees": 1234,
         "buildings": 56,
+        "loop": False,
     }
     assert "Planting trees" in job["log"] and any("KN5" in line for line in job["log"])
     assert (env.tracks / tid / MARKER_FILE).is_file()
@@ -630,3 +634,110 @@ def test_foreign_pages_are_refused(env):
         origin = f"http://{host}:{env.srv.port}"
         status, _ = c.call("POST", "/api/settings", {"ac_root": ""}, headers={"Origin": origin})[:2]
         assert status == 200
+
+
+# ---------------------------------------------------------------------------------------------
+# loops ("Back to start")
+# ---------------------------------------------------------------------------------------------
+
+
+def _block_loop(size: float = 1.0) -> Route:
+    """A closed route round a small block (300 x 200 m at size 1) near the Forks pins."""
+    from driftmaps.geo.overpass import OsmData, Way
+    from driftmaps.geo.project import LocalProjection
+
+    proj = LocalProjection(*PIN_A)
+    xy = np.array([(0, 0), (300, 0), (300, 200), (0, 200), (0, 0)], float) * size
+    lon, lat = proj.to_lonlat(xy[:, 0], xy[:, 1])
+    way = Way(
+        7,
+        (1, 2, 3, 4, 1),
+        np.stack([lon, lat], -1),
+        {"highway": "residential", "name": "Block Road"},
+    )
+    osm = OsmData((way,), "2026-01-01T00:00:00Z", "block")
+    a = proj.to_lonlat(150 * size, 0.0)
+    b = proj.to_lonlat(300 * size, 100 * size)
+    return REAL_ROUTE_FROM_PINS([(a[1], a[0]), (b[1], b[0])], osm=osm, loop=True)
+
+
+def test_route_loop(env, monkeypatch, forks_route):
+    loop = _block_loop()
+    calls = []
+
+    def fake(pins, cache_dir=None, **kw):
+        calls.append(kw)
+        return loop if kw.get("loop") else forks_route
+
+    monkeypatch.setattr(router, "route_from_pins", fake)
+    pins = [[p.lat, p.lon] for p in loop.pins[:-1]]
+    status, body = env.client.post("/api/route", {"pins": pins, "loop": True})
+    assert status == 200, body
+    assert body["loop"] is True and calls == [{"loop": True, "max_length_m": float("inf")}]
+    assert body["line"][0] == body["line"][-1]  # the line on the map closes
+    assert len(body["snapped"]) == 2  # one per point sent (the closing pin isn't repeated)
+    assert body["length_m"] == pytest.approx(1000.0, abs=0.5)
+    stored = env.srv.app.routes.get(body["route_id"])
+    assert stored.closed
+    # The same points as A->B are a different route (routed separately).
+    status, ab = env.client.post("/api/route", {"pins": pins})
+    assert status == 200 and ab["loop"] is False and len(calls) == 2
+    # Reversed: the other way round from the same start.
+    status, rev = env.client.post("/api/route", {"pins": pins, "loop": True, "reverse": True})
+    assert status == 200 and rev["loop"] is True and len(calls) == 2
+    assert rev["line"][0] == pytest.approx(body["line"][0], abs=1e-6)
+    assert rev["line"][1] == pytest.approx(body["line"][-2], abs=1e-6)
+
+    # Build: a loop route builds as a loop; `loop` must match the route if it is sent.
+    status, res = env.client.post(
+        "/api/build", {"route_id": body["route_id"], "name": "Block", "loop": False}
+    )
+    assert status == 400 and "Back to start" in res["error"]
+    status, res = env.client.post(
+        "/api/build", {"route_id": ab["route_id"], "name": "Block", "loop": True}
+    )
+    assert status == 400 and "isn't a loop" in res["error"]
+    status, res = env.client.post(
+        "/api/build", {"route_id": body["route_id"], "name": "Block", "loop": True}
+    )
+    assert status == 200, res
+    job = env.client.wait_job(res["job_id"])
+    assert job["state"] == "done" and job["result"]["loop"] is True
+    assert env.build.calls[-1][0].closed
+
+
+def test_route_loop_refusals(env, monkeypatch):
+    from driftmaps.geo.router import LOOP_MESSAGE
+
+    def no_loop(pins, cache_dir=None, **kw):
+        raise RouteError(f"no loop: {LOOP_MESSAGE}")
+
+    monkeypatch.setattr(router, "route_from_pins", no_loop)
+    status, body = env.client.post("/api/route", {"pins": [PIN_A, PIN_B], "loop": True})
+    assert status == 400
+    assert body["error"] == (
+        "Can't make a loop here - add a point on a different road back to the start."
+    )
+    tiny = _block_loop(size=0.2)  # 200 m round
+    monkeypatch.setattr(router, "route_from_pins", lambda pins, cache_dir=None, **kw: tiny)
+    status, body = env.client.post("/api/route", {"pins": [PIN_A, PIN_B], "loop": True})
+    assert status == 400 and "too short" in body["error"]
+
+
+def test_tracks_say_which_are_loops(env):
+    folder = write_track(env.out / "dm_block", "Block")
+    ui = json.loads((folder / "ui" / "ui_track.json").read_text())
+    ui["tags"] = ["circuit", "street", "drift-maps"]
+    (folder / "ui" / "ui_track.json").write_text(json.dumps(ui))
+    write_track(env.out / "dm_road", "Road")
+    status, tracks = env.client.get("/api/tracks")
+    assert status == 200
+    assert {t["track_id"]: t["loop"] for t in tracks} == {"dm_block": True, "dm_road": False}
+
+
+def test_pin_letters():
+    from driftmaps.app.server import pin_letter
+
+    assert [pin_letter(i) for i in (0, 1, 2, 25, 26, 27, 49)] == [
+        "A", "B", "C", "Z", "AA", "AB", "AX"
+    ]  # fmt: skip

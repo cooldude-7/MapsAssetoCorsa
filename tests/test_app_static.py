@@ -137,7 +137,9 @@ def test_script_follows_the_api_contract_and_map_sources():
     assert "https://tiles.openfreemap.org/styles/liberty" in js
     assert "https://tiles.openfreemap.org/styles/dark" in js
     assert "https://photon.komoot.io/api/" in js
-    for field in ("route_id", "track_id", "install", "scenery_density", "reverse", "ac_root"):
+    for field in (
+        "route_id", "track_id", "install", "scenery_density", "reverse", "loop", "ac_root"
+    ):  # fmt: skip
         assert re.search(rf"\b{field}\b", js), f"app.js never sends/reads {field}"
 
 
@@ -173,8 +175,19 @@ const out = {
   insertMid: bestInsertIndex([[0, 0], [0, 1], [0, 2]], [0.01, 1.5]),
   insertFirst: bestInsertIndex([[0, 0], [0, 1], [0, 2]], [0.01, 0.4]),
   insertShort: bestInsertIndex([[0, 0]], [0, 1]),
+  // On a loop the gap from the last point back to A counts too (index n: insert at the end).
+  insertLoopClose: bestInsertIndex([[0, 0], [0, 1], [1, 1]], [0.8, 0.5], true),
+  insertLoopOpen: bestInsertIndex([[0, 0], [0, 1], [1, 1]], [0.8, 0.5], false),
   pins: apiPins([[-79.8, 43.2], [-79.75, 43.25], [-79.7, 43.3]], false),
   pinsRev: apiPins([[-79.8, 43.2], [-79.75, 43.25], [-79.7, 43.3]], true),
+  pinsLoopRev: apiPins([[-79.8, 43.2], [-79.75, 43.25], [-79.7, 43.3]], true, true),
+  reversedLoop: reversedPins(["A", "B", "C", "D"], true),
+  reversedOpen: reversedPins(["A", "B", "C", "D"], false),
+  letters: [0, 1, 2, 25, 26, 27, 49].map(pinLetter),
+  roles: [[0, 3, false], [1, 3, false], [2, 3, false], [0, 3, true], [2, 3, true]].map(
+    ([i, n, loop]) => pinRole(i, n, loop)),
+  loopNames: [defaultTrackName(["Mill St"], true),
+    defaultTrackName(["Mill St", "Main St", "X"], true), defaultTrackName([], true)],
   degree: distanceM([0, 0], [0, 1]),
   along: pointAlong(
     [[0, 0], [0, 1], [0, 2]],
@@ -220,6 +233,14 @@ def test_pure_helpers_under_node(tmp_path: Path):
     assert out["insertShort"] == 1
     assert out["pins"] == [[43.2, -79.8], [43.25, -79.75], [43.3, -79.7]]
     assert out["pinsRev"] == [[43.3, -79.7], [43.25, -79.75], [43.2, -79.8]]
+    # Loops: A stays the start whichever way round; letters in click order.
+    assert out["insertLoopClose"] == 3 and out["insertLoopOpen"] == 2
+    assert out["pinsLoopRev"] == [[43.2, -79.8], [43.3, -79.7], [43.25, -79.75]]
+    assert out["reversedLoop"] == ["A", "D", "C", "B"]
+    assert out["reversedOpen"] == ["D", "C", "B", "A"]
+    assert out["letters"] == ["A", "B", "C", "Z", "AA", "AB", "AX"]
+    assert out["roles"] == ["start", "via", "finish", "start", "via"]
+    assert out["loopNames"] == ["Mill St Loop", "Mill St & Main St Loop", ""]
     assert out["degree"] == pytest.approx(111195, rel=1e-3)
     assert out["along"] == pytest.approx([0, 1.5], abs=1e-9)
     assert out["alongEnd"] == [0, 1]

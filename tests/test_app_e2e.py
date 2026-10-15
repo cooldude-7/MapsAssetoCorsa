@@ -19,6 +19,13 @@ clicks A and B on the map, waits for the route and the elevation profile, builds
 install and My tracks, and deletes the track, saving screenshots in out/app_screens/. With
 DRIFTMAPS_E2E_LIVE=1 as well it uses the real router and builder on Snake Road (Overpass and
 elevation downloads; point DRIFTMAPS_CACHE_DIR at a warm cache to make it quick).
+
+The loop scenario (`test_browser_loop`, opt-in with DRIFTMAPS_E2E_LOOP=1 as well) is always
+live: it clicks four points round a block of streets in Waterdown (A to D), presses "Back to
+start", checks the loop on the map (closed line, labels, toggling back to A to B, Shift+click
+in between and Undo), creates the map with the real builder into a fake Assetto Corsa
+(DRIFTMAPS_AC_ROOT) and checks it is a circuit. Screenshots go to out/app_screens/loop_*.png,
+the route and the result to loop_route.json / loop_result.json beside them.
 """
 
 from __future__ import annotations
@@ -485,6 +492,199 @@ def test_browser_flow(browser_page, tmp_path, monkeypatch, forks_route):
         page.wait_for_timeout(300)
         shot("10_deleted")
         assert not (tracks / TRACK_ID).exists()
+        assert problems == []
+    finally:
+        try:
+            shot("zz_last")
+        finally:
+            srv.stop()
+
+
+# ---------------------------------------------------------------------------------------------
+# In a real browser: a loop ("Back to start"), live (opt-in)
+# ---------------------------------------------------------------------------------------------
+
+# Round a block in Waterdown: Flamboro St (A), Dundas St E (B), Mill St S (C), Main St S (D),
+# then back to A along Flamboro St: about 1.4 km.
+LOOP_POINTS = [
+    (43.33140, -79.89173),
+    (43.33355, -79.89272),
+    (43.33302, -79.88976),
+    (43.33059, -79.88994),
+]
+LOOP_BETWEEN = (43.33206, -79.89010)  # on Union Street, between C and D
+LOOP_NAME = "Waterdown Loop (App Test)"
+LOOP_ID = "dm_waterdown_loop_app_test"
+
+
+def test_browser_loop(browser_page, tmp_path, monkeypatch):
+    if os.environ.get("DRIFTMAPS_E2E_LOOP") != "1":
+        pytest.skip("live loop test: set DRIFTMAPS_E2E_LOOP=1 (downloads map and elevation data)")
+    page, problems = browser_page
+    ac = make_ac(tmp_path / "assettocorsa")
+    monkeypatch.setenv("DRIFTMAPS_AC_ROOT", str(ac))
+    tracks = ac / "content" / "tracks"
+    # Assetto Corsa from DRIFTMAPS_AC_ROOT, downloads cached in DRIFTMAPS_CACHE_DIR if set.
+    srv = AppServer(App(Settings(tmp_path / "appdata")), port=0).start()
+    SCREENS.mkdir(parents=True, exist_ok=True)
+    js_state = "window.acmg.state"
+
+    def shot(name: str) -> None:
+        page.screenshot(path=str(SCREENS / f"loop_{name}.png"))
+
+    def idle() -> None:
+        page.wait_for_function(
+            "() => window.acmg.map && window.acmg.map.loaded() && !window.acmg.map.isMoving()",
+            timeout=60_000,
+        )
+        page.wait_for_timeout(500)
+
+    def click(lat: float, lon: float, shift: bool = False) -> None:
+        x, y = page.evaluate(
+            "([lon, lat]) => { const p = window.acmg.map.project([lon, lat]); return [p.x, p.y]; }",
+            [lon, lat],
+        )
+        box = page.locator("#map").bounding_box()
+        if shift:
+            page.keyboard.down("Shift")
+        page.mouse.click(box["x"] + x, box["y"] + y)
+        if shift:
+            page.keyboard.up("Shift")
+        page.wait_for_timeout(450)
+
+    def wait_route(loop: bool) -> dict:
+        page.wait_for_function(
+            f"(loop) => {{ const s = {js_state}; return !s.routeStale && "
+            "((s.route && !!s.route.loop === loop) || !!s.routeError); }",
+            arg=loop,
+            timeout=300_000,
+        )
+        assert page.text_content("#route-status") == "", page.text_content("#route-status")
+        return page.evaluate(f"() => {js_state}.route")
+
+    def labels() -> list[str]:
+        """The map markers' letters, in the app's point order (not DOM order)."""
+        return page.evaluate(
+            f"() => {js_state}.pins.map(p => p.el.querySelector('.dm-pin-label').textContent)"
+        )
+
+    try:
+        page.goto(srv.url)
+        page.wait_for_function("() => window.acmg && window.acmg.state.mapReady", timeout=60_000)
+        page.wait_for_function("() => document.getElementById('ac-pill').dataset.kind === 'ok'")
+        assert page.text_content("#btn-build").strip() == "Create map"
+        assert not page.locator("#opt-trees").is_visible()  # under the closed "More options"
+        lats = [p[0] for p in LOOP_POINTS]
+        lons = [p[1] for p in LOOP_POINTS]
+        page.evaluate(
+            "(b) => window.acmg.map.fitBounds(b, {padding: 110, duration: 0})",
+            [[min(lons), min(lats)], [max(lons), max(lats)]],
+        )
+        idle()
+
+        click(*LOOP_POINTS[0])
+        assert page.is_disabled("#btn-loop")  # needs two points
+        shot("01_start_A")
+        for p in LOOP_POINTS[1:]:
+            click(*p)
+        ab = wait_route(False)
+        assert labels() == ["A", "B", "C", "D"]
+        assert page.eval_on_selector_all(
+            "#pin-list .pin-badge", "els => els.map(e => e.textContent)"
+        ) == ["A", "B", "C", "D"]
+        assert "Finish" in page.text_content("#pin-list li:nth-child(4)")
+        assert page.is_enabled("#btn-loop")
+        page.click("#btn-fit")
+        idle()
+        shot("02_points_A_to_D")
+
+        # Back to start: the loop closes on the map.
+        page.click("#btn-loop")
+        loop = wait_route(True)
+        assert page.get_attribute("#btn-loop", "aria-pressed") == "true"
+        assert loop["line"][0] == loop["line"][-1]
+        assert 1.1 < loop["length_m"] / 1000 < 1.8, loop["length_m"]
+        assert loop["length_m"] != ab["length_m"]
+        assert page.text_content("#route-length-label") == "Lap length"
+        assert "Start and finish" in page.text_content("#pin-list li:nth-child(1)")
+        assert "Back to the start" in page.text_content("#pin-list")
+        assert labels() == ["A", "B", "C", "D"]
+        page.wait_for_function(
+            "() => document.getElementById('profile-stats').textContent.length > 0",
+            timeout=300_000,
+        )
+        page.click("#btn-fit")
+        idle()
+        shot("03_back_to_start")
+
+        # Off again: A to B, D is the finish; on again: the same loop.
+        page.click("#btn-loop")
+        again = wait_route(False)
+        assert again["length_m"] == pytest.approx(ab["length_m"], abs=0.5)
+        idle()
+        shot("04_toggled_off")
+        page.click("#btn-loop")
+        assert wait_route(True)["route_id"] == loop["route_id"]
+
+        # Shift+click on the loop between C and D inserts a point there (the old D becomes
+        # E); Undo takes it out again.
+        click(*LOOP_BETWEEN, shift=True)
+        between = wait_route(True)
+        assert labels() == ["A", "B", "C", "D", "E"]
+        pins = page.evaluate(f"() => {js_state}.pins.map(p => p.lngLat)")
+        assert pins[3] == pytest.approx([LOOP_BETWEEN[1], LOOP_BETWEEN[0]], abs=2e-4)
+        assert between["length_m"] == pytest.approx(loop["length_m"], abs=25.0)
+        idle()
+        shot("05_shift_click_between")
+        page.click("#btn-undo")
+        assert wait_route(True)["route_id"] == loop["route_id"]
+        assert labels() == ["A", "B", "C", "D"]
+
+        page.click("#more-options summary")
+        page.wait_for_timeout(300)
+        assert page.locator("#opt-trees").is_visible()
+        shot("06_more_options")
+        page.click("#more-options summary")
+
+        page.fill("#track-name", LOOP_NAME)
+        page.click("#btn-build")
+        page.wait_for_timeout(2500)
+        assert page.locator("#job").is_visible()
+        shot("07_creating")
+        page.wait_for_function(
+            "() => ['done', 'error'].includes(document.getElementById('job').dataset.state)",
+            timeout=1_800_000,
+        )
+        page.wait_for_timeout(800)
+        shot("08_created")
+        assert page.get_attribute("#job", "data-state") == "done", page.text_content("#job")
+        assert "Installed!" in page.text_content("#job-result")
+        assert "Lap" in page.text_content("#job-result")
+        track = tracks / LOOP_ID
+        assert is_driftmaps_track(track)
+        ui = json.loads((track / "ui" / "ui_track.json").read_text(encoding="utf-8"))
+        assert "circuit" in ui["tags"] and ui["run"] in ("clockwise", "anticlockwise")
+        assert Route.load(track / "route.json").closed
+        page.wait_for_selector("#track-list li", timeout=10_000)
+        assert "Loop" in page.text_content("#track-list")
+        page.locator("#track-list li").first.scroll_into_view_if_needed()
+        shot("09_my_tracks")
+
+        # Keep what was built for a closer look (debug render, zip size).
+        shutil.copyfile(track / "route.json", SCREENS / "loop_route.json")
+        result = page.evaluate("() => fetch('/api/tracks').then(r => r.json())")
+        (SCREENS / "loop_result.json").write_text(
+            json.dumps(
+                {
+                    "tracks": result,
+                    "job_result": page.text_content("#job-result"),
+                    "ui_track": ui,
+                    "kn5_bytes": (track / f"{LOOP_ID}.kn5").stat().st_size,
+                },
+                indent=1,
+            ),
+            encoding="utf-8",
+        )
         assert problems == []
     finally:
         try:

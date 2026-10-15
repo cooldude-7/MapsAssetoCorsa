@@ -1,8 +1,9 @@
 # Assetto Corsa Map Generator
 
-Turn real roads into Assetto Corsa tracks: click a start and a finish on a map, and the app
-builds a driveable track from OpenStreetMap road data and real (lidar) elevation, with trees,
-buildings and bridges, and installs it so it shows up in Content Manager.
+Turn real roads into Assetto Corsa tracks: click points on a map (A, B, C...), from A to B or
+round a loop "back to start", and the app builds a driveable track from OpenStreetMap road
+data and real (lidar) elevation, with trees, buildings and bridges, and installs it so it
+shows up in Content Manager (a loop is a circuit you can race lap after lap).
 
 Status: **M5 (the map app)**. Players: get the Windows app from
 [`docs/INSTALL_APP.md`](docs/INSTALL_APP.md) and test it with

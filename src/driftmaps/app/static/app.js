@@ -76,14 +76,16 @@ function pointAlong(line, cum, d) {
   return [line[lo][0] + (line[hi][0] - line[lo][0]) * t, line[lo][1] + (line[hi][1] - line[lo][1]) * t];
 }
 
-/** Where a new waypoint `p` goes in the pin chain: the gap it lengthens the least (1..n-1). */
-function bestInsertIndex(points, p) {
+/** Where a point `p` added in between goes in the chain: the gap it lengthens the least
+ * (1..n-1; on a loop also n, the gap from the last point back to A). */
+function bestInsertIndex(points, p, loop) {
   if (points.length < 2) return points.length;
   let best = 1;
   let bestCost = Infinity;
-  for (let i = 1; i < points.length; i++) {
+  const n = points.length;
+  for (let i = 1; i <= (loop ? n : n - 1); i++) {
     const a = points[i - 1];
-    const b = points[i];
+    const b = points[i % n];
     const cost = distanceM(a, p) + distanceM(p, b) - distanceM(a, b);
     if (cost < bestCost) {
       bestCost = cost;
@@ -93,22 +95,51 @@ function bestInsertIndex(points, p) {
   return best;
 }
 
-/** Pins for POST /api/route: [lat, lon] in routing order. Reversed routes are routed A->B and
- * then driven backwards by the server, so the displayed order is flipped back first. */
-function apiPins(lngLats, reversed) {
+/** The label of the i-th point in click order: A, B, ..., Z, AA, AB, ... */
+function pinLetter(i) {
+  let out = "";
+  for (let k = i + 1; k > 0; k = Math.floor((k - 1) / 26)) out = String.fromCharCode(65 + ((k - 1) % 26)) + out;
+  return out;
+}
+
+/** What a point is: "start" (A), "finish" (the last point of an A->B route) or "via". On a
+ * loop A is both the start and the finish, and the last point is just another point. */
+function pinRole(i, n, loop) {
+  if (i === 0) return "start";
+  if (i === n - 1 && !loop) return "finish";
+  return "via";
+}
+
+/** Pins for POST /api/route: [lat, lon] in routing order. The displayed order is always the
+ * driving order. A reversed route is routed in the other order and then driven backwards by
+ * the server (same roads), so the displayed order is flipped back first; on a loop A stays
+ * the start, so only the points after it are flipped. */
+function apiPins(lngLats, reversed, loop) {
   const pins = lngLats.map((p) => [p[1], p[0]]);
-  return reversed ? pins.reverse() : pins;
+  if (!reversed) return pins;
+  if (loop) return pins.slice(0, 1).concat(pins.slice(1).reverse());
+  return pins.reverse();
+}
+
+/** The points after reversing the driving direction (on a loop A stays first). */
+function reversedPins(items, loop) {
+  return loop ? items.slice(0, 1).concat(items.slice(1).reverse()) : items.slice().reverse();
 }
 
 /** A friendly default track name from the road names along the route. */
-function defaultTrackName(names) {
+function defaultTrackName(names, loop) {
   const clean = (names || []).map((n) => String(n == null ? "" : n).trim()).filter(Boolean);
   if (!clean.length) return "";
   let name;
-  if (clean.length === 1) name = clean[0];
-  else if (clean.length === 2) name = `${clean[0]} & ${clean[1]}`;
-  else name = `${clean[0]} to ${clean[clean.length - 1]}`;
-  if (name.length > 48) name = clean[0];
+  if (loop) {
+    name = clean.length === 1 ? `${clean[0]} Loop` : `${clean[0]} & ${clean[1]} Loop`;
+    if (name.length > 48) name = `${clean[0]} Loop`;
+  } else {
+    if (clean.length === 1) name = clean[0];
+    else if (clean.length === 2) name = `${clean[0]} & ${clean[1]}`;
+    else name = `${clean[0]} to ${clean[clean.length - 1]}`;
+    if (name.length > 48) name = clean[0];
+  }
   return name.slice(0, 60);
 }
 
@@ -414,8 +445,9 @@ const state = {
   map: null,
   mapReady: false,
   styleKey: "light",
-  pins: [], // [{lngLat: [lon, lat], marker, el}] in driving order: A first, B last
+  pins: [], // [{lngLat: [lon, lat], marker, el}] in driving order: A, B, C, ... (click order)
   reversed: false, // drive the routed road backwards (sent as `reverse` to /api/route)
+  loop: false, // "Back to start": the route comes back to A (sent as `loop` to /api/route)
   history: [],
   dragSnapshot: null,
   lastDragEnd: 0,
@@ -760,7 +792,7 @@ function createPin(lngLat) {
 }
 
 function snapshot() {
-  return { pins: state.pins.map((p) => p.lngLat.slice()), reversed: state.reversed };
+  return { pins: state.pins.map((p) => p.lngLat.slice()), reversed: state.reversed, loop: state.loop };
 }
 
 function pushHistory(snap) {
@@ -773,22 +805,16 @@ function setPins(lngLats) {
   state.pins = lngLats.map((ll) => createPin(ll));
 }
 
-function pinRole(i, n) {
-  if (i === 0) return "start";
-  if (i === n - 1) return "finish";
-  return "via";
+function pinTitle(role, loop) {
+  if (role === "start") return loop ? "Start and finish" : "Start";
+  if (role === "finish") return "Finish";
+  return "Then through here";
 }
 
-function pinTitle(role, i) {
-  if (role === "start") return "Start (A)";
-  if (role === "finish") return "Finish (B)";
-  return `Waypoint ${i}`;
-}
-
-function addPin(lngLat, asWaypoint) {
+function addPin(lngLat, between) {
   pushHistory();
   const points = state.pins.map((p) => p.lngLat);
-  const index = asWaypoint && points.length >= 2 ? bestInsertIndex(points, lngLat) : points.length;
+  const index = between && points.length >= 2 ? bestInsertIndex(points, lngLat, state.loop) : points.length;
   state.pins.splice(index, 0, createPin(lngLat));
   afterPinsChanged();
 }
@@ -798,7 +824,6 @@ function removePin(index) {
   pushHistory();
   const [pin] = state.pins.splice(index, 1);
   if (pin.marker) pin.marker.remove();
-  if (state.pins.length < 2) state.reversed = false;
   afterPinsChanged();
 }
 
@@ -807,14 +832,23 @@ function undo() {
   if (!snap) return;
   setPins(snap.pins);
   state.reversed = !!snap.reversed;
+  state.loop = !!snap.loop;
   afterPinsChanged();
 }
 
 function reverseRoute() {
   if (state.pins.length < 2) return;
   pushHistory();
-  state.pins.reverse();
+  state.pins = reversedPins(state.pins, state.loop);
   state.reversed = !state.reversed;
+  afterPinsChanged();
+}
+
+/** "Back to start": close the route back to A (a loop), or open it again (A to B). */
+function toggleLoop() {
+  if (state.pins.length < 2) return;
+  pushHistory();
+  state.loop = !state.loop;
   afterPinsChanged();
 }
 
@@ -822,21 +856,24 @@ function clearPins() {
   if (!state.pins.length) return;
   pushHistory();
   setPins([]);
-  state.reversed = false;
   setWaypointMode(false);
   afterPinsChanged();
 }
 
 function afterPinsChanged() {
-  if (state.pins.length < 2) setWaypointMode(false);
+  if (state.pins.length < 2) {
+    setWaypointMode(false);
+    state.reversed = false;
+    state.loop = false;
+  }
   renderPins();
   store.set(STORE_KEYS.pins, snapshot());
   scheduleRoute();
 }
 
+/** Insert mode (W key): plain clicks add points in between, like Shift+click. */
 function setWaypointMode(on) {
   state.waypointMode = !!on && state.pins.length >= 2;
-  $("btn-waypoint").setAttribute("aria-pressed", String(state.waypointMode));
   $("map-mode").hidden = !state.waypointMode;
 }
 
@@ -851,21 +888,22 @@ function onMapClick(e) {
 
 function renderPins() {
   const n = state.pins.length;
+  const loop = state.loop && n >= 2;
   const list = $("pin-list");
   list.replaceChildren();
   state.pins.forEach((pin, i) => {
-    const role = pinRole(i, n);
-    const label = role === "start" ? "A" : role === "finish" ? "B" : String(i);
-    const title = pinTitle(role, i);
-    pin.el.className = `dm-pin dm-pin--${role}`;
+    const role = pinRole(i, n, loop);
+    const label = pinLetter(i);
+    const title = pinTitle(role, loop);
+    pin.el.className = `dm-pin dm-pin--${role}${loop && role === "start" ? " dm-pin--loop" : ""}`;
     pin.el.querySelector(".dm-pin-label").textContent = label;
-    pin.el.title = `${title}. Drag to move, right-click to remove.`;
+    pin.el.title = `${label}: ${title}. Drag to move, right-click to remove.`;
     const coords = `${pin.lngLat[1].toFixed(5)}, ${pin.lngLat[0].toFixed(5)}`;
     list.append(
       h(
         "li",
         { class: "pin-item" },
-        h("span", { class: `pin-badge ${role}`, "aria-hidden": "true" }, label),
+        h("span", { class: `pin-badge ${role}${loop && role === "start" ? " loop" : ""}`, "aria-hidden": "true" }, label),
         h("span", { class: "pin-text" }, h("strong", {}, title), h("span", {}, coords)),
         h(
           "span",
@@ -873,33 +911,48 @@ function renderPins() {
           iconButton("locate", {
             class: "icon-btn",
             title: "Show on map",
-            "aria-label": `Show ${title} on the map`,
+            "aria-label": `Show point ${label} on the map`,
             onclick: () =>
               state.map && state.map.flyTo({ center: pin.lngLat, zoom: Math.max(state.map.getZoom(), 15) }),
           }),
           iconButton("close", {
             class: "icon-btn danger",
             title: "Remove",
-            "aria-label": `Remove ${title}`,
+            "aria-label": `Remove point ${label}`,
             onclick: () => removePin(state.pins.indexOf(pin)),
           }),
         ),
       ),
     );
   });
+  if (loop) {
+    list.append(
+      h(
+        "li",
+        { class: "pin-item pin-back" },
+        h("span", { class: "pin-badge start loop", "aria-hidden": "true" }, "A"),
+        h("span", { class: "pin-text" }, h("strong", {}, "Back to the start"), h("span", {}, "A loop: lap it as many times as you like")),
+      ),
+    );
+  }
 
   let hint;
-  if (n === 0) hint = "Click the map to drop the start (A), then click again for the finish (B).";
-  else if (n === 1) hint = "Now click where the road should end to drop the finish (B).";
+  if (n === 0) hint = "Click the map where your road starts (A). Each click adds the next point: B, C, D…";
+  else if (n === 1) hint = "Now click further along the road for point B.";
+  else if (loop)
+    hint = `Click to add point ${pinLetter(n)}; the road comes back to A after it. Shift+click adds a point in between. Drag points to move them, right-click to remove one.`;
   else
-    hint =
-      "Drag pins to adjust. Shift+click (or + Waypoint) adds a waypoint in between; a plain click moves the finish further. Right-click a pin to remove it.";
+    hint = `Click to add point ${pinLetter(n)}; the last point is the finish. Shift+click adds a point in between. Drag points to move them, right-click to remove one.`;
   $("route-hint").textContent = hint;
 
+  const loopBtn = $("btn-loop");
+  loopBtn.disabled = n < 2;
+  loopBtn.setAttribute("aria-pressed", String(loop));
+  $("loop-state").textContent = loop ? "On" : "Off";
+  loopBtn.title = n < 2 ? "Add at least two points first" : loop ? "Make it A to B again" : "Come back to A along the roads: a loop you can lap";
   $("btn-undo").disabled = state.history.length === 0;
   $("btn-reverse").disabled = n < 2;
   $("btn-clear").disabled = n === 0;
-  $("btn-waypoint").disabled = n < 2;
 }
 
 /* ------------------------------------------------------------------------------------------
@@ -936,7 +989,12 @@ async function requestRoute() {
   const ctrl = new AbortController();
   state.routeAbort = ctrl;
   setBusy(true);
-  const body = { pins: apiPins(state.pins.map((p) => p.lngLat), state.reversed), reverse: state.reversed };
+  const loop = state.loop && state.pins.length >= 2;
+  const body = {
+    pins: apiPins(state.pins.map((p) => p.lngLat), state.reversed, loop),
+    reverse: state.reversed,
+    loop,
+  };
   try {
     const route = await api(API.route, { method: "POST", body, signal: ctrl.signal });
     if (seq !== state.routeSeq) return;
@@ -981,6 +1039,7 @@ function renderRouteInfo() {
   const r = state.route;
   $("route-info").hidden = !r;
   if (!r) return;
+  $("route-length-label").textContent = r.loop ? "Lap length" : "Length";
   $("route-length").textContent = formatLength(Number(r.length_m));
   const names = Array.isArray(r.names) ? r.names.filter(Boolean) : [];
   const shown = names.slice(0, 10);
@@ -994,7 +1053,7 @@ function renderRouteInfo() {
 
 function applyDefaultName() {
   const input = $("track-name");
-  const name = state.route ? defaultTrackName(state.route.names) : "";
+  const name = state.route ? defaultTrackName(state.route.names, !!state.route.loop) : "";
   input.placeholder = name || "Snake Road";
   if (!state.nameTouched) input.value = name;
 }
@@ -1040,7 +1099,7 @@ function resetProfile(message) {
   $("profile-stats").textContent = "";
   $("profile-source").textContent = "";
   $("profile-tip").hidden = true;
-  showProfileMessage(message || "Drop two pins to see the elevation profile.");
+  showProfileMessage(message || "Click two points to see the elevation profile.");
   setSourceData("dm-hover", EMPTY_FC);
   drawProfile();
 }
@@ -1481,22 +1540,23 @@ function updateBuildPanel() {
   const ready = !!state.route && !state.routeStale;
   const busy = state.jobId != null;
   btn.disabled = !ready || busy;
-  btn.textContent = busy ? "Building…" : "Build track";
+  btn.textContent = busy ? "Creating map…" : "Create map";
   let hint;
-  if (busy) hint = "You can keep exploring. The build carries on while the app is open.";
-  else if (state.pins.length < 2) hint = "Drop a start and a finish on the map first.";
+  if (busy) hint = "You can keep exploring. The map is made while the app is open.";
+  else if (state.pins.length < 2) hint = "Click at least two points on the map first.";
   else if (state.routeStale) hint = "Waiting for the route…";
   else if (!state.route) hint = "Fix the route above first.";
   else if ($("opt-install").checked && state.status && !state.status.ac_found)
     hint = "Assetto Corsa wasn't found, so the track is saved in the app's folder instead.";
-  else hint = "Takes a few minutes. The first build in a new area downloads map data.";
+  else if (state.route.loop) hint = "A loop: you can race it lap after lap. Takes a few minutes.";
+  else hint = "Takes a few minutes. The first map in a new area downloads map data.";
   $("build-hint").textContent = hint;
 }
 
 async function startBuild() {
   const r = state.route;
   if (!r || state.routeStale || state.jobId != null) return;
-  const name = $("track-name").value.trim() || defaultTrackName(r.names) || "My Road";
+  const name = $("track-name").value.trim() || defaultTrackName(r.names, !!r.loop) || "My Road";
   const trackId = sanitizeTrackId($("track-id").value) || null;
   state.jobLogCount = -1;
   renderJob({ state: "queued", step: "Sending to the builder…", progress: 0, log: [] });
@@ -1509,6 +1569,7 @@ async function startBuild() {
         name,
         track_id: trackId,
         install: $("opt-install").checked,
+        loop: !!r.loop,
         options: buildOptions(),
       },
     });
@@ -1555,7 +1616,7 @@ async function pollJob() {
         step: "Build lost",
         progress: 0,
         log: [],
-        error: "The app was restarted, so this build stopped. Press Build track to start it again.",
+        error: "The app was restarted, so this map wasn't finished. Press Create map to start it again.",
       });
       return;
     }
@@ -1642,7 +1703,7 @@ function renderJobResult(job) {
       h(
         "dl",
         { class: "job-stats" },
-        stat("Length", formatLength(Number(r.length_m))),
+        stat(r.loop ? "Lap" : "Length", formatLength(Number(r.length_m))),
         stat("Size", Number.isFinite(Number(r.kn5_mb)) ? `${Number(r.kn5_mb).toFixed(1)} MB` : "–"),
         stat("Trees", formatInt(Number(r.trees))),
         stat("Buildings", formatInt(Number(r.buildings))),
@@ -1696,7 +1757,7 @@ function renderTracks(tracks) {
   list.replaceChildren(
     ...sorted.map((t) => {
       const name = t.name || t.track_id;
-      const meta = [formatLength(Number(t.length_m)), formatDate(t.built_at)].filter((x) => x && x !== "–");
+      const meta = [formatLength(Number(t.length_m)), t.loop ? "Loop" : "", formatDate(t.built_at)].filter((x) => x && x !== "–");
       return h(
         "li",
         { class: "track-item" },
@@ -1772,7 +1833,7 @@ function onKeyDown(e) {
 
 function bindUi() {
   $("style-toggle").addEventListener("click", toggleMapStyle);
-  $("btn-waypoint").addEventListener("click", () => setWaypointMode(!state.waypointMode));
+  $("btn-loop").addEventListener("click", toggleLoop);
   $("btn-undo").addEventListener("click", undo);
   $("btn-reverse").addEventListener("click", reverseRoute);
   $("btn-clear").addEventListener("click", clearPins);
@@ -1813,6 +1874,7 @@ function restorePins() {
   if (!snap || !Array.isArray(snap.pins) || !snap.pins.every(isLngLat)) return;
   setPins(snap.pins.slice(0, 50));
   state.reversed = !!snap.reversed && state.pins.length >= 2;
+  state.loop = !!snap.loop && state.pins.length >= 2;
 }
 
 function initialStyleKey() {

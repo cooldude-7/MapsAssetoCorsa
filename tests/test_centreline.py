@@ -295,3 +295,67 @@ def test_frames_rejects_repeated_points() -> None:
 def _unit(v: list[float]) -> np.ndarray:
     a = np.asarray(v, dtype=float)
     return a / np.linalg.norm(a)
+
+
+# --------------------------------------------------------------------------------------------
+# Loops
+# --------------------------------------------------------------------------------------------
+
+
+def _square_loop(start_corner: bool) -> tuple[np.ndarray, np.ndarray]:
+    """A 200 m square round the origin, anticlockwise, starting on its south-west corner or in
+    the middle of its south side; returns (xy, param) with the start repeated at the end."""
+    corners = np.array([[-100.0, -100.0], [100.0, -100.0], [100.0, 100.0], [-100.0, 100.0]])
+    if not start_corner:
+        corners = np.vstack([[0.0, -100.0], corners[1:], corners[:1]])
+    xy = np.vstack([corners, corners[:1]])
+    return xy, np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(xy, axis=0), axis=1))])
+
+
+@pytest.mark.parametrize("start_corner", [False, True])
+def test_closed_centreline_has_no_seam(start_corner):
+    from driftmaps.geometry.road import closed_centreline
+
+    xy, param = _square_loop(start_corner)
+    out, p = closed_centreline(xy, param, max_deviation_m=1.5, cutoff_m=40.0)
+    np.testing.assert_array_equal(out[0], out[-1])
+    assert p[0] == 0.0 and p[-1] == pytest.approx(800.0) and np.all(np.diff(p) >= 0)
+    step = np.linalg.norm(np.diff(out, axis=0), axis=1)
+    assert step.max() - step.min() < 0.01  # even stations right round, also over the join
+    # The start is where the loop started (on a corner: the filleted corner's middle).
+    start = xy[0]
+    assert np.linalg.norm(out[0] - start) < (12.0 if start_corner else 0.5)
+    # Heading turns smoothly everywhere, including across the join.
+    tan = np.diff(np.vstack([out, out[1:2]]), axis=0)
+    heading = np.unwrap(np.arctan2(tan[:, 1], tan[:, 0]))
+    turn = np.abs(np.diff(heading))
+    assert turn.max() < 0.2  # ~10 m corner radius, 1 m stations
+    join = np.r_[turn[:5], turn[-5:]].max()
+    assert join <= turn.max() + 1e-9 and (start_corner or join < 1e-3)
+    assert heading[-1] - heading[0] == pytest.approx(2 * np.pi, abs=0.1)  # one full turn
+    # Every corner is rounded the same: the join corner is no different.
+    from scipy.spatial import cKDTree
+
+    d, _ = cKDTree(out).query(np.array([[-100, -100], [100, -100], [100, 100], [-100, 100.0]]))
+    assert d.max() - d.min() < 0.3
+
+
+def test_closed_road_model_wraps():
+    from driftmaps.geometry.road import RoadModel, closed_centreline, road_columns
+
+    xy, param = _square_loop(True)
+    out, _ = closed_centreline(xy, param)
+    s = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(out, axis=0), axis=1))])
+    centre = np.stack([out[:, 0], np.zeros(len(out)), out[:, 1]], axis=1)
+    m = RoadModel(s, centre, 3.0, 1.0, True, False, closed=True)
+    np.testing.assert_array_equal(m.forward[0], m.forward[-1])
+    assert m.curvature[0] == pytest.approx(m.curvature[-1])
+    for off in (4.0, -4.0, 9.0):
+        col = road_columns(m, off)
+        np.testing.assert_array_equal(col[0], col[-1])
+    lap = m.length
+    for a, b in ((m.at(10.0), m.at(10.0 + lap)), (m.at(-5.0), m.at(lap - 5.0))):
+        for u, v in zip(a, b, strict=True):
+            np.testing.assert_allclose(u, v, atol=1e-9)
+    with pytest.raises(ValueError, match="first station"):
+        RoadModel(s[:-5], centre[:-5], 3.0, 1.0, True, False, closed=True)

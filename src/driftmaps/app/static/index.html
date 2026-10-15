@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Assetto Corsa Map Generator</title>
-  <meta name="description" content="Click two points on a map and turn the real road into an Assetto Corsa track.">
+  <meta name="description" content="Click points on a map and turn the real roads into an Assetto Corsa track: A to B, or a loop back to the start.">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
   <link rel="stylesheet" href="style.css">
@@ -45,23 +45,27 @@
       <section class="card" aria-labelledby="route-title">
         <div class="card-head">
           <h2 id="route-title"><span class="step">1</span> Pick your road</h2>
+          <div class="head-tools">
+            <button id="btn-undo" class="btn ghost small" type="button" title="Undo (Ctrl+Z)">Undo</button>
+            <button id="btn-clear" class="btn ghost small" type="button" title="Remove all points">Clear</button>
+          </div>
         </div>
-        <p id="route-hint" class="hint">Click the map to drop the start (A), then click again for
-          the finish (B).</p>
-        <ol id="pin-list" class="pin-list"></ol>
-        <div class="toolbar" role="toolbar" aria-label="Route tools">
-          <button id="btn-waypoint" class="btn small" type="button" aria-pressed="false"
-                  title="Add a waypoint between pins (W). Shift+click also works.">+ Waypoint</button>
-          <button id="btn-undo" class="btn small" type="button" title="Undo (Ctrl+Z)">Undo</button>
-          <button id="btn-reverse" class="btn small" type="button"
-                  title="Drive the same road the other way">Reverse</button>
-          <button id="btn-clear" class="btn small" type="button" title="Remove all pins">Clear</button>
-        </div>
+        <p id="route-hint" class="hint">Click the map where your road starts (A). Each click adds
+          the next point: B, C, D…</p>
+        <ol id="pin-list" class="pin-list" aria-label="Your points, in driving order"></ol>
+        <button id="btn-loop" class="btn loop-toggle" type="button" aria-pressed="false" disabled
+                title="Come back to A along the roads: a loop you can lap">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor"
+               stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v5h-5"/></svg>
+          <span>Back to start</span>
+          <span id="loop-state" class="loop-state">Off</span>
+        </button>
         <p id="route-status" class="status-line" role="status" aria-live="polite"></p>
         <div id="route-info" class="route-info" hidden>
           <div class="stat-row">
             <div class="stat">
-              <span class="stat-label">Length</span>
+              <span id="route-length-label" class="stat-label">Length</span>
               <span id="route-length" class="stat-value">–</span>
             </div>
             <button id="btn-fit" class="btn ghost small" type="button">Zoom to route</button>
@@ -73,30 +77,12 @@
 
       <section class="card" aria-labelledby="build-title">
         <div class="card-head">
-          <h2 id="build-title"><span class="step">2</span> Build it</h2>
+          <h2 id="build-title"><span class="step">2</span> Create your map</h2>
         </div>
         <label class="field-label" for="track-name">Track name</label>
         <input id="track-name" type="text" maxlength="60" placeholder="Snake Road" autocomplete="off">
-        <div class="toggles">
-          <label class="switch"><input id="opt-trees" type="checkbox" checked><span>Trees</span></label>
-          <label class="switch"><input id="opt-buildings" type="checkbox" checked><span>Buildings</span></label>
-          <label class="switch"><input id="opt-guardrails" type="checkbox" checked><span>Guardrails</span></label>
-        </div>
-        <div class="range-field">
-          <label class="field-label" for="opt-density">Scenery density
-            <output id="density-out" for="opt-density">Normal</output></label>
-          <input id="opt-density" type="range" min="0" max="2" step="0.1" value="1">
-        </div>
-        <details class="advanced">
-          <summary>More options</summary>
-          <label class="field-label" for="track-id">Folder name <span class="muted">(optional)</span></label>
-          <input id="track-id" type="text" maxlength="60" placeholder="picked for you" spellcheck="false"
-                 autocomplete="off">
-          <label class="switch"><input id="opt-install" type="checkbox" checked>
-            <span>Install into Assetto Corsa when done</span></label>
-        </details>
-        <button id="btn-build" class="btn primary block" type="button" disabled>Build track</button>
-        <p id="build-hint" class="hint">Drop a start and a finish on the map first.</p>
+        <button id="btn-build" class="btn primary block" type="button" disabled>Create map</button>
+        <p id="build-hint" class="hint">Click your points on the map first.</p>
 
         <div id="job" class="job" hidden>
           <div class="job-head">
@@ -113,6 +99,27 @@
             <pre id="job-log" class="job-log"></pre>
           </details>
         </div>
+
+        <details id="more-options" class="advanced">
+          <summary>More options</summary>
+          <div class="toggles">
+            <label class="switch"><input id="opt-trees" type="checkbox" checked><span>Trees</span></label>
+            <label class="switch"><input id="opt-buildings" type="checkbox" checked><span>Buildings</span></label>
+            <label class="switch"><input id="opt-guardrails" type="checkbox" checked><span>Guardrails</span></label>
+          </div>
+          <div class="range-field">
+            <label class="field-label" for="opt-density">Scenery density
+              <output id="density-out" for="opt-density">Normal</output></label>
+            <input id="opt-density" type="range" min="0" max="2" step="0.1" value="1">
+          </div>
+          <button id="btn-reverse" class="btn small reverse-btn" type="button"
+                  title="Drive the same road the other way">Drive it the other way</button>
+          <label class="field-label" for="track-id">Folder name <span class="muted">(optional)</span></label>
+          <input id="track-id" type="text" maxlength="60" placeholder="picked for you" spellcheck="false"
+                 autocomplete="off">
+          <label class="switch"><input id="opt-install" type="checkbox" checked>
+            <span>Install into Assetto Corsa when done</span></label>
+        </details>
       </section>
 
       <section class="card" aria-labelledby="tracks-title">
@@ -128,14 +135,14 @@
 
     <section class="main">
       <div class="map-wrap">
-        <div id="map" class="map" role="region" aria-label="Map. Click to drop pins."></div>
+        <div id="map" class="map" role="region" aria-label="Map. Click to add points."></div>
         <div class="search">
           <input id="search" type="search" role="combobox" aria-autocomplete="list" aria-expanded="false"
                  aria-controls="search-results" autocomplete="off" spellcheck="false"
                  placeholder="Search a road or town  ( / )" aria-label="Search for a place">
           <ul id="search-results" class="search-results" role="listbox" hidden></ul>
         </div>
-        <div id="map-mode" class="map-banner" hidden>Click the map to add a waypoint. Press Esc to stop.</div>
+        <div id="map-mode" class="map-banner" hidden>Click the map to add a point in between. Press Esc to stop.</div>
         <div id="map-busy" class="map-busy" hidden><span class="spinner" aria-hidden="true"></span>Finding the road…</div>
         <div id="map-error" class="map-error" role="alert" hidden></div>
       </div>
@@ -148,7 +155,7 @@
         <div id="profile-body" class="profile-body">
           <canvas id="profile-canvas" aria-label="Elevation profile of the route"></canvas>
           <div id="profile-tip" class="profile-tip" hidden></div>
-          <p id="profile-empty" class="profile-empty">Drop two pins to see the elevation profile.</p>
+          <p id="profile-empty" class="profile-empty">Click two points to see the elevation profile.</p>
         </div>
       </section>
     </section>

@@ -4,9 +4,9 @@ Design (PLAN §5.2 "Terrain", §5.3; docs/research/geo.md §2.5, §3.4, §3.5):
 
 - **Points.** Regular grids in rings by distance from the road footprint (default 2 m cells to
   25 m, 5 m to 150 m, 12 m to 500 m, 30 m to 1.5 km), plus the road's outer shoulder edges
-  (exactly the shoulder mesh's edge vertices) and the two end caps. Grid points within
-  `edge_clearance_m` of the footprint are dropped, so the first terrain triangles join the
-  shoulder edge exactly: no crack and no step.
+  (exactly the shoulder mesh's edge vertices) and the two end caps (none on a closed loop).
+  Grid points within `edge_clearance_m` of the footprint are dropped, so the first terrain
+  triangles join the shoulder edge exactly: no crack and no step.
 - **One Delaunay triangulation** of all points (scipy/Qhull), so rings of different density
   are stitched without T-junction cracks. Triangles whose centroid or any edge midpoint lies
   inside the road footprint are removed (the road hole), as are triangles with edges longer
@@ -201,7 +201,7 @@ def terrain_points(
     for edge in (left_outer, right_outer):
         e = edge[ground]
         edges.append(e)
-    for i in (0, len(model) - 1):
+    for i in () if model.closed else (0, len(model) - 1):  # a loop has no ends
         a, b = left_outer[i], right_outer[i]
         n = max(2, math.ceil(np.linalg.norm(b - a) / 1.0))
         t = np.linspace(0.0, 1.0, n + 1)[1:-1, None]

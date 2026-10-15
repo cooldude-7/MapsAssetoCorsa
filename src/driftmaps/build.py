@@ -46,6 +46,16 @@ Pipeline (PLAN §5.1-§5.5, docs/research/geo.md §1-§3, ac_format.md §2, §3,
    `route.json`, and `guardrails.json` if one was used: its bytes are read before the old
    track folder is cleared, so a file kept inside the track folder survives a rebuild).
 
+**Loops** (a closed `Route`, PLAN §5.5 circuits): the centreline is smoothed as a closed
+curve (`geometry.road.closed_centreline`, no seam at the join), the height profile is fitted
+with the lap before and after it so it meets itself, and the `RoadModel` is `closed`: road,
+shoulders, paint, terrain and walls run on across the join (no run-up, no run-off, no end
+walls; the corridor is a ring with walls outside and inside). Timing is a lap: AC_TIME_0 on
+the start/finish line at A and AC_TIME_1/2 at a third and two thirds of the lap; the grid and
+the pits are behind the line in pairs like on an A->B track, the hotlap start
+`HOTLAP_BEFORE_M` before it, and the AI line is closed. ui_track.json gets the "circuit" tag
+(multi-lap races in Content Manager) and `run` = "clockwise" or "anticlockwise".
+
 `build_track(route, out_dir, options)` writes `<out_dir>/<track_id>/` (replacing an existing
 folder only if drift-maps made it, or with `options.force`) and returns a
 `BuildResult` with the statistics the CLI prints. Same route + same DEM cache -> identical
@@ -169,6 +179,7 @@ from driftmaps.geometry.road import (
     RoadMeshes,
     RoadModel,
     build_road_meshes,
+    closed_centreline,
     extend_straight,
     fillet_corners,
     road_columns,
@@ -202,6 +213,7 @@ __all__ = [
     "BuildResult",
     "TrackGeometry",
     "build_track",
+    "loop_direction",
     "prepare_geometry",
     "render_debug_png",
 ]
@@ -217,6 +229,12 @@ GRID_ROW_M = 7.0
 GRID_GAP_M = 8.0
 GRID_TAIL_M = 8.0
 MAX_SPLITS = 1  # A->B tracks: one AC_TIME split is verified; more are not
+# Loops (circuits): the hotlap start this far before the start/finish line (ASSUMED: enough to
+# be at speed over the line on a city block, short enough to stay on the lap's last straight),
+# and how much of a lap the height profile sees before and after the join.
+HOTLAP_BEFORE_M = 120.0
+LOOP_PROFILE_PAD_M = 600.0
+MIN_LOOP_M = 200.0
 # Datum offset between DEM sources (geo.md §2): measured on gentle near-ring terrain beside the
 # road. ASSUMED values; real datum differences (CGVD28/2013, EGM2008) are well under 2 m.
 OFFSET_RING_M = (30.0, 60.0, 100.0, 140.0)
@@ -342,10 +360,16 @@ class BuildResult:
 
     def summary(self) -> str:
         s = self.stats
+        if s.get("closed"):
+            length = f"length   {s['length_m'] / 1000:.2f} km lap, {s.get('run', '')}"
+        else:
+            length = (
+                f"length   {s['length_m'] / 1000:.2f} km A->B ({s['road_length_m'] / 1000:.2f} "
+                "km of road incl. run-up/run-off)"
+            )
         lines = [
             f"track    {self.track_dir}",
-            f"length   {s['length_m'] / 1000:.2f} km A->B ({s['road_length_m'] / 1000:.2f} km "
-            "of road incl. run-up/run-off)",
+            length,
             f"climb    {s['elevation_min_m']:.1f} .. {s['elevation_max_m']:.1f} m, max grade "
             f"{100 * s['max_grade']:.1f}%",
             f"DEM      {s['elevation_source']} (road coverage {s['elevation_coverage']})",
@@ -542,13 +566,24 @@ class TrackGeometry:
     def length_m(self) -> float:
         return self.s_b - self.s_a
 
+    @property
+    def closed(self) -> bool:
+        """A loop (circuit): s_a = 0 is the start/finish line and s_b the lap length."""
+        return self.model.closed
 
-def _box_smooth(values: np.ndarray, window: int) -> np.ndarray:
+
+def _box_smooth(values: np.ndarray, window: int, closed: bool = False) -> np.ndarray:
+    """Moving average over `window` stations; `closed`: round a loop (last value = first)."""
     if window <= 1 or len(values) < 3:
         return values.astype(float)
     pad = window // 2
-    padded = np.pad(values.astype(float), pad, mode="edge")
     kernel = np.ones(2 * pad + 1) / (2 * pad + 1)
+    if closed:
+        ring = values[:-1].astype(float)
+        idx = np.arange(-pad, len(ring) + pad) % len(ring)
+        out = np.convolve(ring[idx], kernel, mode="valid")
+        return np.append(out, out[:1])
+    padded = np.pad(values.astype(float), pad, mode="edge")
     return np.convolve(padded, kernel, mode="valid")
 
 
@@ -572,20 +607,36 @@ def prepare_geometry(route: Route, options: BuildOptions) -> TrackGeometry:
     en = proj.to_xy(nodes.lonlat)
     xz = np.stack([en[:, 0], -en[:, 1]], axis=1)
     raw_length = float(nodes.s[-1])
+    closed = route.closed
 
-    xz_f, p_f = fillet_corners(*simplify(xz, nodes.s, 0.3))
-    run_up = max(options.run_up_m, grid_length_m(options.pits) + GRID_TAIL_M)
-    xz_e, p_e = extend_straight(xz_f, p_f, run_up, options.run_off_m)
-    xz_s, param = smooth_centreline(
-        xz_e,
-        p_e,
-        max_deviation_m=options.max_deviation_m,
-        cutoff_m=options.smoothing_cutoff_m,
-    )
+    if closed:  # a loop: no run-up or run-off, smoothed round the join
+        xz_s, param = closed_centreline(
+            xz,
+            nodes.s,
+            max_deviation_m=options.max_deviation_m,
+            cutoff_m=options.smoothing_cutoff_m,
+        )
+    else:
+        xz_f, p_f = fillet_corners(*simplify(xz, nodes.s, 0.3))
+        run_up = max(options.run_up_m, grid_length_m(options.pits) + GRID_TAIL_M)
+        xz_e, p_e = extend_straight(xz_f, p_f, run_up, options.run_off_m)
+        xz_s, param = smooth_centreline(
+            xz_e,
+            p_e,
+            max_deviation_m=options.max_deviation_m,
+            cutoff_m=options.smoothing_cutoff_m,
+        )
     param = np.maximum.accumulate(param)
     s = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(xz_s, axis=0), axis=1))])
-    s_a = float(np.interp(0.0, param, s))
-    s_b = float(np.interp(raw_length, param, s))
+    if closed:
+        s_a, s_b = 0.0, float(s[-1])
+        if s_b < MIN_LOOP_M:
+            raise ValueError(
+                f"the loop is only {s_b:.0f} m long; make it at least {MIN_LOOP_M:.0f} m"
+            )
+    else:
+        s_a = float(np.interp(0.0, param, s))
+        s_b = float(np.interp(raw_length, param, s))
 
     # Attributes per station: the OSM polyline point at that distance (clamped at the ends).
     j = np.clip(
@@ -594,15 +645,24 @@ def prepare_geometry(route: Route, options: BuildOptions) -> TrackGeometry:
         len(attrs) - 1,
     )
     width = np.clip(attrs.width_m[j], MIN_DRIVE_WIDTH_M, MAX_WIDTH_M)
-    width = _box_smooth(width, int(WIDTH_RAMP_M))
+    width = _box_smooth(width, int(WIDTH_RAMP_M), closed)
     lanes = attrs.lanes[j]
     oneway = attrs.oneway[j]
-    bridge = attrs.bridge[j] & (param > 0) & (param < raw_length)
-    tunnel = attrs.tunnel[j] & (param > 0) & (param < raw_length)
+    on_route = np.ones(len(s), bool) if closed else (param > 0) & (param < raw_length)
+    bridge = attrs.bridge[j] & on_route
+    tunnel = attrs.tunnel[j] & on_route
+    if closed:
+        for a in (lanes, oneway, bridge, tunnel):
+            a[-1] = a[0]
     region = region_for(pin_a.snap_lat, pin_a.snap_lon)
 
     # Elevation: five samples across the asphalt at every station.
-    tangent = np.gradient(xz_s, axis=0)
+    if closed:
+        ring = xz_s[:-1]
+        tangent = np.roll(ring, -1, axis=0) - np.roll(ring, 1, axis=0)
+        tangent = np.vstack([tangent, tangent[:1]])
+    else:
+        tangent = np.gradient(xz_s, axis=0)
     tangent /= np.linalg.norm(tangent, axis=1)[:, None]
     left = np.stack([tangent[:, 1], -tangent[:, 0]], axis=1)  # left = up x forward, in XZ
     fr = np.array([-0.5, -0.25, 0.0, 0.25, 0.5])
@@ -611,14 +671,16 @@ def prepare_geometry(route: Route, options: BuildOptions) -> TrackGeometry:
     elev = _Elevation(options, pin_a.snap_lon, pin_a.snap_lat)
     z_samples = elev.road(np.asarray(lon_s), np.asarray(lat_s))
     weights = np.where(_pad_mask(bridge | tunnel, s, BRIDGE_WEIGHT_PAD_M), 0.0, 1.0)
-    z = road_profile(
-        s,
-        z_samples,
-        weights,
+    profile = functools.partial(
+        road_profile,
         source_resolution_m=elev.resolution_m(),
         max_grade=options.max_grade,
         max_vertical_curvature=options.max_vertical_curvature,
     )
+    if closed:
+        z = _closed_profile(s, z_samples, weights, profile)
+    else:
+        z = profile(s, z_samples, weights)
     z_ref = float(np.interp(s_a, s, z))
     raw_z = np.nanmedian(z_samples, axis=1) - z_ref
 
@@ -631,6 +693,7 @@ def prepare_geometry(route: Route, options: BuildOptions) -> TrackGeometry:
         centre_line=(lanes >= 2) & (oneway == 0),
         bridge=bridge,
         double_yellow=region == "na",
+        closed=closed,
     )
     osm = np.stack([xz[:, 0], np.zeros(len(xz)), xz[:, 1]], axis=1)
     return TrackGeometry(
@@ -649,6 +712,35 @@ def prepare_geometry(route: Route, options: BuildOptions) -> TrackGeometry:
         elevation=elev,
         osm_polyline=osm,
     )
+
+
+def _closed_profile(
+    s: np.ndarray,
+    z_samples: np.ndarray,
+    weights: np.ndarray,
+    profile: Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray],
+) -> np.ndarray:
+    """`road_profile` round a loop (the last station is the first): the stations are padded
+    with up to `LOOP_PROFILE_PAD_M` of the lap before and after, so the smoothing and the grade
+    limits see the road go on across the join, then the tiny mismatch left between the end and
+    the start is spread evenly over the lap, so the road meets itself exactly."""
+    lap = float(s[-1])
+    pad = min(LOOP_PROFILE_PAD_M, lap)
+    before = np.flatnonzero(s[:-1] >= lap - pad)
+    after = np.flatnonzero((s > 0.0) & (s <= pad))
+    idx = np.r_[before, np.arange(len(s)), after]
+    s_ext = np.r_[s[before] - lap, s, s[after] + lap]
+    z = profile(s_ext, z_samples[idx], weights[idx])[len(before) : len(before) + len(s)]
+    return z - (z[-1] - z[0]) * (s / lap)
+
+
+def loop_direction(centre: np.ndarray) -> str:
+    """Which way a closed centreline (N, 3) in AC coordinates (X = east, Z = south) goes
+    round, seen from above with north up: "clockwise" or "anticlockwise" (sign of its area)."""
+    x, north = centre[:, 0], -centre[:, 2]
+    area = 0.5 * float(np.sum(x[:-1] * north[1:] - x[1:] * north[:-1]))
+    area += 0.5 * float(x[-1] * north[0] - x[0] * north[-1])  # 0 when the last point is the first
+    return "anticlockwise" if area > 0.0 else "clockwise"
 
 
 def _terrain_height_fn(geo: TrackGeometry):
@@ -671,7 +763,7 @@ def lane_offset(geo: TrackGeometry) -> np.ndarray:
     m = geo.model
     sign = -1.0 if geo.driving_side == "right" else 1.0
     raw = np.where(m.centre_line, sign * m.half_width / 2.0, 0.0)
-    return _box_smooth(raw, int(WIDTH_RAMP_M))
+    return _box_smooth(raw, int(WIDTH_RAMP_M), m.closed)
 
 
 def _grid(pits: int) -> tuple[list[float], list[float], float]:
@@ -721,27 +813,42 @@ def _dummies(geo: TrackGeometry, options: BuildOptions) -> _Dummies:
 
     # Grid: a start slot per pit box (at least 2), side by side in rows every 7 m from 6 m
     # behind A (the first car of a row on the driving lane), the pits in pairs behind them and
-    # the hotlap start behind those (`grid_length_m`; prepare_geometry sized the run-up).
+    # the hotlap start behind those (`grid_length_m`; prepare_geometry sized the run-up). On a
+    # loop "behind A" is the end of the lap, and the hotlap start is HOTLAP_BEFORE_M back.
     starts, pit_rows, hot = _grid(options.pits)
-    hot_s = geo.s_a - hot
-    if hot_s < 3.0:
+    if geo.closed:
+        lap = geo.length_m
+        if hot + GRID_GAP_M > lap / 2:
+            raise ValueError(
+                f"the loop ({lap:.0f} m) is too short for {options.pits} pit boxes; make it "
+                "longer or use fewer pits"
+            )
+        hot = max(hot, min(HOTLAP_BEFORE_M, lap / 2))
+    hot_s = m.wrap(geo.s_a - hot)
+    if hot_s < 3.0 and not geo.closed:
         raise ValueError("run_up_m is too short for the spawn grid; increase it or use fewer pits")
     n_starts = 2 * len(starts)
     for prefix, count, rows in (("AC_START", n_starts, starts), ("AC_PIT", options.pits, pit_rows)):
         for n in range(count):
-            s = geo.s_a - rows[n // 2]
+            s = m.wrap(geo.s_a - rows[n // 2])
             d, o = lanes_at(s)
             spawn(f"{prefix}_{n}", s, d if n % 2 == 0 else o)
     spawn("AC_HOTLAP_START_0", hot_s, lanes_at(hot_s)[0])
 
-    splits = min(max(int(options.splits), 0), MAX_SPLITS)
-    if splits != options.splits:
-        warnings.warn(
-            f"{options.splits} splits asked; A->B tracks get at most {MAX_SPLITS}", stacklevel=2
-        )
-    gates: dict[str, float] = {"AC_AB_START": geo.s_a, "AC_AB_FINISH": geo.s_b}
-    for k in range(splits):
-        gates[f"AC_TIME_{k}"] = geo.s_a + (k + 1) * geo.length_m / (splits + 1)
+    gates: dict[str, float]
+    if geo.closed:
+        # A lap: AC_TIME_0 is the start/finish line, AC_TIME_1/2 split it in thirds.
+        gates = {f"AC_TIME_{k}": geo.s_a + k * geo.length_m / 3.0 for k in range(3)}
+    else:
+        splits = min(max(int(options.splits), 0), MAX_SPLITS)
+        if splits != options.splits:
+            warnings.warn(
+                f"{options.splits} splits asked; A->B tracks get at most {MAX_SPLITS}",
+                stacklevel=2,
+            )
+        gates = {"AC_AB_START": geo.s_a, "AC_AB_FINISH": geo.s_b}
+        for k in range(splits):
+            gates[f"AC_TIME_{k}"] = geo.s_a + (k + 1) * geo.length_m / (splits + 1)
     for prefix, s in gates.items():
         pos, fwd, left = m.at(s)
         reach = m.interp(m.half_width, s) + GATE_EXTRA_M
@@ -751,6 +858,18 @@ def _dummies(geo: TrackGeometry, options: BuildOptions) -> _Dummies:
 
 def _ai_line(geo: TrackGeometry, options: BuildOptions) -> tuple[AiLine, slice]:
     m = geo.model
+    if geo.closed:  # the whole lap, starting on the start/finish line
+        offs = lane_offset(geo)
+        hw = m.half_width
+        ai = build_ai_line(
+            m.centre + offs[:, None] * m.left,
+            hw - offs,
+            hw + offs,
+            closed=True,
+            surface_normals=m.up,
+            with_grid=True,
+        )
+        return ai, slice(0, len(m))
     s_end = min(geo.s_b + options.ai_past_b_m, m.s[-1] - 5.0)
     i0 = m.index_at(2.0)
     i1 = m.index_at(s_end)
@@ -1493,23 +1612,31 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
     if sc.buildings:
         scenery_text += " Buildings from OpenStreetMap"
         scenery_text += " and Microsoft footprints." if sc.footprints.ms_count else "."
+    run = loop_direction(m.centre) if geo.closed else "A2B"
+    what = (
+        f"a {geo.length_m / 1000:.1f} km loop on real roads"
+        if geo.closed
+        else f"{geo.length_m / 1000:.1f} km A to B on a real road"
+    )
     description = options.description or (
-        f"{options.name}: {geo.length_m / 1000:.1f} km A to B on a real road, generated by "
+        f"{options.name}: {what}, generated by "
         f"{GENERATOR_NAME}. Road data (c) OpenStreetMap contributors, ODbL. "
         f"Elevation: {dem_titles}."
         f"{scenery_text} See LICENSE-DATA.txt. Not affiliated with Kunos Simulazioni."
     )
+    # "circuit" lets Content Manager run multi-lap races (A->B tracks deliberately lack it).
+    tags = ["circuit", "street", "drift-maps"] if geo.closed else ["A2B", "touge", "drift-maps"]
     ui = UiTrack(
         name=options.name,
         description=description,
-        tags=["A2B", "touge", "drift-maps"],
+        tags=tags,
         geotags=(round(pin_a.snap_lat, 6), round(pin_a.snap_lon, 6)),
         country=country,
         city=options.city,
         length_m=geo.length_m,
         width=mean_width,
         pitboxes=options.pits,
-        run="A2B",
+        run=run,
     )
     write_ui_track_json(ui_dir / "ui_track.json", ui)
     write_preview_png(ui_dir / "preview.png", [line], title=options.name)
@@ -1532,6 +1659,8 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
     kn5_meshes = [n for n in kn5.iter_nodes() if isinstance(n, Mesh)]
     stats: dict[str, object] = {
         "length_m": geo.length_m,
+        "closed": geo.closed,
+        "run": run,
         "road_length_m": float(m.s[-1]),
         "elevation_source": geo.elevation.primary,
         "elevation_coverage": ", ".join(
@@ -1679,10 +1808,10 @@ def render_debug_png(
             pos = node.transform[3, :3].astype(np.float64)
             (x, y), r = px(pos[None, :])[0], 3
             colour = (40, 200, 230)
-            if name.startswith("AC_AB_START") or name.startswith("AC_TIME"):
+            if name.startswith("AC_AB_FINISH") or (geo.closed and name.startswith("AC_TIME_0")):
+                colour = (230, 40, 40)  # finish (a loop's start/finish line)
+            elif name.startswith("AC_AB_START") or name.startswith("AC_TIME"):
                 colour = (30, 200, 60)
-            elif name.startswith("AC_AB_FINISH"):
-                colour = (230, 40, 40)
             dr.ellipse((x - r, y - r, x + r, y + r), fill=colour)
         # Distance from A every 250 m (to place user feedback such as guardrails.json spans).
         for d in np.arange(0.0, geo.length_m + 1.0, 250.0):

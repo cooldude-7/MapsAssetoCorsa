@@ -271,7 +271,27 @@ input[type="text"]:focus, input[type="search"]:focus {
 .icon-btn:hover { background: var(--panel-3); color: var(--text); }
 .icon-btn.danger:hover { color: var(--bad); }
 
-.toolbar { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.head-tools { display: flex; gap: 2px; }
+.head-tools .btn.small { padding: 4px 8px; font-weight: 550; color: var(--muted); }
+.head-tools .btn.small:hover:not(:disabled) { color: var(--text); }
+
+/* "Back to start": a wide toggle under the points */
+.btn.loop-toggle { width: 100%; margin-top: 10px; justify-content: flex-start; padding: 9px 12px; }
+.loop-toggle .loop-state {
+  margin-left: auto;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--panel-3);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+.btn.loop-toggle[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, var(--panel-2));
+}
+.loop-toggle[aria-pressed="true"] .loop-state { background: var(--accent); color: var(--accent-ink); }
+.reverse-btn { margin-top: 12px; }
 
 /* switches */
 .toggles { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 12px; }
@@ -339,6 +359,9 @@ input[type="range"]:disabled { opacity: 0.4; }
 .pin-badge.start { background: var(--pin-start); }
 .pin-badge.finish { background: var(--pin-finish); }
 .pin-badge.via { background: var(--pin-via); color: #2a1a00; }
+.pin-badge.loop { background: linear-gradient(135deg, var(--pin-start) 50%, var(--pin-finish) 50%); }
+.pin-item.pin-back { background: transparent; border: 1px dashed var(--border); }
+.pin-item.pin-back .pin-text span { font-family: var(--font); font-size: 12px; }
 .pin-text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
 .pin-text strong { font-size: 13px; }
 .pin-text span { color: var(--muted); font-family: var(--mono); font-size: 11.5px; }
@@ -537,6 +560,7 @@ input[type="range"]:disabled { opacity: 0.4; }
 .dm-pin--finish { --pin-color: var(--pin-finish); }
 .dm-pin--via { --pin-color: var(--pin-via); }
 .dm-pin--via .dm-pin-label { color: #2a1a00; font-size: 12px; }
+.dm-pin--loop .dm-pin-shape path { stroke: var(--pin-finish); stroke-width: 3.5; }
 
 .maplibregl-ctrl-attrib { font-size: 11px; }
 

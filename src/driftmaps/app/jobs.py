@@ -363,4 +363,5 @@ class BuildRunner:
             "kn5_mb": round(_num(kn5_bytes) / 1e6, 2),
             "trees": int(_num((scenery.get("trees") or {}).get("total"))),
             "buildings": int(_num((scenery.get("buildings") or {}).get("buildings"))),
+            "loop": bool(getattr(req.route, "closed", False)),
         }

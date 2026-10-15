@@ -5,7 +5,8 @@ geo.md §3.6 / PLAN §5.3: the corridor is the union of every road station's dis
 Its boundary (exterior ring plus any holes, e.g. inside a hairpin loop) becomes the wall line,
 so walls never cut across another leg of the road: every wall point is at least the corridor
 radius from the nearest centreline point. The round caps of the union close both ends of the
-road, which gives the end walls behind the run-up and after the run-off.
+road, which gives the end walls behind the run-up and after the run-off. A loop's corridor is a
+ring with no ends: its walls are the outer ring and the inner one (the hole inside the loop).
 
 Walls are double-sided vertical strips (`primitives.wall`) from `depth_m` below the terrain
 to `height_m` above the higher of the terrain and the nearest road (so they still hold where
