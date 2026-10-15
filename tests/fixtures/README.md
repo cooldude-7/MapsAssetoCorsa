@@ -43,3 +43,22 @@ Licences and attribution:
 Licence and attribution: map data (c) OpenStreetMap contributors, available under the Open
 Database Licence (ODbL) 1.0, https://www.openstreetmap.org/copyright. The file is an unmodified
 extract of the OSM database, so it stays under the ODbL.
+
+## DSM/DTM pair (`dem/hrdem_snake_dsm_1m.tif`, `dem/hrdem_snake_dtm_1m.tif`, used by `tests/test_elevation_dsm.py`)
+
+Two 64 x 64 px (64 x 64 m) windows cut on 2026-10-15 at the **same** pixel window
+(`col_off=245907,row_off=491515,width=64,height=64`, EPSG:3979, 1 m) from the NRCan HRDEM 1 m
+mosaic surface model `hrdem-mosaic-1m/8_2-mosaic-1m-dsm.tif` and terrain model
+`hrdem-mosaic-1m/8_2-mosaic-1m-dtm.tif` (both on `canelevation-dem.s3.ca-central-1.amazonaws.com`).
+Exact float32 source pixels, NoData -32767, written as 32 x 32 tiled deflate GeoTIFFs
+(predictor 3; 11.7 KB and 9.6 KB). Tags `SOURCE_URL` / `SOURCE_WINDOW` record the cut.
+
+The window is centred on an OSM building 28 m east of Snake Road, Flamborough (Hamilton), Ontario
+(-79.88979, 43.31024). It holds the roof, deciduous canopy and open ground: DSM - DTM ranges
+0.01-19.65 m and is >= 3 m on 45 % of pixels. Reference values (also returned by the live
+pipeline on 2026-10-15): roof pixel DSM 159.447 / DTM 150.955 m, tallest tree 170.473 / 150.825 m,
+bare ground 149.926 / 149.905 m.
+
+Licence and attribution: Contains information licensed under the Open Government Licence -
+Canada (https://open.canada.ca/en/open-government-licence-canada). Source: Natural Resources
+Canada, High Resolution Digital Elevation Model (HRDEM) - CanElevation Series.

@@ -28,6 +28,15 @@ Vertical datums differ (CGVD2013 for HRDEM/MRDEM, NAVD88 for 3DEP, EGM2008 for G
 NGF-IGN69 for RGE ALTI). ASSUMED fine to treat all as orthometric metres; mixing sources inside
 one track can still leave a step of up to a few metres where coverage changes, so callers should
 check `ElevationSample.source` and prefer one source per build (geo.md §2.3.6).
+
+Surface models (scenery, docs/research/scenery.md §1): `sample_surface_elevation(lon, lat)` reads
+the lidar DSM (top of trees and roofs) through `SURFACE_CHAINS`: HRDEM mosaic 1 m DSM -> HRDEM
+lidar-project DSMs -> HRDEM mosaic 2 m DSM, all the `dsm` asset of the same STAC items as the DTMs
+above (VERIFIED live 2026-10-15: every item over the three Ontario test roads has both, same
+EPSG:3979 grid, 512 px tiles, NoData -32767). Outside Canada the chain is empty and the answer is
+NaN (GLO-30 is a 30 m radar DSM, useless for single trees). `canopy_height_grid` returns
+DSM - DTM (>= 0) with each DSM paired to the DTM of the *same* collection (`DSM_TO_DTM`), so a
+point never mixes a lidar DSM with a coarser fallback DTM.
 """
 
 from __future__ import annotations
@@ -61,7 +70,9 @@ from rasterio.windows import Window
 
 __all__ = [
     "CHAINS",
+    "DSM_TO_DTM",
     "ENV_CACHE_DIR",
+    "SURFACE_CHAINS",
     "CatalogItem",
     "CatalogSource",
     "CogSource",
@@ -70,12 +81,14 @@ __all__ = [
     "SourceInfo",
     "TiledCogSource",
     "WmsSource",
+    "canopy_height_grid",
     "default_cache_dir",
     "default_sources",
     "local_dem_source",
     "region_of",
     "sample_elevation",
     "sample_grid",
+    "sample_surface_elevation",
     "source_chain",
 ]
 
@@ -722,7 +735,22 @@ def default_sources() -> dict[str, ElevationSource]:
     """The built-in sources by name."""
     hrdem = dict(surface="DTM", licence="OGL-Canada-2.0", attribution=_OGL_CANADA
                  + " Source: Natural Resources Canada, High Resolution Digital Elevation Model.")
+    hrdem_dsm = dict(hrdem, surface="DSM")
     srcs: list[ElevationSource] = [
+        # Surface models: the `dsm` asset of the same STAC items (only reached via
+        # SURFACE_CHAINS, never by the terrain chains in CHAINS).
+        CatalogSource(
+            SourceInfo("hrdem-1m-dsm", "NRCan HRDEM mosaic 1 m (lidar DSM)", 1.0, **hrdem_dsm),
+            stac_search("hrdem-mosaic-1m", asset="dsm"),
+        ),
+        CatalogSource(
+            SourceInfo("hrdem-lidar-dsm", "NRCan HRDEM lidar projects (DSM)", 1.0, **hrdem_dsm),
+            stac_search("hrdem-lidar", asset="dsm"),
+        ),
+        CatalogSource(
+            SourceInfo("hrdem-2m-dsm", "NRCan HRDEM mosaic 2 m (DSM)", 2.0, **hrdem_dsm),
+            stac_search("hrdem-mosaic-2m", asset="dsm"),
+        ),
         CatalogSource(
             SourceInfo("hrdem-1m", "NRCan HRDEM mosaic 1 m (lidar DTM)", 1.0, **hrdem),
             stac_search("hrdem-mosaic-1m"),
@@ -796,6 +824,25 @@ CHAINS: dict[str, tuple[str, ...]] = {
     "US": ("3dep-1m", "3dep-13", "glo30"),
     "FR": ("ign-rge-alti", "glo30"),
     "WORLD": ("glo30",),
+}
+
+# Surface-model (DSM) chains per region, for scenery. Only Canadian lidar DSMs: a point the
+# chain can't answer stays NaN rather than falling back to a coarse or radar DSM.
+_HRDEM_DSM = ("hrdem-1m-dsm", "hrdem-lidar-dsm", "hrdem-2m-dsm")
+SURFACE_CHAINS: dict[str, tuple[str, ...]] = {
+    "CA": _HRDEM_DSM,
+    "CA-border": _HRDEM_DSM,
+    "US-border": _HRDEM_DSM,  # lidar projects can spill a little over the border
+    "US": (),
+    "FR": (),
+    "WORLD": (),
+}
+
+# The bare-earth source made from the same lidar as each DSM source (canopy = DSM - this DTM).
+DSM_TO_DTM: dict[str, str] = {
+    "hrdem-1m-dsm": "hrdem-1m",
+    "hrdem-lidar-dsm": "hrdem-lidar",
+    "hrdem-2m-dsm": "hrdem-2m",
 }
 
 # Coarse outline of Canada (lon, lat). Only its southern edge matters: it follows the
@@ -889,6 +936,95 @@ def sample_elevation(
     - `sources` / `chain`: override the source registry and use one chain for every point
       (tests and power users). Without `chain` each point uses `CHAINS[region_of(point)]`.
     """
+    return _sample_chains(lon, lat, CHAINS, cache_dir, prefer, sources, chain, "elevation")
+
+
+def sample_surface_elevation(
+    lon: npt.ArrayLike,
+    lat: npt.ArrayLike,
+    *,
+    cache_dir: Path | str | None = None,
+    prefer: str | Sequence[str] | None = None,
+    sources: Mapping[str, ElevationSource] | None = None,
+    chain: Sequence[str] | None = None,
+) -> ElevationSample:
+    """Surface-model heights (top of trees, roofs, bridge decks) at N lon/lat points.
+
+    Same arguments and result as `sample_elevation`, but each point tries
+    `SURFACE_CHAINS[region_of(point)]`: NRCan HRDEM lidar DSMs in and near Canada (1 m mosaic,
+    then lidar projects newest first, then the 2 m mosaic). Points no DSM covers (anywhere
+    outside Canada) are NaN; there is deliberately no coarse fallback.
+    """
+    return _sample_chains(lon, lat, SURFACE_CHAINS, cache_dir, prefer, sources, chain, "surface")
+
+
+def canopy_height_grid(
+    lon_grid: npt.ArrayLike,
+    lat_grid: npt.ArrayLike,
+    *,
+    cache_dir: Path | str | None = None,
+    sources: Mapping[str, ElevationSource] | None = None,
+    chain: Sequence[str] | None = None,
+    pairs: Mapping[str, str] | None = None,
+) -> ElevationSample:
+    """Height of whatever stands on the ground (trees, buildings) = DSM - DTM, clamped >= 0.
+
+    Takes lon/lat arrays of any (equal) shape and returns an `ElevationSample` of that shape whose
+    `heights` are metres above bare ground. Each point's DSM (from `sample_surface_elevation`) is
+    paired with the DTM made from the same lidar (`pairs`, default `DSM_TO_DTM`); where either
+    is missing the height is NaN and `source` is "". `info` holds both the DSM and DTM sources,
+    for LICENSE-DATA.txt. `sources` / `chain` are as for `sample_surface_elevation`; `sources`
+    must also hold the paired DTM sources.
+
+    Small negative differences (DSM a few cm below DTM from separate TIN rasterisation) become
+    0. ASSUMED good enough: on the Ontario test roads DSM - DTM never went below 0 (2026-10-15).
+    """
+    lon_grid = np.asarray(lon_grid, np.float64)
+    lat_grid = np.asarray(lat_grid, np.float64)
+    if lon_grid.shape != lat_grid.shape:
+        raise ValueError(f"grid shapes differ: {lon_grid.shape} vs {lat_grid.shape}")
+    shape = lon_grid.shape
+    lon, lat = lon_grid.ravel(), lat_grid.ravel()
+    sources = default_sources() if sources is None else sources
+    pairs = DSM_TO_DTM if pairs is None else pairs
+
+    dsm = sample_surface_elevation(lon, lat, cache_dir=cache_dir, sources=sources, chain=chain)
+    ground = np.full(lon.size, np.nan)
+    used: dict[str, SourceInfo] = dict(dsm.info)
+    for name in np.unique(dsm.source[dsm.source != ""]):
+        dtm_name = pairs.get(str(name))
+        if dtm_name is None:
+            raise ValueError(f"surface source {name!r} has no paired DTM; have {dict(pairs)}")
+        idx = np.flatnonzero(dsm.source == name)
+        dtm = sample_elevation(
+            lon[idx], lat[idx], cache_dir=cache_dir, sources=sources, chain=[dtm_name]
+        )
+        ground[idx] = dtm.heights
+        used.update(dtm.info)
+
+    with np.errstate(invalid="ignore"):
+        height = np.maximum(dsm.heights - ground, 0.0)  # NaN stays NaN
+    ok = np.isfinite(height)
+    return ElevationSample(
+        height.reshape(shape),
+        np.where(ok, dsm.source, "").reshape(shape),
+        np.where(ok, dsm.resolution_m, np.nan).reshape(shape),
+        used,
+    )
+
+
+def _sample_chains(
+    lon: npt.ArrayLike,
+    lat: npt.ArrayLike,
+    chains: Mapping[str, Sequence[str]],
+    cache_dir: Path | str | None,
+    prefer: str | Sequence[str] | None,
+    sources: Mapping[str, ElevationSource] | None,
+    chain: Sequence[str] | None,
+    what: str,
+) -> ElevationSample:
+    """Shared core of `sample_elevation` / `sample_surface_elevation`: try each point's chain
+    (`chains[region]`, or `chain` for every point) in order until a source answers."""
     lon = np.asarray(lon, np.float64).ravel()
     lat = np.asarray(lat, np.float64).ravel()
     if lon.shape != lat.shape:
@@ -910,7 +1046,7 @@ def sample_elevation(
     else:
         regions = region_of(lon, lat) if n else np.array([], dtype="<U9")
         groups = [
-            (_with_prefer(CHAINS[str(r)], prefer), np.flatnonzero(regions == r))
+            (_with_prefer(chains[str(r)], prefer), np.flatnonzero(regions == r))
             for r in np.unique(regions)
         ]
     for names_in_chain, idx in groups:
@@ -930,7 +1066,7 @@ def sample_elevation(
                 used[name] = src.info
     missing = int(np.isnan(heights).sum())
     if missing:
-        log.warning("no elevation for %d of %d points", missing, n)
+        log.warning("no %s height for %d of %d points", what, missing, n)
     return ElevationSample(heights, names.astype(str), res, used)
 
 
