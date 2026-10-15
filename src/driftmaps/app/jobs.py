@@ -23,7 +23,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from driftmaps.ac.scene import TrackFolderError, check_track_folder, install_track
+from driftmaps.ac.scene import (
+    MARKER_FILE,
+    TrackFolderError,
+    check_track_folder,
+    install_track,
+    stamp_marker,
+)
 from driftmaps.ac.track_files import make_track_id
 
 if TYPE_CHECKING:
@@ -337,6 +343,12 @@ class BuildRunner:
             for line in str(summary()).splitlines():
                 job.add_log(line)
 
+        track_dir = getattr(result, "track_dir", None)
+        if track_dir is not None and (Path(track_dir) / MARKER_FILE).is_file():
+            try:  # "My tracks" shows this date (file times can come from a zip)
+                stamp_marker(Path(track_dir))
+            except OSError as exc:
+                log.warning("could not write the build time: %s", exc)
         installed_to = None
         if ac_tracks is not None:
             job.update("Installing into Assetto Corsa", BUILD_END + 0.01)

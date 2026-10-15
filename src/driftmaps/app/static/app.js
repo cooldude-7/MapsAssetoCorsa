@@ -341,6 +341,399 @@ function clamp(x, lo, hi) {
 }
 
 /* ------------------------------------------------------------------------------------------
+ * Turn by turn: road tiles and the client-side road graph (pure, no DOM)
+ *
+ * Roads come from POST /api/roads in z14 slippy-map tiles. The graph has a node per OSM node
+ * ([lon, lat]), a half-edge per drivable direction of every way segment, and a coarse grid of
+ * segments for snapping clicks. A junction is a node where 3+ segment ends meet, or a dead end.
+ * ---------------------------------------------------------------------------------------- */
+
+const TILE_Z = 14;
+const ROADS_MIN_ZOOM = 13;
+const ROADS_BATCH = 16;
+const GRID_DEG = 0.002; // spatial grid cell for snapping (about 160-220 m)
+
+function lonToTileX(lon, z = TILE_Z) {
+  const n = 2 ** z;
+  return clamp(Math.floor(((lon + 180) / 360) * n), 0, n - 1);
+}
+
+function latToTileY(lat, z = TILE_Z) {
+  const n = 2 ** z;
+  const r = toRad(clamp(lat, -85.05112878, 85.05112878));
+  return clamp(Math.floor(((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2) * n), 0, n - 1);
+}
+
+function tileKeyAt(lon, lat, z = TILE_Z) {
+  return `${z}/${lonToTileX(lon, z)}/${latToTileY(lat, z)}`;
+}
+
+/** [west, south, east, north] of tile "z/x/y". */
+function tileBounds(key) {
+  const [z, x, y] = String(key).split("/").map(Number);
+  const n = 2 ** z;
+  const lat = (yy) => (Math.atan(Math.sinh(Math.PI * (1 - (2 * yy) / n))) * 180) / Math.PI;
+  return [(x / n) * 360 - 180, lat(y + 1), ((x + 1) / n) * 360 - 180, lat(y)];
+}
+
+/** The z14 tiles covering a box plus `margin` tiles round it, nearest the middle first. */
+function tilesForBounds(west, south, east, north, margin = 1, z = TILE_Z) {
+  const n = 2 ** z;
+  const x0 = Math.max(0, lonToTileX(west, z) - margin);
+  const x1 = Math.min(n - 1, lonToTileX(east, z) + margin);
+  const y0 = Math.max(0, latToTileY(north, z) - margin);
+  const y1 = Math.min(n - 1, latToTileY(south, z) + margin);
+  const cx = (lonToTileX(west, z) + lonToTileX(east, z)) / 2;
+  const cy = (latToTileY(north, z) + latToTileY(south, z)) / 2;
+  const out = [];
+  for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) out.push({ k: `${z}/${x}/${y}`, d: Math.hypot(x - cx, y - cy) });
+  out.sort((a, b) => a.d - b.d);
+  return out.map((t) => t.k);
+}
+
+function createRoadGraph() {
+  return { nodes: new Map(), ways: new Map(), adj: new Map(), grid: new Map(), segments: 0 };
+}
+
+function wayName(w) {
+  return (w && (String(w.name || "").trim() || String(w.ref || "").trim())) || "";
+}
+
+function gridKey(i, j) {
+  return `${i},${j}`;
+}
+
+/** Merge a /api/roads response into the graph (ways already there are skipped). Returns the
+ * number of segments added. */
+function addRoads(g, data) {
+  const nodes = (data && data.nodes) || {};
+  for (const [id, ll] of Object.entries(nodes)) {
+    if (g.nodes.has(id) || !Array.isArray(ll)) continue;
+    const p = [Number(ll[0]), Number(ll[1])];
+    if (isLngLat(p)) g.nodes.set(id, p);
+  }
+  let added = 0;
+  for (const raw of (data && Array.isArray(data.ways) ? data.ways : [])) {
+    if (!raw || raw.id == null) continue;
+    const id = String(raw.id);
+    if (g.ways.has(id)) continue;
+    const ids = (Array.isArray(raw.nodes) ? raw.nodes : []).map(String);
+    const oneway = Number(raw.oneway) === 1 ? 1 : Number(raw.oneway) === -1 ? -1 : 0;
+    const way = { id, name: raw.name || "", ref: raw.ref || "", highway: raw.highway || "", oneway, nodes: ids };
+    g.ways.set(id, way);
+    for (let i = 0; i + 1 < ids.length; i++) {
+      const a = ids[i];
+      const b = ids[i + 1];
+      const pa = g.nodes.get(a);
+      const pb = g.nodes.get(b);
+      if (a === b || !pa || !pb) continue;
+      for (const [from, e] of [[a, { to: b, way: id, i, fwd: true }], [b, { to: a, way: id, i, fwd: false }]]) {
+        let list = g.adj.get(from);
+        if (!list) g.adj.set(from, (list = []));
+        list.push(e);
+      }
+      const seg = { a, b, w: id };
+      const i0 = Math.floor(Math.min(pa[0], pb[0]) / GRID_DEG);
+      const i1 = Math.floor(Math.max(pa[0], pb[0]) / GRID_DEG);
+      const j0 = Math.floor(Math.min(pa[1], pb[1]) / GRID_DEG);
+      const j1 = Math.floor(Math.max(pa[1], pb[1]) / GRID_DEG);
+      for (let gi = i0; gi <= i1; gi++) {
+        for (let gj = j0; gj <= j1; gj++) {
+          const k = gridKey(gi, gj);
+          let cell = g.grid.get(k);
+          if (!cell) g.grid.set(k, (cell = []));
+          cell.push(seg);
+        }
+      }
+      g.segments++;
+      added++;
+    }
+  }
+  return added;
+}
+
+function nodeDegree(g, id) {
+  const list = g.adj.get(id);
+  return list ? list.length : 0;
+}
+
+/** A junction: 3+ segment ends meet, or a dead end. Nodes with 2 are just road. */
+function isJunction(g, id) {
+  return nodeDegree(g, id) !== 2;
+}
+
+/** May a car drive half-edge `e` (respects one-way streets)? */
+function canDrive(g, e) {
+  const w = g.ways.get(e.way);
+  if (!w || !w.oneway) return true;
+  return w.oneway === 1 ? e.fwd : !e.fwd;
+}
+
+function findEdge(g, from, to) {
+  const list = g.adj.get(from) || [];
+  return list.find((e) => e.to === to && canDrive(g, e)) || list.find((e) => e.to === to) || null;
+}
+
+/** The nearest segment to p within maxM metres: {a, b, w, t (0..1 from a to b), point, dist}. */
+function nearestSegment(g, p, maxM) {
+  const kx = Math.cos(toRad(p[1])) * 111320;
+  const ky = 110540;
+  const dLon = maxM / Math.max(kx, 1);
+  const dLat = maxM / ky;
+  const i0 = Math.floor((p[0] - dLon) / GRID_DEG);
+  const i1 = Math.floor((p[0] + dLon) / GRID_DEG);
+  const j0 = Math.floor((p[1] - dLat) / GRID_DEG);
+  const j1 = Math.floor((p[1] + dLat) / GRID_DEG);
+  let best = null;
+  for (let gi = i0; gi <= i1; gi++) {
+    for (let gj = j0; gj <= j1; gj++) {
+      for (const s of g.grid.get(gridKey(gi, gj)) || []) {
+        const a = g.nodes.get(s.a);
+        const b = g.nodes.get(s.b);
+        const ax = (a[0] - p[0]) * kx;
+        const ay = (a[1] - p[1]) * ky;
+        const bx = (b[0] - p[0]) * kx;
+        const by = (b[1] - p[1]) * ky;
+        const vx = bx - ax;
+        const vy = by - ay;
+        const len2 = vx * vx + vy * vy;
+        const t = len2 > 0 ? clamp(-(ax * vx + ay * vy) / len2, 0, 1) : 0;
+        const dist = Math.hypot(ax + t * vx, ay + t * vy);
+        if (dist <= maxM && (!best || dist < best.dist)) {
+          best = { a: s.a, b: s.b, w: s.w, t, dist, point: [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])] };
+        }
+      }
+    }
+  }
+  return best;
+}
+
+/** Compass bearing (degrees, 0 = north, clockwise) from a to b; flat-earth, fine for metres. */
+function bearingDeg(a, b) {
+  const dx = (b[0] - a[0]) * Math.cos(toRad((a[1] + b[1]) / 2));
+  const dy = b[1] - a[1];
+  return ((Math.atan2(dx, dy) * 180) / Math.PI + 360) % 360;
+}
+
+/** Signed turn from heading `inB` to heading `outB`: -180..180, negative = left. */
+function turnAngle(inB, outB) {
+  let d = (((outB - inB) % 360) + 540) % 360 - 180;
+  if (d === -180) d = 180;
+  return d;
+}
+
+function turnWord(angle) {
+  const a = Math.abs(angle);
+  if (a < 20) return "straight";
+  const side = angle < 0 ? "left" : "right";
+  if (a < 60) return `slight ${side}`;
+  if (a < 135) return side;
+  return `sharp ${side}`;
+}
+
+/** Drive on from `cur` (arrived from `prev`) through plain road nodes (2 segment ends) to the
+ * next junction. Returns the nodes after `cur`, ending at the junction. Stops early at a node
+ * whose roads aren't loaded yet (`isLoaded`), a one-way the wrong way (unless `anyWay`), or
+ * after going all round a ring. */
+function continueRun(g, prev, cur, isLoaded, anyWay) {
+  const out = [];
+  const seen = new Set();
+  for (let guard = 0; guard < 100000; guard++) {
+    if (isLoaded && !isLoaded(cur)) break;
+    const edges = g.adj.get(cur) || [];
+    if (edges.length !== 2 || seen.has(cur)) break;
+    const next = edges[0].to === prev ? edges[1] : edges[1].to === prev ? edges[0] : null;
+    if (!next || next.to === prev || (!anyWay && !canDrive(g, next))) break;
+    seen.add(cur);
+    prev = cur;
+    cur = next.to;
+    out.push(cur);
+  }
+  return out;
+}
+
+/** Nodes driving from `from` onto `to` and on to the next junction: [to, ..., junction]. */
+function runFrom(g, from, to, isLoaded) {
+  return [to, ...continueRun(g, from, to, isLoaded)];
+}
+
+/** The whole stretch of road between two junctions that segment a-b is on, as node ids. */
+function runAround(g, a, b) {
+  const back = continueRun(g, b, a, null, true).reverse();
+  const fwd = continueRun(g, a, b, null, true);
+  return [...back, a, b, ...fwd];
+}
+
+function coordsOf(g, ids) {
+  const out = [];
+  for (const id of ids) {
+    const p = g.nodes.get(id);
+    if (p) out.push(p);
+  }
+  return out;
+}
+
+/** The point `d` metres along a line of [lon, lat] (the last point if it is shorter). */
+function pointAtDistance(line, d) {
+  return pointAlong(line, cumulativeM(line), d);
+}
+
+/** The point `d` metres back from the end of a line. */
+function pointBack(line, d) {
+  return pointAtDistance(line.slice().reverse(), d);
+}
+
+/** The roads you can take at the end of `path` (node ids in driving order): every way out
+ * except straight back (the U-turn), ordered left to right, each {to, way, name, angle,
+ * allowed (false: a one-way the wrong way), run (nodes to the next junction), coords}. */
+function branchesAt(g, path, isLoaded) {
+  const n = path.length;
+  if (n < 2) return [];
+  const prev = path[n - 2];
+  const cur = path[n - 1];
+  const pc = g.nodes.get(cur);
+  if (!pc) return [];
+  const back = pointBack(coordsOf(g, path.slice(Math.max(0, n - 40))), 20);
+  const inB = bearingDeg(back, pc);
+  const out = [];
+  for (const e of g.adj.get(cur) || []) {
+    if (e.to === prev) continue;
+    const run = runFrom(g, cur, e.to, isLoaded);
+    const coords = [pc, ...coordsOf(g, run)];
+    const ahead = pointAtDistance(coords, 20);
+    const bearing = bearingDeg(pc, ahead);
+    const w = g.ways.get(e.way);
+    out.push({ to: e.to, way: e.way, name: wayName(w), angle: turnAngle(inB, bearing), bearing, allowed: canDrive(g, e), run, coords });
+  }
+  out.sort((a, b) => a.angle - b.angle);
+  return out;
+}
+
+/** Which branch the Left / Up / Right keys take: the leftmost, the straightest, the rightmost
+ * of the ones you may drive (null when there is none that way). */
+function keyBranches(branches) {
+  const ok = branches.filter((b) => b.allowed);
+  if (!ok.length) return { left: null, straight: null, right: null };
+  let straight = ok.reduce((best, b) => (Math.abs(b.angle) < Math.abs(best.angle) ? b : best), ok[0]);
+  if (Math.abs(straight.angle) > 50 && ok.length > 1) straight = null;
+  const left = ok[0].angle < -15 || ok.length === 1 ? ok[0] : null;
+  const right = ok[ok.length - 1].angle > 15 || ok.length === 1 ? ok[ok.length - 1] : null;
+  return { left, straight, right };
+}
+
+/** Keep going "along the same road" at a junction: the way you're on, else a road of the same
+ * name, else the straightest road within 45 degrees. */
+function sameRoadBranch(g, branches, wayId) {
+  const ok = branches.filter((b) => b.allowed);
+  const same = ok.find((b) => b.way === wayId);
+  if (same) return same;
+  const name = wayName(g.ways.get(wayId));
+  const named = name ? ok.filter((b) => b.name === name) : [];
+  if (named.length === 1) return named[0];
+  const straight = ok.filter((b) => Math.abs(b.angle) <= 45).sort((a, b) => Math.abs(a.angle) - Math.abs(b.angle));
+  return straight[0] || null;
+}
+
+function edgeWay(g, a, b) {
+  const e = findEdge(g, a, b);
+  return e ? e.way : null;
+}
+
+/** Driving on from the end of `path` (any road out of its junction, then along that road
+ * through up to `maxJunctions` junctions), where is segment {a, b}? Returns {nodes (to append,
+ * up to the junction after the segment), cut (index in nodes of the segment's end node),
+ * forward (driving a to b), branch} or null. */
+function findAhead(g, path, seg, isLoaded, maxJunctions = 40) {
+  const hit = (from, to) => (from === seg.a && to === seg.b ? 1 : from === seg.b && to === seg.a ? -1 : 0);
+  for (const br of branchesAt(g, path, isLoaded)) {
+    if (!br.allowed) continue;
+    const nodes = [];
+    let tail = path.slice(-2);
+    let run = br.run;
+    let way = br.way;
+    for (let j = 0; j <= maxJunctions && run.length; j++) {
+      let from = tail[tail.length - 1];
+      for (let k = 0; k < run.length; k++) {
+        const to = run[k];
+        nodes.push(to);
+        const h = hit(from, to);
+        if (h) {
+          const cut = nodes.length - 1;
+          nodes.push(...run.slice(k + 1));
+          return { nodes, cut, forward: h > 0, branch: br };
+        }
+        from = to;
+      }
+      tail = [tail[tail.length - 1], ...run].slice(-2);
+      if (nodes.length > 50000) break;
+      const next = sameRoadBranch(g, branchesAt(g, [...path.slice(-1), ...nodes], isLoaded), way);
+      if (!next) break;
+      way = next.way;
+      run = next.run;
+    }
+  }
+  return null;
+}
+
+/** "Back to start": the path closed back to A, if the route returns to A's road and drives
+ * through the start the same way; null if it doesn't (yet). The closed path ends at path[0]. */
+function closeLoopPath(g, path, isLoaded) {
+  if (path.length < 3) return null;
+  const p0 = path[0];
+  const p1 = path[1];
+  for (let i = 2; i + 1 < path.length; i++) if (path[i] === p0 && path[i + 1] === p1) return path.slice(0, i + 1);
+  const tip = path[path.length - 1];
+  if (tip === p0) return path.slice();
+  for (const br of branchesAt(g, path, isLoaded)) {
+    if (!br.allowed) continue;
+    const seq = [tip, ...br.run];
+    for (let j = 0; j + 1 < seq.length; j++) {
+      if (seq[j] === p0 && seq[j + 1] === p1) return path.concat(seq.slice(1, j + 1));
+    }
+  }
+  return null;
+}
+
+/** The drawn line of a path: from `startT` along its first segment to `endT` along its last. */
+function pathLine(g, path, startT, endT) {
+  const pts = coordsOf(g, path);
+  if (pts.length < 2) return pts;
+  const lerp = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+  const n = pts.length;
+  const first = lerp(pts[0], pts[1], startT || 0);
+  const last = lerp(pts[n - 2], pts[n - 1], endT == null ? 1 : endT);
+  if (n === 2) return [first, last];
+  return [first, ...pts.slice(1, n - 1), last];
+}
+
+function lineLengthM(line) {
+  let s = 0;
+  for (let i = 1; i < line.length; i++) s += distanceM(line[i - 1], line[i]);
+  return s;
+}
+
+/** One line per leg for the route panel: "Start on Snake Road", "Left onto Thomson Drive". */
+function legLabel(leg, prevName) {
+  const name = leg.name || "an unnamed road";
+  if (leg.kind === "start") return `Start on ${name}`;
+  if (leg.kind === "close") return `Back to A on ${name}`;
+  const word = turnWord(leg.angle || 0);
+  if (word === "straight") return leg.name && leg.name === prevName ? `Continue on ${name}` : `Straight on ${name}`;
+  return `${word[0].toUpperCase()}${word.slice(1)} onto ${name}`;
+}
+
+/** "Update 3 · 2026-10-15 · abc1234", or "dev build". */
+function buildLabel(build) {
+  if (!build || typeof build !== "object") return "dev build";
+  const v = String(build.version == null ? "" : build.version).trim();
+  if (!v || v === "dev") return "dev build";
+  const parts = [/^update\b/i.test(v) ? v : `Update ${v}`];
+  if (build.date) parts.push(String(build.date).slice(0, 10));
+  if (build.commit) parts.push(String(build.commit).slice(0, 7));
+  return parts.join(" · ");
+}
+
+/* ------------------------------------------------------------------------------------------
  * Small browser utilities
  * ---------------------------------------------------------------------------------------- */
 

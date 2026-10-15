@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 import zipfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -45,6 +46,8 @@ __all__ = [
     "HIDDEN_WALL_FLAGS",
     "MARKER_FILE",
     "MARKER_TEXT",
+    "marker_built_at",
+    "stamp_marker",
     "Scene",
     "TrackFolderError",
     "check_track_folder",
@@ -206,6 +209,39 @@ def zip_tracks(track_dirs: Sequence[Path], zip_path: Path) -> Path:
 # marks a folder that drift-maps may replace.
 MARKER_FILE = ".driftmaps"
 MARKER_TEXT = "Made by drift-maps. drift-maps build/install may replace this folder.\n"
+
+
+_BUILT_AT = "built_at: "
+
+
+def stamp_marker(folder: Path, when: float | None = None) -> Path:
+    """Write the marker with the build time (`built_at: <unix seconds>`): zips carry a fixed
+    date (`_ZIP_DATE`), so file times can't say when a track was built."""
+    path = Path(folder) / MARKER_FILE
+    when = time.time() if when is None else float(when)
+    path.write_text(f"{MARKER_TEXT}{_BUILT_AT}{when:.0f}\n", encoding="utf-8", newline="\n")
+    return path
+
+
+def marker_built_at(folder: Path) -> float | None:
+    """The build time written by `stamp_marker` (unix seconds), or None."""
+    try:
+        text = (Path(folder) / MARKER_FILE).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith(_BUILT_AT):
+            try:
+                value = float(line[len(_BUILT_AT) :].strip())
+            except ValueError:
+                return None
+            return value if value > 0 else None
+    return None
+
+
+def is_zip_time(ts: float) -> bool:
+    """True if a file time is the fixed zip date (the file came out of one of our zips)."""
+    return time.localtime(ts)[:6] == _ZIP_DATE
 
 
 class TrackFolderError(FileExistsError):

@@ -9,6 +9,8 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import threading
+import time
 import urllib.error
 from pathlib import Path
 
@@ -114,8 +116,26 @@ def test_post_query_falls_through_mirrors():
     sleeps: list[float] = []
     out = post_query("q", ["https://a", "https://b"], opener=opener, sleep=sleeps.append)
     assert out == body
-    assert opener.urls == ["https://a", "https://b", "https://a", "https://b"]
+    # Each pass asks both mirrors at once (threads), so only the per-pass set is fixed.
+    assert sorted(opener.urls[:2]) == sorted(opener.urls[2:]) == ["https://a", "https://b"]
     assert sleeps == [5.0]  # one backoff between the two passes
+
+
+def test_post_query_races_mirrors():
+    """The first good answer wins without waiting for a slow mirror."""
+    body = FIXTURE.read_bytes()
+    release = threading.Event()
+
+    def opener(request, timeout):
+        if request.full_url == "https://slow":
+            release.wait(5)
+            raise urllib.error.URLError("too late")
+        return body
+
+    t0 = time.monotonic()
+    out = post_query("q", ["https://slow", "https://fast"], opener=opener, sleep=lambda s: None)
+    assert out == body and time.monotonic() - t0 < 2.0
+    release.set()
 
 
 def test_post_query_backoff_and_failure():

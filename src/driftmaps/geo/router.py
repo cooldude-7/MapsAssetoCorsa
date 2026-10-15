@@ -30,6 +30,9 @@ the ordered directed edges `(way, u, v, dir)`, the coordinates of every node use
 every way used, side-road stubs at route junctions, the length, and `closed` for a loop (only
 written when true). `Route.reverse()` drives the same edges the other way.
 `Route.polyline(step)` densifies it with per-point attributes.
+
+`route_from_path` builds a Route from an explicit node path (the app's turn-by-turn builder):
+no search, just checks that each pair of consecutive nodes is a road segment.
 """
 
 from __future__ import annotations
@@ -70,6 +73,7 @@ __all__ = [
     "RouterOptions",
     "SnappedPin",
     "route_alternatives",
+    "route_from_path",
     "route_from_pins",
     "route_on_graph",
     "snap_pin",
@@ -962,4 +966,105 @@ def route_from_pins(
         warnings.warn(
             "route passes the same node twice (it crosses or overlaps itself)", stacklevel=2
         )
+    return route
+
+
+def route_from_path(
+    osm: OsmData,
+    path: Sequence[int],
+    start_t: float = 0.0,
+    end_t: float = 1.0,
+    *,
+    loop: bool = False,
+    options: RouterOptions | None = None,
+) -> Route:
+    """The Route along `path` (OSM node ids in driving order; each consecutive pair must be
+    joined by a segment of one way), from `start_t` along the first segment to `end_t` along
+    the last. No pathfinding.
+
+    With `loop`, the path must end at its first node; the route then closes where it started
+    (mid-segment starts drive the first segment again up to `start_t`, as `route_from_pins`
+    loops do). Going straight back along the segment just driven (a U-turn) is refused.
+    """
+    options = options or RouterOptions()
+    path = [int(n) for n in path]
+    if len(path) < 2:
+        raise RouteError("need at least two nodes")
+    for t in (start_t, end_t):
+        if not (isinstance(t, int | float) and 0.0 <= float(t) <= 1.0):
+            raise RouteError("start_t and end_t must be between 0 and 1")
+    start_t, end_t = float(start_t), float(end_t)
+    if loop:
+        if path[-1] != path[0] or len(path) < 4:
+            raise RouteError("a loop must come back to its first node")
+        if start_t > 0.0:
+            path.append(path[1])
+            end_t = start_t
+        else:
+            end_t = 1.0
+    for i in range(len(path) - 1):
+        if path[i] == path[i + 1]:
+            raise RouteError(f"node {path[i]} is repeated")
+        if i + 2 < len(path) and path[i + 2] == path[i]:
+            raise RouteError(f"the path turns back on itself at node {path[i + 1]}")
+    if len(path) == 2 and end_t <= start_t:
+        raise RouteError("the route ends before it starts")
+
+    want = set(path)
+    sub = OsmData(
+        tuple(w for w in osm.ways if not want.isdisjoint(w.nodes)), osm.osm_base, osm.cache_key
+    )
+    lonlat = sub.node_lonlat()
+    missing = [n for n in path if n not in lonlat]
+    if missing:
+        raise RouteError(f"node {missing[0]} is not in the loaded road data")
+    a, b = np.array(lonlat[path[0]]), np.array(lonlat[path[1]])
+    lon0, lat0 = (a + (b - a) * start_t).tolist()
+    graph = build_graph(sub, LocalProjection(lat0, lon0), respect_oneway=False)
+
+    by_pair: dict[tuple[int, int], int] = {}
+    for e in range(graph.n_edges):  # ascending: the lowest edge (way id) wins duplicates
+        by_pair.setdefault((int(graph.edge_u[e]), int(graph.edge_v[e])), e)
+    idx = [graph.node_index(n) for n in path]
+    edges: list[int] = []
+    for i in range(len(idx) - 1):
+        e = by_pair.get((idx[i], idx[i + 1]))
+        if e is None:
+            raise RouteError(
+                f"nodes {path[i]} and {path[i + 1]} are not next to each other on a road"
+            )
+        edges.append(e)
+    if loop:
+        inner = edges[:-1] if edges[0] == edges[-1] else edges
+        segs = [int(graph.edge_seg[e]) for e in inner]
+        if len(set(segs)) != len(segs):
+            raise RouteError(f"no loop: {LOOP_MESSAGE}")
+
+    def snap(e: int, t: float) -> _Snap:
+        seg = int(graph.edge_seg[e])
+        u, v = int(graph.edge_u[e]), int(graph.edge_v[e])
+        xy = graph.node_xy[u] + (graph.node_xy[v] - graph.node_xy[u]) * t
+        seg_t = t if graph.edge_dir[e] > 0 else 1.0 - t
+        node = u if t <= 0.0 else v if t >= 1.0 else -1
+        return _Snap(seg, seg_t, node, (float(xy[0]), float(xy[1])), 0.0)
+
+    first, last = snap(edges[0], start_t), snap(edges[-1], end_t)
+    pins_ll = []
+    for sn in (first, last):
+        slon, slat = graph.proj.to_lonlat(sn.xy[0], sn.xy[1])
+        pins_ll.append((_ll(slat), _ll(slon)))
+    route = _build_route(
+        graph,
+        pins_ll,
+        [first, last],
+        options,
+        edges,
+        start_t,
+        end_t,
+        osm.osm_base,
+        osm.cache_key,
+        loop,
+    )
+    if route.length_m <= 0.0:
+        raise RouteError("the route has no length")
     return route

@@ -11,3 +11,5 @@ out/
 .cache/
 # Dev-only third-party test oracles (GPL etc.) are downloaded, never committed
 tools/oracles/
+# Written by CI (windows-app.yml) for the app's "Update N" label; never committed
+src/driftmaps/app/_build_info.py

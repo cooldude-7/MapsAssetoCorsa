@@ -6,10 +6,13 @@ Design (docs/research/geo.md §1.2, PLAN §5.1):
   geo.md §1.2). `out body geom` returns each way's node ids (topology) and coordinates.
 - Paved `highway=track` ways are included by default; service roads that are parking aisles,
   driveways or drive-throughs are left out so routes can't cut through car parks.
-- Mirrors are tried in order with exponential backoff. Overpass answers 429 when rate limited
-  and 504 when overloaded (VERIFIED, geo.md §1.1); its fair-use policy asks for a 30 s pause
-  after a 429 and an identifying User-Agent. On 2026-10-15 overpass-api.de reset connections
-  from the dev sandbox while maps.mail.ru answered, so the mirror list matters.
+- Mirrors are raced: up to `RACE_MIRRORS` at once in threads, the first good answer wins (the
+  others are ignored), with exponential backoff between rounds. Overpass answers 429 when rate
+  limited and 504 when overloaded (VERIFIED, geo.md §1.1); its fair-use policy asks for a 30 s
+  pause after a 429 and an identifying User-Agent. On 2026-10-15 overpass-api.de reset
+  connections from the dev sandbox while maps.mail.ru answered, so the mirror list matters.
+- `build_bbox_query` asks for the same drivable ways inside one or more lat/lon boxes (the
+  app's map tiles, `driftmaps.app.tiles`).
 - The raw response is cached gzip'd under `<cache_dir>/overpass/<sha256(query)>.json.gz`. The
   hash is the cache key that `route.json` records, together with `osm3s.timestamp_osm_base`.
 
@@ -23,6 +26,8 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import queue
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -42,6 +47,7 @@ __all__ = [
     "OsmData",
     "OverpassError",
     "Way",
+    "build_bbox_query",
     "build_query",
     "default_cache_dir",
     "fetch_corridor",
@@ -79,6 +85,7 @@ EXCLUDED_SERVICE_RE = "^(parking_aisle|driveway|drive-through|emergency_access)$
 # Overpass retry policy: HTTP codes worth retrying, and the pause after a 429 (fair-use policy).
 RETRY_HTTP_CODES = (429, 500, 502, 503, 504)
 RATE_LIMIT_PAUSE_S = 30.0
+RACE_MIRRORS = 3  # mirrors asked at once; the first good answer wins
 
 
 class OverpassError(RuntimeError):
@@ -130,6 +137,27 @@ def _fmt(value: float) -> str:
     return f"{value:.7f}".rstrip("0").rstrip(".")
 
 
+def _way_statements(spatial: str, include_tracks: str) -> list[str]:
+    """The `way[...]` statements for drivable roads (and tracks) with a spatial filter."""
+    if include_tracks not in ("none", "paved", "all"):
+        raise ValueError(f"include_tracks must be none/paved/all, got {include_tracks!r}")
+    common = f'["area"!="yes"]["service"!~"{EXCLUDED_SERVICE_RE}"]{spatial}'
+    parts = [f'way["highway"~"{DRIVABLE_HIGHWAY_RE}"]{common};']
+    if include_tracks == "paved":
+        parts.append(f'way["highway"="track"]["surface"~"{PAVED_SURFACE_RE}"]{common};')
+    elif include_tracks == "all":
+        parts.append(f'way["highway"="track"]{common};')
+    return parts
+
+
+def _union_query(parts: Sequence[str], timeout_s: int) -> str:
+    return (
+        f"[out:json][timeout:{int(timeout_s)}];\n(\n  "
+        + "\n  ".join(parts)
+        + "\n);\nout body geom;\n"
+    )
+
+
 def build_query(
     pins: Sequence[tuple[float, float]],
     buffer_m: float = DEFAULT_BUFFER_M,
@@ -142,21 +170,26 @@ def build_query(
     """
     if not pins:
         raise ValueError("need at least one pin")
-    if include_tracks not in ("none", "paved", "all"):
-        raise ValueError(f"include_tracks must be none/paved/all, got {include_tracks!r}")
     coords = ",".join(f"{_fmt(lat)},{_fmt(lon)}" for lat, lon in pins)
     around = f"(around:{_fmt(buffer_m)},{coords})"
-    common = f'["area"!="yes"]["service"!~"{EXCLUDED_SERVICE_RE}"]{around}'
-    parts = [f'way["highway"~"{DRIVABLE_HIGHWAY_RE}"]{common};']
-    if include_tracks == "paved":
-        parts.append(f'way["highway"="track"]["surface"~"{PAVED_SURFACE_RE}"]{common};')
-    elif include_tracks == "all":
-        parts.append(f'way["highway"="track"]{common};')
-    return (
-        f"[out:json][timeout:{int(timeout_s)}];\n(\n  "
-        + "\n  ".join(parts)
-        + "\n);\nout body geom;\n"
-    )
+    return _union_query(_way_statements(around, include_tracks), timeout_s)
+
+
+def build_bbox_query(
+    boxes: Sequence[tuple[float, float, float, float]],
+    include_tracks: str = "paved",
+    timeout_s: int = 60,
+) -> str:
+    """Overpass QL for drivable ways crossing any of the (south, west, north, east) boxes.
+
+    Ways come back whole (`out body geom`), also the parts outside the boxes.
+    """
+    if not boxes:
+        raise ValueError("need at least one box")
+    parts: list[str] = []
+    for s_, w, n, e in boxes:
+        parts += _way_statements(f"({_fmt(s_)},{_fmt(w)},{_fmt(n)},{_fmt(e)})", include_tracks)
+    return _union_query(parts, timeout_s)
 
 
 def query_cache_key(query: str) -> str:
@@ -221,6 +254,59 @@ def _mirrors(mirrors: Sequence[str] | None) -> list[str]:
     return list(DEFAULT_MIRRORS)
 
 
+def _request(url: str, data: bytes) -> urllib.request.Request:
+    return urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+
+
+def _race(
+    urls: Sequence[str], data: bytes, opener: Opener, timeout_s: float
+) -> tuple[bytes | None, list[str], list[int | None]]:
+    """Ask every url at once (one thread each); return the first good body, or None and the
+    errors (with HTTP codes) once they have all failed. Late answers are ignored."""
+    results: queue.Queue = queue.Queue()
+
+    def ask(url: str) -> None:
+        try:
+            body = opener(_request(url, data), timeout_s)
+            parse_overpass(body)  # reject HTML error pages / runtime errors early
+            results.put((body, None, None))
+        except urllib.error.HTTPError as exc:
+            results.put((None, f"{url}: HTTP {exc.code}", exc.code))
+        except Exception as exc:  # noqa: BLE001 - every failure is reported, none may hang us
+            results.put((None, f"{url}: {exc}", None))
+
+    if len(urls) == 1:
+        ask(urls[0])
+    else:
+        for url in urls:
+            threading.Thread(target=ask, args=(url,), daemon=True, name="overpass").start()
+    errors: list[str] = []
+    codes: list[int | None] = []
+    deadline = time.monotonic() + 2.0 * timeout_s + 5.0  # urlopen's timeout is per read
+    for _ in urls:
+        try:
+            body, err, code = results.get(timeout=max(0.1, deadline - time.monotonic()))
+        except queue.Empty:
+            errors.append(f"no answer in {timeout_s:.0f} s")
+            break
+        if body is not None:
+            return body, errors, codes
+        errors.append(err)
+        codes.append(code)
+        if code == 400:
+            break
+    return None, errors, codes
+
+
 def post_query(
     query: str,
     mirrors: Sequence[str] | None = None,
@@ -229,39 +315,28 @@ def post_query(
     timeout_s: float = 180.0,
     opener: Opener = _urlopen,
     sleep: Callable[[float], None] = time.sleep,
+    parallel: int = RACE_MIRRORS,
 ) -> bytes:
-    """POST `query` to each mirror in turn for up to `rounds` passes; return the response body.
+    """POST `query` to the mirrors for up to `rounds` passes; return the first good body.
 
+    Each pass races the mirrors `parallel` at a time (threads; the first good answer wins).
     Between passes it waits backoff_s * 2**pass (and at least RATE_LIMIT_PAUSE_S after a 429).
     A 400 (bad query) is not retried. `opener` and `sleep` are injectable for tests.
     """
     urls = _mirrors(mirrors)
     data = urllib.parse.urlencode({"data": query}).encode("ascii")
+    step = max(1, int(parallel))
     errors: list[str] = []
     for attempt in range(rounds):
         rate_limited = False
-        for url in urls:
-            req = urllib.request.Request(
-                url,
-                data=data,
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json",
-                },
-                method="POST",
-            )
-            try:
-                body = opener(req, timeout_s)
-                parse_overpass(body)  # reject HTML error pages / runtime errors early
+        for i in range(0, len(urls), step):
+            body, errs, codes = _race(urls[i : i + step], data, opener, timeout_s)
+            if body is not None:
                 return body
-            except urllib.error.HTTPError as exc:
-                errors.append(f"{url}: HTTP {exc.code}")
-                if exc.code == 400:
-                    raise OverpassError(f"Overpass rejected the query: {exc}") from exc
-                rate_limited |= exc.code == 429
-            except (urllib.error.URLError, OSError, ValueError, OverpassError) as exc:
-                errors.append(f"{url}: {exc}")
+            errors += errs
+            if 400 in codes:
+                raise OverpassError(f"Overpass rejected the query: {errs[-1]}")
+            rate_limited |= 429 in codes
         if attempt + 1 < rounds:
             wait = backoff_s * 2**attempt
             sleep(max(wait, RATE_LIMIT_PAUSE_S) if rate_limited else wait)

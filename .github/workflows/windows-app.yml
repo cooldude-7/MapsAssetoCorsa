@@ -54,6 +54,19 @@ jobs:
         continue-on-error: true
         run: uv run --locked pytest -m "not network"
 
+      # The app shows "Update 3 · <date> · <commit>" in its header (GET /api/status -> build).
+      - name: Write the build info
+        run: |
+          $date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
+          $lines = @(
+            '"""Written by CI (windows-app.yml) before PyInstaller; never committed."""',
+            'VERSION = "Update 3"',
+            "COMMIT = `"$env:GITHUB_SHA`"",
+            "DATE = `"$date`""
+          )
+          Set-Content -Path src/driftmaps/app/_build_info.py -Value $lines -Encoding utf8
+          Get-Content src/driftmaps/app/_build_info.py
+
       - name: Build the app (PyInstaller)
         run: uv run --locked pyinstaller --noconfirm --clean packaging/acmg.spec
 

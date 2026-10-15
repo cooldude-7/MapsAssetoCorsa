@@ -4,7 +4,9 @@ Binds 127.0.0.1 only. Endpoints (all JSON; errors are `{"error": "<plain English
 
 - `GET /` and other GETs: the single-page app from `driftmaps/app/static/` (read through
   `importlib.resources`, so it also works when frozen by PyInstaller).
-- `GET /api/status`, `POST /api/settings {ac_root}`: app name/version and where AC is.
+- `GET /api/status`, `POST /api/settings {ac_root}`: app name/version and where AC is;
+  `build` is `{version, commit, date}` from `_build_info.py` (written by CI), else
+  `{version: "dev"}`.
 - `POST /api/route {pins: [[lat, lon], ...], reverse, loop}`: route over real roads; the route
   is kept by `route_id` (in memory and as `<app data>/routes/<route_id>.json`).
   `snapped[i]` is where request pin i landed on the road (request order, even with
@@ -20,6 +22,12 @@ Binds 127.0.0.1 only. Endpoints (all JSON; errors are `{"error": "<plain English
 - `POST /api/build {route_id, name, track_id, install, options, loop}` -> `{job_id}`;
   `GET /api/jobs/<job_id>`: one build at a time, the rest queued (see `jobs.py`). A loop route
   builds a circuit; `loop` is optional and, if sent, must match the route.
+- `POST /api/roads {tiles: ["14/x/y", ...]}` (at most 16): the drivable roads crossing those
+  z14 map tiles, for the turn-by-turn builder: `{tiles: {"14/x/y": "ok"|"error"},
+  nodes: {"<id>": [lon, lat]}, ways: [{id, name, ref, highway, oneway, nodes}], error}`.
+  Cached per tile (see `tiles.py`); the missing tiles are fetched in one Overpass query.
+- `POST /api/route-path {path: [node ids], start_t, end_t, loop}`: a route along an explicit
+  node path (from the tiles above; no pathfinding), answered and kept like `/api/route`.
 - `GET /api/tracks`, `DELETE /api/tracks/<id>`: tracks this app made (marker file or the
   "drift-maps" tag), in AC's `content/tracks` and the app's output folder. Other tracks are
   never listed or touched.
@@ -50,7 +58,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from driftmaps.ac.scene import clear_track_folder, is_driftmaps_track
+from driftmaps.ac.scene import (
+    clear_track_folder,
+    is_driftmaps_track,
+    is_zip_time,
+    marker_built_at,
+)
 from driftmaps.ac.track_files import validate_track_id
 from driftmaps.app.jobs import (
     NO_AC_MESSAGE,
@@ -64,6 +77,8 @@ from driftmaps.app.jobs import (
 from driftmaps.app.settings import APP_NAME, Settings, SettingsError
 
 if TYPE_CHECKING:
+    from driftmaps.app.tiles import TileStore
+    from driftmaps.geo.overpass import OsmData
     from driftmaps.geo.router import Route
 
 __all__ = ["DEFAULT_PORT", "ApiError", "App", "AppServer", "run"]
@@ -97,6 +112,12 @@ COARSE_WARNING = (
     "dips won't be in the road."
 )
 ROUTE_GONE = "That route isn't available any more - draw it again."
+ROADS_GONE = (
+    "The road data for part of this route isn't loaded any more - move the map over it "
+    "and try again."
+)
+MAX_PATH_NODES = 50_000
+CORRIDOR_BUFFER_M = 1500.0  # route_from_pins' corridor; cached tiles covering it skip Overpass
 
 _CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -283,13 +304,15 @@ def _track_info(folder: Path) -> dict[str, object]:
             loop = isinstance(tags, list) and "circuit" in tags
     except (OSError, ValueError):
         pass
-    built = 0.0
-    for p in (folder / ".driftmaps", ui_path, folder):
-        try:
-            built = p.stat().st_mtime
-            break
-        except OSError:
-            continue
+    built = marker_built_at(folder) or 0.0
+    if not built:  # older builds: file times, skipping the fixed date files get from a zip
+        for p in (folder / ".driftmaps", ui_path, folder):
+            try:
+                built = p.stat().st_mtime
+            except OSError:
+                continue
+            if not is_zip_time(built):
+                break
     return {
         "track_id": folder.name,
         "name": name,
@@ -297,6 +320,46 @@ def _track_info(folder: Path) -> dict[str, object]:
         "built_at": _iso(built),
         "loop": loop,
     }
+
+
+def build_info() -> dict[str, str]:
+    """`{version, commit, date}` of this build (CI writes `_build_info.py`), else dev."""
+    try:
+        from driftmaps.app import _build_info  # type: ignore[attr-defined]
+    except ImportError:
+        return {"version": "dev"}
+    out = {"version": str(getattr(_build_info, "VERSION", "") or "dev")}
+    for key in ("commit", "date"):
+        value = getattr(_build_info, key.upper(), None)
+        if value:
+            out[key] = str(value)
+    return out
+
+
+def _parse_path(value: object) -> list[int]:
+    if not isinstance(value, list) or len(value) < 2:
+        raise ApiError(400, "Send the route as path: a list of at least two road node ids.")
+    if len(value) > MAX_PATH_NODES:
+        raise ApiError(400, "That route is too long.")
+    out = []
+    for v in value:
+        if isinstance(v, bool) or not isinstance(v, int | str):
+            raise ApiError(400, "path must list road node ids.")
+        try:
+            out.append(int(v))
+        except ValueError:
+            raise ApiError(400, "path must list road node ids.") from None
+    return out
+
+
+def _parse_t(body: dict, key: str, default: float) -> float:
+    value = body.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ApiError(400, f"{key} must be a number from 0 to 1.")
+    value = float(value)
+    if not (0.0 <= value <= 1.0):
+        raise ApiError(400, f"{key} must be a number from 0 to 1.")
+    return value
 
 
 def _json_default(o: object) -> object:
@@ -408,6 +471,17 @@ class App:
         self.jobs = JobQueue(BuildRunner(self.settings, build_fn))
         self._by_pins: OrderedDict[tuple, Route] = OrderedDict()
         self._lock = threading.Lock()
+        self._tiles: TileStore | None = None
+
+    @property
+    def tiles(self) -> TileStore:
+        """Road tiles for the turn-by-turn builder (created on first use)."""
+        with self._lock:
+            if self._tiles is None:
+                from driftmaps.app.tiles import TileStore
+
+                self._tiles = TileStore(self.settings.cache_dir)
+            return self._tiles
 
     def close(self) -> None:
         self.jobs.close(timeout=0)
@@ -415,7 +489,7 @@ class App:
     # -- status and settings ------------------------------------------------------------------
 
     def status(self) -> dict:
-        return self.settings.status()
+        return {**self.settings.status(), "build": build_info()}
 
     def set_settings(self, body: dict) -> dict:
         if "ac_root" not in body:
@@ -442,9 +516,38 @@ class App:
             fn = router.route_from_pins
         # Our own warnings replace route_from_pins' length warning. The route options come
         # back in the best route's `alternatives`.
+        osm = None if "offline" in kw else self._cached_roads(pins)
+        if osm is not None:  # the map tiles already hold the corridor: no download
+            from driftmaps.geo.router import RouteError
+
+            try:
+                return fn(
+                    pins,
+                    self.settings.cache_dir,
+                    max_length_m=math.inf,
+                    alternatives=ROUTE_OPTIONS,
+                    osm=osm,
+                    **kw,
+                )
+            except RouteError:
+                pass  # the corridor download can widen the search; try that
         return fn(
             pins, self.settings.cache_dir, max_length_m=math.inf, alternatives=ROUTE_OPTIONS, **kw
         )
+
+    def _cached_roads(self, pins: list[tuple[float, float]]) -> OsmData | None:
+        """The roads around the pins from cached map tiles, if they cover the corridor."""
+        try:
+            lats = [p[0] for p in pins]
+            lons = [p[1] for p in pins]
+            pad = CORRIDOR_BUFFER_M / 111_320.0
+            pad_lon = pad / max(0.2, math.cos(math.radians(sum(lats) / len(lats))))
+            return self.tiles.covering(
+                min(lats) - pad, min(lons) - pad_lon, max(lats) + pad, max(lons) + pad_lon
+            )
+        except Exception as exc:  # only a shortcut
+            log.warning("could not use the cached road tiles: %s", exc)
+            return None
 
     def _base_route(
         self, pins: list[tuple[float, float]], loop: bool = False
@@ -526,6 +629,60 @@ class App:
                 [round(p.snap_lat, 7), round(p.snap_lon, 7)] for p in base.pins[: len(pins)]
             ],
             "alternatives": options,
+        }
+
+    def roads(self, body: dict) -> dict:
+        from driftmaps.app.tiles import MAX_TILES, parse_tile, tile_key
+
+        raw = body.get("tiles")
+        if not isinstance(raw, list) or not raw:
+            raise ApiError(400, 'Send tiles: a list of map tiles like "14/4567/5987".')
+        if len(raw) > MAX_TILES:
+            raise ApiError(400, f"Ask for at most {MAX_TILES} map tiles at a time.")
+        try:
+            tiles = list(dict.fromkeys(parse_tile(t) for t in raw))
+        except ValueError as exc:
+            raise ApiError(400, str(exc)) from None
+        found, error = self.tiles.get(tiles)
+        nodes, ways = self.tiles.api_payload(found[t] for t in tiles if t in found)
+        return {
+            "tiles": {tile_key(t): "ok" if t in found else "error" for t in tiles},
+            "nodes": nodes,
+            "ways": ways,
+            "error": MAP_SERVERS_MESSAGE if error else None,
+        }
+
+    def route_path(self, body: dict) -> dict:
+        from driftmaps.geo.router import RouteError, route_from_path
+
+        path = _parse_path(body.get("path"))
+        start_t = _parse_t(body, "start_t", 0.0)
+        end_t = _parse_t(body, "end_t", 1.0)
+        loop = bool(body.get("loop", False))
+        osm, missing = self.tiles.for_nodes(path)
+        if missing:
+            raise ApiError(409, ROADS_GONE)
+        try:
+            route = route_from_path(osm, path, start_t, end_t, loop=loop)
+        except RouteError as exc:
+            text = str(exc)
+            if "no loop" in text:
+                raise ApiError(400, route_error_message(exc, [])) from None
+            raise ApiError(400, f"That route doesn't follow the roads: {text}.") from None
+        except Exception as exc:
+            log.exception("route-path failed")
+            raise ApiError(500, f"Something went wrong while making the route: {exc}") from None
+        if route.closed and route.length_m < MIN_LOOP_M:
+            raise ApiError(
+                400,
+                f"That loop is only {route.length_m:.0f} m long - too short for a track. "
+                "Make it bigger.",
+            )
+        option = self._route_option(route, [])
+        return {
+            **option,
+            "snapped": [[round(p.snap_lat, 7), round(p.snap_lon, 7)] for p in route.pins],
+            "alternatives": [option],
         }
 
     def _route_option(self, route: Route, notes: list[str]) -> dict:
@@ -885,6 +1042,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, app.set_settings(self._body()))
         elif key == ("POST", "route", 1):
             self._json(200, app.route(self._body()))
+        elif key == ("POST", "roads", 1):
+            self._json(200, app.roads(self._body()))
+        elif key == ("POST", "route-path", 1):
+            self._json(200, app.route_path(self._body()))
         elif key == ("POST", "profile", 1):
             self._json(200, app.profile(self._body()))
         elif key == ("POST", "build", 1):
@@ -896,7 +1057,17 @@ class _Handler(BaseHTTPRequestHandler):
         elif key == ("DELETE", "tracks", 2):
             self._json(200, app.delete_track(segs[1]))
         else:
-            known = {"status", "settings", "route", "profile", "build", "jobs", "tracks"}
+            known = {
+                "status",
+                "settings",
+                "route",
+                "roads",
+                "route-path",
+                "profile",
+                "build",
+                "jobs",
+                "tracks",
+            }
             if segs and segs[0] in known:
                 raise ApiError(405, "Not allowed.")
             raise ApiError(404, "Unknown API address.")
