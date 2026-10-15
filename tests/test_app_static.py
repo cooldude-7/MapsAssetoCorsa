@@ -138,7 +138,8 @@ def test_script_follows_the_api_contract_and_map_sources():
     assert "https://tiles.openfreemap.org/styles/dark" in js
     assert "https://photon.komoot.io/api/" in js
     for field in (
-        "route_id", "track_id", "install", "scenery_density", "reverse", "loop", "ac_root"
+        "route_id", "track_id", "install", "scenery_density", "reverse", "loop", "ac_root",
+        "alternatives", "snapped", "far_pin",
     ):  # fmt: skip
         assert re.search(rf"\b{field}\b", js), f"app.js never sends/reads {field}"
 
@@ -166,6 +167,7 @@ def test_script_parses():
 
 
 HELPER_PROBE = r"""
+const ELL = [[0, 0], [0.01, 0], [0.01, 0.01]];
 const out = {
   len: [formatLength(850), formatLength(3421), formatLength(12345), formatLength(NaN)],
   names: [
@@ -210,6 +212,30 @@ const out = {
   ],
   label: photonLabel({ name: "Snake Road", city: "Hamilton", state: "Ontario", country: "Canada" }),
   labelStreet: photonLabel({ housenumber: "12", street: "King St", city: "Hamilton" }),
+  // Snapped points come back in request order: flip them back like the points were.
+  snapOpen: displaySnapped([[1, 10], [2, 20], [3, 30]], 3, false, false),
+  snapRev: displaySnapped([[1, 10], [2, 20], [3, 30]], 3, true, false),
+  snapLoopRev: displaySnapped([[1, 10], [2, 20], [3, 30]], 3, true, true),
+  snapBad: [displaySnapped([[1, 10]], 2, false, false), displaySnapped(null, 0, false, false),
+    displaySnapped([[1, 10], [95, 0]], 2, false, false)],
+  farIdx: [[0, 3, false, false], [0, 3, true, false], [2, 3, true, false], [1, 4, true, true],
+    [0, 4, true, true]].map(([i, n, rev, loop]) => displayIndex(i, n, rev, loop)),
+  optLabels: [
+    routeOptionLabel({ length_m: 3512, names: ["Snake Road"] }, 0),
+    routeOptionLabel({ length_m: 4120, names: ["Waterdown Road", "Mill Street"] }, 1),
+    routeOptionLabel({ length_m: 900, names: ["A", "B", "C", "D"] }, 2),
+    routeOptionLabel({ length_m: 900, names: [] }, 3),
+  ],
+  // A line east then north; points A (start), B (corner), C (end).
+  onLine: nearestOnLine(ELL, cumulativeM(ELL), [0.005, 0.001]),
+  insAB: insertIndexAlong(ELL, ELL, [0.004, 0.0003], false),
+  insBC: insertIndexAlong(ELL, ELL, [0.0102, 0.006], false),
+  // A loop round a square from A at the south-west corner, B at the south-east, C at the
+  // north-east: a drag on the west side (after C, back to A) goes at the end.
+  insLoopEnd: insertIndexAlong([[0, 0], [0.01, 0], [0.01, 0.01], [0, 0.01], [0, 0]],
+    [[0, 0], [0.01, 0], [0.01, 0.01]], [-0.0002, 0.004], true),
+  insLoopMid: insertIndexAlong([[0, 0], [0.01, 0], [0.01, 0.01], [0, 0.01], [0, 0]],
+    [[0, 0], [0.01, 0], [0.01, 0.01]], [0.006, 0.0002], true),
 };
 process.stdout.write(JSON.stringify(out));
 """
@@ -256,3 +282,19 @@ def test_pure_helpers_under_node(tmp_path: Path):
     assert out["nearest"] == [1, 2, 1]
     assert out["label"] == {"title": "Snake Road", "subtitle": "Hamilton, Ontario, Canada"}
     assert out["labelStreet"] == {"title": "12 King St", "subtitle": "Hamilton"}
+    assert out["snapOpen"] == [[10, 1], [20, 2], [30, 3]]
+    assert out["snapRev"] == [[30, 3], [20, 2], [10, 1]]
+    assert out["snapLoopRev"] == [[10, 1], [30, 3], [20, 2]]
+    assert out["snapBad"] == [None, None, None]
+    assert out["farIdx"] == [0, 2, 0, 3, 0]
+    assert out["optLabels"] == [
+        "1 · 3.51 km · Snake Road",
+        "2 · 4.12 km · Waterdown Road, Mill Street",
+        "3 · 900 m · A, B, C, …",
+        "4 · 900 m",
+    ]
+    on = out["onLine"]
+    assert on["d"] == pytest.approx(556, rel=0.01) and on["dist"] == pytest.approx(110.5, rel=0.01)
+    assert on["point"] == pytest.approx([0.005, 0], abs=1e-9)
+    assert (out["insAB"], out["insBC"]) == (1, 2)
+    assert (out["insLoopEnd"], out["insLoopMid"]) == (3, 1)

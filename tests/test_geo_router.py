@@ -27,6 +27,7 @@ from driftmaps.geo.router import (
     Route,
     RouteError,
     RouterOptions,
+    route_alternatives,
     route_from_pins,
     route_on_graph,
     snap_pin,
@@ -447,3 +448,134 @@ def test_loop_where_the_pins_cannot_be_joined_says_so():
     # ...but B -> C needs a U-turn, so the points themselves can't be joined.
     with pytest.raises(RouteError, match="no route joins"):
         route_on_graph(g, [pin(50, 0), pin(250, 0), pin(100, 0)], loop=True)
+
+
+# ---------------------------------------------------------------------------------------------
+# Route options (route_alternatives)
+# ---------------------------------------------------------------------------------------------
+
+
+def big_grid(n: int = 5, step: float = 100.0) -> OsmData:
+    """n x n junctions `step` m apart; node id = 100*row + col + 1 (row = north index)."""
+    nodes = {100 * r + c + 1: (step * c, step * r) for r in range(n) for c in range(n)}
+    ways = [(1000 + r, [100 * r + c + 1 for c in range(n)], {"name": f"R{r}"}) for r in range(n)]
+    ways += [(2000 + c, [100 * r + c + 1 for r in range(n)], {"name": f"C{c}"}) for c in range(n)]
+    return make_osm(nodes, ways)
+
+
+def driven(route: Route) -> dict[frozenset, float]:
+    """Metres driven on each road segment (unordered node pair), the end edges in part."""
+    proj = route.projection()
+    out: dict[frozenset, float] = {}
+    last = len(route.edges) - 1
+    for i, e in enumerate(route.edges):
+        (x0, y0), (x1, y1) = (proj.to_enu(*route.nodes[n]) for n in (e.u, e.v))
+        full = float(np.hypot(x1 - x0, y1 - y0))
+        a = route.start_t if i == 0 else 0.0
+        b = route.end_t if i == last else 1.0
+        key = frozenset((e.u, e.v))
+        out[key] = out.get(key, 0.0) + full * (b - a)
+    return out
+
+
+def assert_options_ok(routes: list[Route], loop: bool = False) -> None:
+    best = routes[0]
+    assert len({r.to_json() for r in routes}) == len(routes), "options must be distinct"
+    lengths = [r.length_m for r in routes]
+    assert lengths[1:] == sorted(lengths[1:])
+    for r in routes:
+        assert r.pins == best.pins  # the same pins, snapped the same way
+        assert r.closed == loop
+        assert r.length_m <= 1.7 * best.length_m + 1e-6
+        if loop:
+            assert_closed(r)
+            segs = [frozenset((e.u, e.v)) for e in r.edges]
+            inner = segs[:-1] if r.start_t > 0.0 else segs
+            assert len(set(inner)) == len(inner), "a loop option drives a stretch twice"
+        else:
+            assert_no_u_turns(r)
+    for i, r in enumerate(routes[1:], start=1):
+        mine = driven(r)
+        for other in routes[:i]:
+            theirs = driven(other)
+            shared = sum(min(m, theirs.get(k, 0.0)) for k, m in mine.items())
+            assert shared < 0.6 * r.length_m + 0.01, (i, shared, r.length_m)
+
+
+def test_route_options_on_a_grid():
+    g = build_graph(big_grid(), PROJ)
+    pins = [pin(50, 0), pin(350, 400)]
+    routes = route_alternatives(g, pins, k=4)
+    assert 2 <= len(routes) <= 4
+    # The first option is exactly the plain best route.
+    assert routes[0].to_json() == route_on_graph(g, pins).to_json()
+    assert routes[0].length_m == pytest.approx(700.0, abs=0.01)  # Manhattan distance
+    assert_options_ok(routes)
+    # Deterministic: same input, same options, whatever the order of the ways.
+    again = route_alternatives(build_graph(big_grid(), PROJ), pins, k=4)
+    assert [r.to_json() for r in again] == [r.to_json() for r in routes]
+    shuffled = list(big_grid().ways)
+    random.Random(7).shuffle(shuffled)
+    osm = OsmData(tuple(shuffled), "2026-01-01T00:00:00Z", "testkey")
+    assert [r.to_json() for r in route_alternatives(build_graph(osm, PROJ), pins)] == [
+        r.to_json() for r in routes
+    ]
+    assert len(route_alternatives(g, pins, k=2)) == 2
+    assert len(route_alternatives(g, pins, k=1)) == 1
+
+
+def test_route_options_respect_the_limits():
+    g = build_graph(big_grid(), PROJ)
+    pins = [pin(50, 0), pin(350, 400)]
+    # Nothing may be longer than the best: only the 700 m Manhattan routes are left.
+    tight = route_alternatives(g, pins, k=4, max_stretch=1.0)
+    assert all(r.length_m == pytest.approx(700.0, abs=0.01) for r in tight)
+    assert_options_ok(tight)
+    # No overlap at all allowed: every option shares (almost) no road with the others.
+    apart = route_alternatives(g, pins, k=4, max_overlap=0.2)
+    assert len(apart) >= 2
+    for i, r in enumerate(apart[1:], start=1):
+        for other in apart[:i]:
+            theirs = driven(other)
+            shared = sum(min(m, theirs.get(k, 0.0)) for k, m in driven(r).items())
+            assert shared < 0.2 * r.length_m + 0.01
+
+
+def test_route_options_with_a_waypoint_and_on_a_single_road():
+    g = build_graph(big_grid(), PROJ)
+    pins = [pin(50, 0), pin(400, 250), pin(150, 400)]  # B on the east edge
+    routes = route_alternatives(g, pins, k=4)
+    assert len(routes) >= 2
+    assert_options_ok(routes)
+    b = np.array(PROJ.to_lonlat(400.0, 250.0))
+    for r in routes:  # every option goes through B
+        pl = r.polyline(step_m=1.0)
+        assert np.min(np.linalg.norm(pl.lonlat - b, axis=1)) < 2e-5
+    # One road, no choice: one option.
+    road = build_graph(lollipop(with_loop=False), PROJ)
+    one = route_alternatives(road, [pin(50, 0), pin(250, 0)])
+    assert len(one) == 1
+
+
+def test_route_options_for_a_loop():
+    g = build_graph(big_grid(), PROJ)
+    pins = [pin(150, 100), pin(300, 250), pin(150, 300)]
+    routes = route_alternatives(g, pins, k=4, loop=True)
+    assert len(routes) >= 2
+    assert routes[0].to_json() == route_on_graph(g, pins, loop=True).to_json()
+    assert_options_ok(routes, loop=True)
+
+
+def test_route_from_pins_with_alternatives():
+    pins = [pin(50, 0), pin(350, 400)]
+    plain = route_from_pins(pins, osm=big_grid())
+    best = route_from_pins(pins, osm=big_grid(), alternatives=4)
+    assert best == plain and best.to_json() == plain.to_json()  # route.json unchanged
+    assert plain.alternatives == ()
+    assert 1 <= len(best.alternatives) <= 3
+    osm = big_grid()
+    direct = route_alternatives(
+        build_graph(osm, LocalProjection(*pins[0])), pins, 4, None, osm.osm_base, osm.cache_key
+    )
+    assert [r.to_json() for r in (best, *best.alternatives)] == [r.to_json() for r in direct]
+    assert "alternatives" not in best.to_json()

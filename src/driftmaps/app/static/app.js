@@ -24,6 +24,9 @@ const PHOTON_URL = "https://photon.komoot.io/api/";
 const HOME_VIEW = { center: [-79.87, 43.25], zoom: 10.5 }; // Hamilton, Ontario
 const ROUTE_COLOR = "#19d3ff";
 const CASING_COLOR = "#06121a";
+const ALT_COLOR = "#7f8a9c"; // route options that aren't selected
+const ALT_HOVER_COLOR = "#9be9ff";
+const LINE_DRAG_PX = 4; // a press on the route line that moves further than this is a drag
 const STORE_KEYS = {
   view: "acmg.view",
   style: "acmg.style",
@@ -367,10 +370,11 @@ function h(tag, attrs, ...children) {
 }
 
 class ApiError extends Error {
-  constructor(message, status) {
+  constructor(message, status, data) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.data = data || null; // the error response's other fields (e.g. far_pin)
   }
 }
 
@@ -399,7 +403,7 @@ async function api(path, { method = "GET", body, signal } = {}) {
   }
   if (!res.ok) {
     const msg = data && typeof data.error === "string" && data.error ? data.error : `Something went wrong (HTTP ${res.status}).`;
-    throw new ApiError(msg, res.status);
+    throw new ApiError(msg, res.status, data);
   }
   return data;
 }
@@ -437,6 +441,75 @@ function confirmDialog(title, text, okLabel) {
   });
 }
 
+/** Where the server snapped each point, as [lon, lat] in the displayed (driving) order.
+ * `snapped` is [[lat, lon], ...] in request order (see apiPins); null if it doesn't fit. */
+function displaySnapped(snapped, n, reversed, loop) {
+  if (!Array.isArray(snapped) || snapped.length !== n) return null;
+  const pts = snapped.map((p) => (Array.isArray(p) && p.length === 2 ? [Number(p[1]), Number(p[0])] : null));
+  if (!pts.every(isLngLat)) return null;
+  return reversed ? reversedPins(pts, loop) : pts;
+}
+
+/** The displayed index of request pin `i` (apiPins' order is its own inverse). */
+function displayIndex(i, n, reversed, loop) {
+  const order = [...Array(n).keys()];
+  return (reversed ? reversedPins(order, loop) : order)[i];
+}
+
+/** "1 · 3.5 km · Snake Road" for route option i (at most three road names). */
+function routeOptionLabel(opt, i) {
+  const names = (Array.isArray(opt && opt.names) ? opt.names : []).map((x) => String(x || "").trim()).filter(Boolean);
+  const roads = names.length > 3 ? `${names.slice(0, 3).join(", ")}, …` : names.join(", ");
+  return [String(i + 1), formatLength(Number(opt && opt.length_m)), roads].filter(Boolean).join(" · ");
+}
+
+/** The point of a [lon, lat] line nearest to p: {d: metres along the line, dist: metres off it,
+ * point}. Each segment is flattened around its own start (fine at map-click scale). With
+ * `fromD`, only the part of the line from `fromD` metres on is searched. */
+function nearestOnLine(line, cum, p, fromD = 0) {
+  let best = null;
+  for (let i = 1; i < line.length; i++) {
+    if (cum[i] < fromD) continue;
+    const a = line[i - 1];
+    const b = line[i];
+    const kx = Math.cos(toRad(a[1])) * 111320;
+    const ky = 110540;
+    const bx = (b[0] - a[0]) * kx;
+    const by = (b[1] - a[1]) * ky;
+    const px = (p[0] - a[0]) * kx;
+    const py = (p[1] - a[1]) * ky;
+    const len2 = bx * bx + by * by;
+    let t = len2 > 0 ? clamp((px * bx + py * by) / len2, 0, 1) : 0;
+    const segLen = cum[i] - cum[i - 1];
+    if (cum[i - 1] + t * segLen < fromD && segLen > 0) t = (fromD - cum[i - 1]) / segLen;
+    const dist = Math.hypot(px - t * bx, py - t * by);
+    if (!best || dist < best.dist - 1e-9) {
+      best = { d: cum[i - 1] + t * segLen, dist, point: [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])] };
+    }
+  }
+  return best;
+}
+
+/** Where a point dragged off the route line at `p` goes in the chain of points: between the
+ * two points it lies between along the route (1..n-1; on a loop n is the stretch back to A). */
+function insertIndexAlong(line, points, p, loop) {
+  const n = points.length;
+  if (!Array.isArray(line) || line.length < 2 || n < 2) return bestInsertIndex(points, p, loop);
+  const cum = cumulativeM(line);
+  const at = nearestOnLine(line, cum, p);
+  if (!at) return bestInsertIndex(points, p, loop);
+  let from = 0;
+  for (let i = 1; i < n; i++) {
+    // Each point is looked for after the one before it, so a route that runs over itself
+    // still finds the points in driving order.
+    const pin = nearestOnLine(line, cum, points[i], from);
+    if (!pin) break;
+    if (at.d < pin.d) return i;
+    from = pin.d;
+  }
+  return loop ? n : n - 1;
+}
+
 /* ------------------------------------------------------------------------------------------
  * App state
  * ---------------------------------------------------------------------------------------- */
@@ -452,7 +525,13 @@ const state = {
   dragSnapshot: null,
   lastDragEnd: 0,
   waypointMode: false,
-  route: null, // last /api/route response
+  route: null, // the selected route option (from the last /api/route response) + `snapped`
+  routeOptions: [], // the response's `alternatives`: the best route first
+  optionIndex: 0, // which of routeOptions is selected (drawn blue, built, profiled)
+  routeSnapped: null, // the response's `snapped` (request order)
+  altHover: -1, // route option highlighted on the map (hovered line or list item)
+  lastEdit: null, // {pin}: the point the last click/drag placed (taken back if it is off-road)
+  lineDrag: null, // dragging the route line: {index, start, moved}
   routeCum: null,
   routeStale: false,
   routeError: "",
@@ -517,6 +596,13 @@ function initMap() {
     }
   });
   map.on("click", onMapClick);
+  map.on("mousemove", onMapMouseMove);
+  map.on("mouseout", () => {
+    if (!state.lineDrag) setMapHover(-1, false);
+  });
+  map.on("mousedown", "dm-route-hit", onRouteLineDown);
+  map.on("mouseup", onRouteLineUp);
+  window.addEventListener("mouseup", () => setTimeout(cancelLineDrag, 0));
   let viewTimer = 0;
   map.on("moveend", () => {
     clearTimeout(viewTimer);
@@ -563,7 +649,13 @@ function addRouteLayers() {
   const map = state.map;
   if (!map) return;
   if (!map.hasImage("dm-arrow")) map.addImage("dm-arrow", arrowImage(), { pixelRatio: 2 });
-  const sources = { "dm-route": routeData(), "dm-snap": snapData(), "dm-hover": hoverData() };
+  const sources = {
+    "dm-route": routeData(),
+    "dm-alts": altsData(),
+    "dm-snap": snapData(),
+    "dm-hover": hoverData(),
+    "dm-drag": EMPTY_FC,
+  };
   for (const [id, data] of Object.entries(sources)) {
     if (!map.getSource(id)) map.addSource(id, { type: "geojson", data });
   }
@@ -578,6 +670,39 @@ function addRouteLayers() {
     source: "dm-snap",
     filter: isLine,
     paint: { "line-color": "#ffffff", "line-width": 1.5, "line-dasharray": [2, 2], "line-opacity": 0.85 },
+  });
+  // The other route options: thinner grey lines under the selected one.
+  add({
+    id: "dm-alt-casing",
+    type: "line",
+    source: "dm-alts",
+    layout: { "line-join": "round", "line-cap": "round" },
+    paint: {
+      "line-color": CASING_COLOR,
+      "line-width": ["interpolate", ["linear"], ["zoom"], 8, 4, 13, 6, 17, 10],
+      "line-opacity": 0.45,
+    },
+  });
+  add({
+    id: "dm-alt-line",
+    type: "line",
+    source: "dm-alts",
+    layout: { "line-join": "round", "line-cap": "round" },
+    paint: {
+      "line-color": ALT_COLOR,
+      "line-width": ["interpolate", ["linear"], ["zoom"], 8, 2, 13, 3.5, 17, 6.5],
+    },
+  });
+  add({
+    id: "dm-alt-hover",
+    type: "line",
+    source: "dm-alts",
+    filter: ["==", ["get", "index"], -1],
+    layout: { "line-join": "round", "line-cap": "round" },
+    paint: {
+      "line-color": ALT_HOVER_COLOR,
+      "line-width": ["interpolate", ["linear"], ["zoom"], 8, 3, 13, 5, 17, 9],
+    },
   });
   add({
     id: "dm-route-casing",
@@ -637,7 +762,49 @@ function addRouteLayers() {
       "circle-stroke-width": 3,
     },
   });
+  // Invisible, wider copies of the lines: what the mouse hovers, clicks and drags.
+  const hit = (id, source) =>
+    add({
+      id,
+      type: "line",
+      source,
+      layout: { "line-join": "round", "line-cap": "round" },
+      paint: { "line-color": "#000000", "line-width": 18, "line-opacity": 0 },
+    });
+  hit("dm-alt-hit", "dm-alts");
+  hit("dm-route-hit", "dm-route");
+  // Dragging the route line: dashed legs from the points either side to the new point.
+  add({
+    id: "dm-drag-line",
+    type: "line",
+    source: "dm-drag",
+    filter: isLine,
+    paint: { "line-color": ROUTE_COLOR, "line-width": 3, "line-dasharray": [1.5, 1.5], "line-opacity": 0.9 },
+  });
+  add({
+    id: "dm-drag-point",
+    type: "circle",
+    source: "dm-drag",
+    filter: isPoint,
+    paint: {
+      "circle-radius": 7,
+      "circle-color": "#ffffff",
+      "circle-stroke-color": ROUTE_COLOR,
+      "circle-stroke-width": 3,
+    },
+  });
+  applyAltHover();
   applyStaleStyle();
+}
+
+/** The route options that aren't selected (feature property `index` = option index). */
+function altsData() {
+  const features = [];
+  state.routeOptions.forEach((opt, i) => {
+    if (i === state.optionIndex || !opt || !Array.isArray(opt.line) || opt.line.length < 2) return;
+    features.push({ type: "Feature", properties: { index: i }, geometry: { type: "LineString", coordinates: opt.line } });
+  });
+  return features.length ? { type: "FeatureCollection", features } : EMPTY_FC;
 }
 
 function routeData() {
@@ -688,8 +855,25 @@ function setSourceData(id, data) {
 
 function drawRoute() {
   setSourceData("dm-route", routeData());
+  setSourceData("dm-alts", altsData());
   setSourceData("dm-snap", snapData());
+  applyAltHover();
   applyStaleStyle();
+}
+
+/** Highlight route option `state.altHover` (a grey line) on the map and in the list. */
+function applyAltHover() {
+  const map = state.map;
+  if (map && map.getLayer("dm-alt-hover")) map.setFilter("dm-alt-hover", ["==", ["get", "index"], state.altHover]);
+  const list = $("route-option-list");
+  if (list) [...list.querySelectorAll("button")].forEach((b, i) => b.classList.toggle("hover", i === state.altHover));
+}
+
+function setAltHover(i) {
+  const k = Number.isInteger(i) && i >= 0 && i !== state.optionIndex ? i : -1;
+  if (k === state.altHover) return;
+  state.altHover = k;
+  applyAltHover();
 }
 
 function applyStaleStyle() {
@@ -784,6 +968,7 @@ function createPin(lngLat) {
       pushHistory(state.dragSnapshot || snapshot());
       state.dragSnapshot = null;
       pin.lngLat = [ll.lng, ll.lat];
+      state.lastEdit = { pin };
       afterPinsChanged();
     });
     pin.marker = marker;
@@ -796,6 +981,7 @@ function snapshot() {
 }
 
 function pushHistory(snap) {
+  state.lastEdit = null; // set again by a click or drag that placed one point
   state.history.push(snap || snapshot());
   if (state.history.length > 100) state.history.shift();
 }
@@ -811,12 +997,52 @@ function pinTitle(role, loop) {
   return "Then through here";
 }
 
-function addPin(lngLat, between) {
+function addPin(lngLat, between, at) {
   pushHistory();
   const points = state.pins.map((p) => p.lngLat);
-  const index = between && points.length >= 2 ? bestInsertIndex(points, lngLat, state.loop) : points.length;
-  state.pins.splice(index, 0, createPin(lngLat));
+  let index = points.length;
+  if (Number.isInteger(at)) index = clamp(at, 0, points.length);
+  else if (between && points.length >= 2) index = bestInsertIndex(points, lngLat, state.loop);
+  const pin = createPin(lngLat);
+  state.pins.splice(index, 0, pin);
+  state.lastEdit = { pin };
   afterPinsChanged();
+}
+
+/** Put the points where the server snapped them, so each visibly sits on its road. */
+function snapPinsToRoad(snapped) {
+  if (state.dragSnapshot) return; // a point is being dragged: it re-snaps when dropped
+  const n = state.pins.length;
+  const pts = displaySnapped(snapped, n, state.reversed, state.loop && n >= 2);
+  if (!pts) return;
+  let moved = false;
+  state.pins.forEach((pin, i) => {
+    if (distanceM(pin.lngLat, pts[i]) < 0.05) return;
+    pin.lngLat = pts[i];
+    if (pin.marker) pin.marker.setLngLat(pts[i]);
+    moved = true;
+  });
+  if (moved) {
+    renderPins();
+    store.set(STORE_KEYS.pins, snapshot());
+  }
+}
+
+/** A click or drag put point `farPin` (request index) too far from any road: take that edit
+ * back and say why. False if that point wasn't the one just placed. */
+function takeBackFarPin(farPin, message) {
+  const n = state.pins.length;
+  if (!Number.isInteger(farPin) || farPin < 0 || farPin >= n || !state.lastEdit) return false;
+  const pin = state.pins[displayIndex(farPin, n, state.reversed, state.loop && n >= 2)];
+  if (pin !== state.lastEdit.pin || !state.history.length) return false;
+  const snap = state.history.pop();
+  state.lastEdit = null;
+  setPins(snap.pins);
+  state.reversed = !!snap.reversed;
+  state.loop = !!snap.loop;
+  afterPinsChanged();
+  toast(message, "error");
+  return true;
 }
 
 function removePin(index) {
@@ -883,7 +1109,89 @@ function onMapClick(e) {
   if (Date.now() - state.lastDragEnd < 300) return;
   closeSearch();
   const shift = !!(e.originalEvent && e.originalEvent.shiftKey);
-  addPin([e.lngLat.lng, e.lngLat.lat], state.waypointMode || shift);
+  const between = state.waypointMode || shift;
+  const alt = between ? -1 : altAt(e.point);
+  if (alt >= 0) {
+    selectOption(alt);
+    return;
+  }
+  addPin([e.lngLat.lng, e.lngLat.lat], between);
+}
+
+/** The route option whose grey line is under screen point `pt` (-1: none, or the selected
+ * route's line is on top there). */
+function altAt(pt) {
+  const map = state.map;
+  if (!map || !map.getLayer("dm-alt-hit") || state.routeStale) return -1;
+  if (map.queryRenderedFeatures(pt, { layers: ["dm-route-hit"] }).length) return -1;
+  const hits = map.queryRenderedFeatures(pt, { layers: ["dm-alt-hit"] });
+  const i = hits.length ? Number(hits[0].properties.index) : -1;
+  return Number.isInteger(i) && i < state.routeOptions.length ? i : -1;
+}
+
+function setMapHover(alt, onRoute) {
+  setAltHover(alt);
+  const canvas = state.map && state.map.getCanvas();
+  if (canvas) canvas.style.cursor = state.lineDrag ? "grabbing" : alt >= 0 ? "pointer" : onRoute ? "move" : "";
+}
+
+function onMapMouseMove(e) {
+  const map = state.map;
+  if (!map) return;
+  const drag = state.lineDrag;
+  if (drag) {
+    if (!drag.moved && Math.hypot(e.point.x - drag.start.x, e.point.y - drag.start.y) <= LINE_DRAG_PX) return;
+    drag.moved = true;
+    const cur = [e.lngLat.lng, e.lngLat.lat];
+    const n = state.pins.length;
+    const prev = state.pins[drag.index - 1];
+    const next = state.pins[drag.index % n];
+    const legs = [prev, null, next].map((p) => (p ? p.lngLat : cur));
+    setSourceData("dm-drag", {
+      type: "FeatureCollection",
+      features: [
+        { type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: legs } },
+        { type: "Feature", properties: {}, geometry: { type: "Point", coordinates: cur } },
+      ],
+    });
+    setMapHover(-1, true);
+    return;
+  }
+  if (!map.getLayer("dm-route-hit")) return;
+  const onRoute = !!state.route && !state.routeStale && map.queryRenderedFeatures(e.point, { layers: ["dm-route-hit"] }).length > 0;
+  setMapHover(onRoute ? -1 : altAt(e.point), onRoute);
+}
+
+/** Press on the selected route's line: dragging it adds a point there (between the points
+ * either side along the route), Google Maps style. */
+function onRouteLineDown(e) {
+  const ev = e.originalEvent;
+  const r = state.route;
+  if (!r || state.routeStale || state.pins.length < 2 || !Array.isArray(r.line) || r.line.length < 2) return;
+  if ((ev && ev.button !== 0) || (ev && ev.shiftKey) || state.waypointMode) return;
+  e.preventDefault(); // no map panning while dragging the line
+  const loop = state.loop && state.pins.length >= 2;
+  const index = insertIndexAlong(r.line, state.pins.map((p) => p.lngLat), [e.lngLat.lng, e.lngLat.lat], loop);
+  state.lineDrag = { index, start: e.point, moved: false };
+}
+
+function onRouteLineUp(e) {
+  const drag = state.lineDrag;
+  if (!drag) return;
+  state.lineDrag = null;
+  setSourceData("dm-drag", EMPTY_FC);
+  setMapHover(-1, false);
+  if (!drag.moved) return; // a plain click: handled as a click
+  state.lastDragEnd = Date.now();
+  closeSearch();
+  addPin([e.lngLat.lng, e.lngLat.lat], true, drag.index);
+}
+
+function cancelLineDrag() {
+  if (!state.lineDrag) return;
+  state.lineDrag = null;
+  setSourceData("dm-drag", EMPTY_FC);
+  setMapHover(-1, false);
 }
 
 function renderPins() {
@@ -940,9 +1248,9 @@ function renderPins() {
   if (n === 0) hint = "Click the map where your road starts (A). Each click adds the next point: B, C, D…";
   else if (n === 1) hint = "Now click further along the road for point B.";
   else if (loop)
-    hint = `Click to add point ${pinLetter(n)}; the road comes back to A after it. Shift+click adds a point in between. Drag points to move them, right-click to remove one.`;
+    hint = `Click to add point ${pinLetter(n)}; the road comes back to A after it. Shift+click or drag the blue line to add a point in between; drag points to move them, right-click to remove one.`;
   else
-    hint = `Click to add point ${pinLetter(n)}; the last point is the finish. Shift+click adds a point in between. Drag points to move them, right-click to remove one.`;
+    hint = `Click to add point ${pinLetter(n)}; the last point is the finish. Shift+click or drag the blue line to add a point in between; drag points to move them, right-click to remove one.`;
   $("route-hint").textContent = hint;
 
   const loopBtn = $("btn-loop");
@@ -964,6 +1272,11 @@ function scheduleRoute() {
   if (state.routeAbort) state.routeAbort.abort();
   state.routeAbort = null;
   state.routeSeq++;
+  state.routeOptions = []; // the old options don't go through the new points
+  state.optionIndex = 0;
+  state.altHover = -1;
+  setSourceData("dm-alts", EMPTY_FC);
+  renderRouteOptions();
   if (state.pins.length < 2) {
     state.route = null;
     state.routeCum = null;
@@ -998,22 +1311,26 @@ async function requestRoute() {
   try {
     const route = await api(API.route, { method: "POST", body, signal: ctrl.signal });
     if (seq !== state.routeSeq) return;
-    state.route = route;
-    state.routeCum = cumulativeM(Array.isArray(route.line) ? route.line : []);
+    const alts = Array.isArray(route.alternatives)
+      ? route.alternatives.filter((o) => o && o.route_id && Array.isArray(o.line))
+      : [];
+    state.routeOptions = alts.length ? alts : [route];
+    state.routeSnapped = route.snapped;
     state.routeStale = false;
     state.routeError = "";
-    drawRoute();
-    renderRouteInfo();
-    applyDefaultName();
-    loadProfile(route.route_id);
+    snapPinsToRoad(route.snapped);
+    selectOption(0, true);
   } catch (err) {
     if ((err && err.name === "AbortError") || seq !== state.routeSeq) return;
+    // A point just clicked or dragged off the roads: put things back as they were.
+    if (takeBackFarPin(err.data && err.data.far_pin, err.message)) return;
     state.route = null;
     state.routeCum = null;
     state.routeStale = false;
     state.routeError = err.message || "Couldn't find a route.";
     drawRoute();
     renderRouteInfo();
+    renderRouteOptions();
     resetProfile("No route yet, so no elevation profile.");
   } finally {
     if (seq === state.routeSeq) {
@@ -1022,6 +1339,56 @@ async function requestRoute() {
       updateBuildPanel();
     }
   }
+}
+
+/** Show route option i (wraps round): the blue line, the profile, the name and the build all
+ * use it. */
+function selectOption(i, force) {
+  const opts = state.routeOptions;
+  if (!opts.length || (state.routeStale && !force)) return;
+  const k = ((i % opts.length) + opts.length) % opts.length;
+  if (!force && k === state.optionIndex && state.route && state.route.route_id === opts[k].route_id) return;
+  const opt = opts[k];
+  state.optionIndex = k;
+  state.altHover = -1;
+  state.route = { ...opt, snapped: state.routeSnapped || [] };
+  state.routeCum = cumulativeM(Array.isArray(opt.line) ? opt.line : []);
+  drawRoute();
+  renderRouteInfo();
+  renderRouteOptions();
+  applyDefaultName();
+  loadProfile(opt.route_id);
+  updateBuildPanel();
+}
+
+function renderRouteOptions() {
+  const box = $("route-options");
+  const list = $("route-option-list");
+  const opts = state.routeOptions;
+  box.hidden = opts.length < 2;
+  list.replaceChildren(
+    ...opts.map((opt, i) => {
+      const selected = i === state.optionIndex;
+      const parts = routeOptionLabel(opt, i).split(" · ");
+      const btn = h(
+        "button",
+        {
+          type: "button",
+          class: `route-option${selected ? " selected" : ""}`,
+          "aria-pressed": String(selected),
+          title: selected ? "The route you'll build" : "Use this route",
+          onclick: () => selectOption(i),
+          onmouseenter: () => setAltHover(i),
+          onmouseleave: () => setAltHover(-1),
+        },
+        h("span", { class: "opt-num" }, parts[0]),
+        " · ",
+        h("span", { class: "opt-len" }, parts[1]),
+        ...(parts.length > 2 ? [" · ", h("span", { class: "opt-names" }, parts.slice(2).join(" · "))] : []),
+      );
+      return h("li", {}, btn);
+    }),
+  );
 }
 
 function setBusy(on) {
@@ -1828,6 +2195,9 @@ function onKeyDown(e) {
     $("search").focus();
   } else if (!e.ctrlKey && !e.metaKey && key === "w" && state.pins.length >= 2) {
     setWaypointMode(!state.waypointMode);
+  } else if (!e.ctrlKey && !e.metaKey && (e.key === "[" || e.key === "]") && state.routeOptions.length > 1) {
+    e.preventDefault();
+    selectOption(state.optionIndex + (e.key === "]" ? 1 : -1));
   }
 }
 

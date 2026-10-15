@@ -12,6 +12,10 @@ Binds 127.0.0.1 only. Endpoints (all JSON; errors are `{"error": "<plain English
   `loop: true` the route comes back to the first pin (a circuit; `line` ends where it
   starts) and `loop` in the answer says so; `reverse` then drives the loop the other way
   round from the same start. `loop` defaults to false (A to B), as before.
+  `alternatives` lists up to ROUTE_OPTIONS ways through the same pins, each
+  `{route_id, length_m, line, names, warnings, loop}`; the first is the best route and the
+  top-level fields are the same as its. A pin too far from any road answers 400 with
+  `far_pin` (its request index) beside `error`.
 - `POST /api/profile {route_id}`: ground height every ~20 m along the route.
 - `POST /api/build {route_id, name, track_id, install, options, loop}` -> `{job_id}`;
   `GET /api/jobs/<job_id>`: one build at a time, the rest queued (see `jobs.py`). A loop route
@@ -76,6 +80,7 @@ LONG_ROUTE_M = 25_000.0  # PLAN §5.1: warn above this
 MIN_LOOP_M = 250.0  # a lap needs room for the start grid (the builder refuses under 200 m)
 # ASSUMED: an Overpass corridor query over pins spread wider than this is too big to be useful.
 MAX_PIN_SPAN_M = 100_000.0
+ROUTE_OPTIONS = 4  # route options offered per request (the best one and up to 3 others)
 PROFILE_STEP_M = 20.0
 ROUTE_MEMORY = 64  # routes (and profiles) kept in memory; all routes also go to disk
 ROUTE_FILES_KEPT = 200
@@ -117,12 +122,13 @@ _CONTENT_TYPES = {
 
 
 class ApiError(Exception):
-    """An HTTP error with a message for the user."""
+    """An HTTP error with a message for the user (and `extra` fields for the page)."""
 
-    def __init__(self, status: int, message: str) -> None:
+    def __init__(self, status: int, message: str, extra: dict | None = None) -> None:
         super().__init__(message)
         self.status = status
         self.message = message
+        self.extra = dict(extra or {})
 
 
 # ---------------------------------------------------------------------------------------------
@@ -176,6 +182,21 @@ def parse_pins(value: object) -> list[tuple[float, float]]:
     return pins
 
 
+def far_pin_index(exc: Exception, pins: list[tuple[float, float]]) -> int | None:
+    """The index of the pin a `RouteError` says is too far from any road, else None."""
+    m = re.search(r"pin \(([-\d.]+), ([-\d.]+)\) is (\d+) m from the nearest road", str(exc))
+    if not m or not pins:
+        return None
+    lat, lon = float(m.group(1)), float(m.group(2))
+    return min(range(len(pins)), key=lambda k: _haversine_m(pins[k], (lat, lon)))
+
+
+def route_error(exc: Exception, pins: list[tuple[float, float]]) -> ApiError:
+    """The 400 answer for a `RouteError`: its message, and `far_pin` when a pin is off-road."""
+    far = far_pin_index(exc, pins)
+    return ApiError(400, route_error_message(exc, pins), None if far is None else {"far_pin": far})
+
+
 def route_error_message(exc: Exception, pins: list[tuple[float, float]]) -> str:
     """A plain-English message for a `RouteError`."""
     from driftmaps.geo.router import LOOP_MESSAGE
@@ -183,10 +204,8 @@ def route_error_message(exc: Exception, pins: list[tuple[float, float]]) -> str:
     text = str(exc)
     if "no loop" in text:
         return LOOP_MESSAGE
-    m = re.search(r"pin \(([-\d.]+), ([-\d.]+)\) is (\d+) m from the nearest road", text)
-    if m:
-        lat, lon = float(m.group(1)), float(m.group(2))
-        i = min(range(len(pins)), key=lambda k: _haversine_m(pins[k], (lat, lon)))
+    i = far_pin_index(exc, pins)
+    if i is not None:
         return f"No road found near point {_pin_label(i, len(pins))} - click closer to a road."
     if "same point" in text:
         return "Your points land on the same spot of road - put them further apart."
@@ -421,8 +440,11 @@ class App:
             from driftmaps.geo import router
 
             fn = router.route_from_pins
-        # Our own warnings replace route_from_pins' length warning.
-        return fn(pins, self.settings.cache_dir, max_length_m=math.inf, **kw)
+        # Our own warnings replace route_from_pins' length warning. The route options come
+        # back in the best route's `alternatives`.
+        return fn(
+            pins, self.settings.cache_dir, max_length_m=math.inf, alternatives=ROUTE_OPTIONS, **kw
+        )
 
     def _base_route(
         self, pins: list[tuple[float, float]], loop: bool = False
@@ -441,7 +463,7 @@ class App:
         try:
             route = self._call_route(pins, **kw)
         except RouteError as exc:
-            raise ApiError(400, route_error_message(exc, pins)) from None
+            raise route_error(exc, pins) from None
         except Exception as exc:
             if not is_network_error(exc):
                 raise
@@ -450,7 +472,7 @@ class App:
             try:
                 route = self._call_route(pins, offline=True, **kw)
             except RouteError as exc2:
-                raise ApiError(400, route_error_message(exc2, pins)) from None
+                raise route_error(exc2, pins) from None
             except Exception:
                 raise ApiError(502, MAP_SERVERS_MESSAGE) from None
             notes.append(STALE_MAP_WARNING)
@@ -480,15 +502,30 @@ class App:
         except Exception as exc:
             log.exception("routing failed")
             raise ApiError(500, f"Something went wrong while finding the route: {exc}") from None
-        route = base.reverse() if reverse else base
-        if route.closed and route.length_m < MIN_LOOP_M:
+        found = [base, *getattr(base, "alternatives", ())][:ROUTE_OPTIONS]
+        routes = [r.reverse() if reverse else r for r in found]
+        if routes[0].closed and routes[0].length_m < MIN_LOOP_M:
             raise ApiError(
                 400,
-                f"That loop is only {route.length_m:.0f} m long - too short for a track. "
+                f"That loop is only {routes[0].length_m:.0f} m long - too short for a track. "
                 "Add a point further away to make it bigger.",
             )
-        route_id = self.routes.put(route)
+        options = [
+            self._route_option(r, notes)
+            for r in routes
+            if not (r.closed and r.length_m < MIN_LOOP_M)
+        ]
+        return {
+            **options[0],
+            "snapped": [
+                [round(p.snap_lat, 7), round(p.snap_lon, 7)] for p in base.pins[: len(pins)]
+            ],
+            "alternatives": options,
+        }
 
+    def _route_option(self, route: Route, notes: list[str]) -> dict:
+        """One route option as the page shows it (the route is kept by its id)."""
+        route_id = self.routes.put(route)
         warnings_out = list(notes)
         if route.length_m > LONG_ROUTE_M:
             warnings_out.append(
@@ -511,9 +548,6 @@ class App:
             "route_id": route_id,
             "length_m": round(float(route.length_m), 1),
             "line": display_line(route),
-            "snapped": [
-                [round(p.snap_lat, 7), round(p.snap_lon, 7)] for p in base.pins[: len(pins)]
-            ],
             "names": road_names(route),
             "warnings": warnings_out,
             "loop": bool(route.closed),
@@ -826,7 +860,7 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 raise ApiError(405, "Not allowed.")
         except ApiError as exc:
-            self._error(exc.status, exc.message)
+            self._json(exc.status, {**exc.extra, "error": exc.message})
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as exc:

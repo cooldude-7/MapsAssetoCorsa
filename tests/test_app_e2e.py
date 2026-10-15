@@ -691,3 +691,220 @@ def test_browser_loop(browser_page, tmp_path, monkeypatch):
             shot("zz_last")
         finally:
             srv.stop()
+
+
+# ---------------------------------------------------------------------------------------------
+# In a real browser: route options, snapping and dragging the line, live (opt-in)
+# ---------------------------------------------------------------------------------------------
+
+# Snake Road, Waterdown: up the escarpment (about 3.5 km). The other way round is Old York
+# Road and Plains Road. OPTIONS_FAR is in the woods between them, 400 m from any road.
+OPTIONS_A = (43.29771, -79.88439)
+OPTIONS_B = (43.32555, -79.88968)
+OPTIONS_FAR = (43.31121, -79.88439)
+
+
+def _xy(line, lat0: float) -> np.ndarray:
+    """[lon, lat] points -> local metres (equirectangular; fine over a few km)."""
+    ll = np.asarray(line, float)
+    return np.stack([ll[:, 0] * 111_320.0 * np.cos(np.radians(lat0)), ll[:, 1] * 110_540.0], -1)
+
+
+def _dist_to_line(line, p) -> float:
+    """Metres from [lon, lat] point p to a [lon, lat] line."""
+    xy = _xy(list(line) + [p], p[1])
+    pts, q = xy[:-1], xy[-1]
+    a, ab = pts[:-1], pts[1:] - pts[:-1]
+    t = np.clip(((q - a) * ab).sum(1) / np.maximum((ab * ab).sum(1), 1e-12), 0.0, 1.0)
+    return float(np.min(np.linalg.norm(a + ab * t[:, None] - q, axis=1)))
+
+
+def _far_from(line, other, min_m: float = 150.0) -> list[float] | None:
+    """A vertex of `line` near its middle that is at least `min_m` from `other`."""
+    n = len(line)
+    for f in (0.5, 0.4, 0.6, 0.3, 0.7, 0.2, 0.8):
+        p = line[int(f * (n - 1))]
+        if _dist_to_line(other, p) > min_m:
+            return p
+    return None
+
+
+def test_browser_route_options(browser_page, tmp_path, monkeypatch):
+    if os.environ.get("DRIFTMAPS_E2E_OPTIONS") != "1":
+        pytest.skip("live route options test: set DRIFTMAPS_E2E_OPTIONS=1 (downloads map data)")
+    page, problems = browser_page
+    ac = make_ac(tmp_path / "assettocorsa")
+    # Real routing (Overpass, cached in DRIFTMAPS_CACHE_DIR if set); fake elevation and build.
+    monkeypatch.setattr(elevation_sources, "sample_elevation", fake_sample)
+    app = App(Settings(tmp_path / "appdata", discover=lambda: ac), build_fn=fake_build)
+    srv = AppServer(app, port=0).start()
+    SCREENS.mkdir(parents=True, exist_ok=True)
+    js_state = "window.acmg.state"
+
+    def shot(name: str) -> None:
+        page.screenshot(path=str(SCREENS / f"options_{name}.png"))
+
+    def idle() -> None:
+        page.wait_for_function(
+            "() => window.acmg.map && window.acmg.map.loaded() && !window.acmg.map.isMoving()",
+            timeout=60_000,
+        )
+        page.wait_for_timeout(500)
+
+    def screen(lon: float, lat: float) -> tuple[float, float]:
+        x, y = page.evaluate(
+            "([lon, lat]) => { const p = window.acmg.map.project([lon, lat]); return [p.x, p.y]; }",
+            [lon, lat],
+        )
+        box = page.locator("#map").bounding_box()
+        return box["x"] + x, box["y"] + y
+
+    def click(lat: float, lon: float) -> None:
+        page.mouse.click(*screen(lon, lat))
+        page.wait_for_timeout(450)
+
+    def wait_route() -> dict:
+        page.wait_for_function(
+            f"() => {{ const s = {js_state};"
+            " return !s.routeStale && (!!s.route || !!s.routeError); }",
+            timeout=300_000,
+        )
+        page.wait_for_timeout(300)
+        return page.evaluate(f"() => {js_state}")
+
+    def selected_id() -> str:
+        return page.evaluate(f"() => {js_state}.route.route_id")
+
+    try:
+        page.goto(srv.url)
+        page.wait_for_function("() => window.acmg && window.acmg.state.mapReady", timeout=60_000)
+        a, b = OPTIONS_A, OPTIONS_B
+        page.evaluate(
+            "(b) => window.acmg.map.fitBounds(b, {padding: 120, duration: 0})",
+            [[b[1] - 0.012, a[0] - 0.002], [a[1] + 0.012, b[0] + 0.002]],
+        )
+        idle()
+
+        # A clicked 25 m off the road: the pin moves onto the road it grabbed.
+        click(a[0], a[1] + 0.0003)
+        click(*b)
+        st = wait_route()
+        assert st["routeError"] == "", st["routeError"]
+        options = st["routeOptions"]
+        assert len(options) >= 2, [o["names"] for o in options]
+        assert st["optionIndex"] == 0 and st["route"]["route_id"] == options[0]["route_id"]
+        pins = page.evaluate(f"() => {js_state}.pins.map(p => p.lngLat)")
+        snapped = st["routeSnapped"]
+        for (lon, lat), (slat, slon) in zip(pins, snapped, strict=True):
+            assert (lon, lat) == pytest.approx((slon, slat), abs=1e-6)
+        assert abs(pins[0][0] - (a[1] + 0.0003)) > 1e-4  # moved: it was clicked off the road
+        assert page.is_visible("#route-options")
+        labels = page.eval_on_selector_all(
+            "#route-option-list button", "els => els.map(e => e.textContent)"
+        )
+        assert labels[0].startswith("1 · ") and "Snake Road" in labels[0]
+        assert labels[1].startswith("2 · ")
+        pressed = "#route-option-list li:nth-child({}) button"
+        assert page.get_attribute(pressed.format(1), "aria-pressed") == "true"
+        page.wait_for_function(
+            "() => document.getElementById('profile-stats').textContent.length > 0"
+        )
+        idle()
+        shot("01_two_options")
+
+        # Option 2 from the list: the blue line, length, profile and name follow it.
+        page.click("#route-option-list li:nth-child(2) button")
+        assert selected_id() == options[1]["route_id"] != options[0]["route_id"]
+        assert page.get_attribute(pressed.format(2), "aria-pressed") == "true"
+        option_2 = page.text_content(pressed.format(2))
+        assert option_2.split(" · ")[1] == page.text_content("#route-length")
+        assert options[1]["names"][0] in page.input_value("#track-name")
+        page.wait_for_function(
+            "(id) => window.acmg.state.profile && window.acmg.state.profile.route_id === id",
+            arg=options[1]["route_id"],
+        )
+        idle()
+        shot("02_option_2_selected")
+
+        # [ and ] cycle through the options.
+        page.keyboard.press("[")
+        assert selected_id() == options[0]["route_id"]
+        page.keyboard.press("]")
+        assert selected_id() == options[1]["route_id"]
+        page.keyboard.press("[")
+
+        # Hovering a grey line highlights it; clicking it selects it.
+        grey = _far_from(options[1]["line"], options[0]["line"])
+        assert grey is not None
+        page.mouse.move(*screen(*grey))
+        page.wait_for_timeout(300)
+        assert page.evaluate(f"() => {js_state}.altHover") == 1
+        assert page.evaluate("() => window.acmg.map.getCanvas().style.cursor") == "pointer"
+        shot("03_hover_grey_line")
+        page.mouse.click(*screen(*grey))
+        page.wait_for_timeout(300)
+        assert selected_id() == options[1]["route_id"]
+        assert page.evaluate(f"() => {js_state}.pins.length") == 2  # selected, no point added
+
+        # Create map builds the selected option.
+        page.fill("#track-name", "Snake Road Option 2 (App Test)")
+        with page.expect_request("**/api/build") as req:
+            page.click("#btn-build")
+        sent = json.loads(req.value.post_data)
+        assert sent["route_id"] == options[1]["route_id"]
+        page.wait_for_function(
+            "() => ['done', 'error'].includes(document.getElementById('job').dataset.state)",
+            timeout=60_000,
+        )
+        assert page.get_attribute("#job", "data-state") == "done"
+        shot("04_built_option_2")
+
+        # Drag the blue line (option 1, Snake Road) over to the other road: a point goes in
+        # between A and B there and the route goes that way.
+        page.keyboard.press("[")
+        assert selected_id() == options[0]["route_id"]
+        grab = _far_from(options[0]["line"], options[1]["line"])
+        drop = _far_from(options[1]["line"], options[0]["line"], 250.0)
+        assert grab is not None and drop is not None
+        page.mouse.move(*screen(*grab))
+        page.wait_for_timeout(200)
+        assert page.evaluate("() => window.acmg.map.getCanvas().style.cursor") == "move"
+        page.mouse.down()
+        (x0, y0), (x1, y1) = screen(*grab), screen(*drop)
+        for k in range(1, 11):
+            page.mouse.move(x0 + (x1 - x0) * k / 10, y0 + (y1 - y0) * k / 10)
+            page.wait_for_timeout(30)
+        shot("05_dragging_line")
+        page.mouse.up()
+        st = wait_route()
+        assert st["routeError"] == ""
+        pins = page.evaluate(f"() => {js_state}.pins.map(p => p.lngLat)")
+        assert len(pins) == 3
+        assert page.evaluate(
+            f"() => {js_state}.pins.map(p => p.el.querySelector('.dm-pin-label').textContent)"
+        ) == ["A", "B", "C"]
+        assert pins[1] == pytest.approx(drop, abs=5e-4)  # the new B, snapped onto that road
+        assert _dist_to_line(st["route"]["line"], pins[1]) < 5.0
+        assert st["route"]["route_id"] not in {o["route_id"] for o in options}
+        idle()
+        shot("06_dragged_line_new_point")
+
+        # A click far from any road: no point is added, and the app says why.
+        before = st["route"]["route_id"]
+        click(*OPTIONS_FAR)
+        page.wait_for_function(
+            "() => !document.getElementById('toast').hidden"
+            " && document.getElementById('toast').textContent.includes('No road found')",
+            timeout=300_000,
+        )
+        assert "point D" in page.text_content("#toast")
+        st = wait_route()
+        assert len(page.evaluate(f"() => {js_state}.pins")) == 3
+        assert st["route"]["route_id"] == before
+        shot("07_far_click_refused")
+        assert problems == []
+    finally:
+        try:
+            shot("zz_last")
+        finally:
+            srv.stop()

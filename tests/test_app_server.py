@@ -236,7 +236,12 @@ def test_settings_validates_and_persists(env):
 
 def test_route(env, forks_route):
     body = make_route(env.client)
-    assert set(body) == {"route_id", "length_m", "line", "snapped", "names", "warnings", "loop"}
+    assert set(body) == {
+        "route_id", "length_m", "line", "snapped", "names", "warnings", "loop", "alternatives"
+    }  # fmt: skip
+    # The fake router has no other ways: one option, the route itself.
+    option = {k: v for k, v in body.items() if k not in ("snapped", "alternatives")}
+    assert body["alternatives"] == [option]
     assert body["loop"] is False
     assert len(body["route_id"]) == 16
     assert body["length_m"] == pytest.approx(forks_route.length_m, abs=0.1)
@@ -251,7 +256,8 @@ def test_route(env, forks_route):
     assert body["warnings"] == []
     call = env.route_calls[0]
     assert call["pins"] == [tuple(PIN_A), tuple(PIN_B)]
-    assert "loop" not in call  # A->B routing is called exactly as before
+    assert "loop" not in call  # A->B routing is called as before, asking for route options
+    assert call["alternatives"] == server_mod.ROUTE_OPTIONS == 4
     assert Path(call["cache_dir"]) == env.settings.data_dir / "cache"
     # The route is kept on disk for builds after a restart.
     saved = Route.load(env.settings.routes_dir / f"{body['route_id']}.json")
@@ -288,13 +294,14 @@ def test_route_errors_are_plain(env, monkeypatch):
     status, body = env.client.post("/api/route", {"pins": [PIN_A, PIN_B]})
     assert status == 400
     assert body["error"] == "No road found near point B - click closer to a road."
+    assert body["far_pin"] == 1  # the page takes that point back off the map
 
     def no_net(pins, cache_dir=None, offline=False, **kw):
         raise OverpassError("all Overpass mirrors failed")
 
     monkeypatch.setattr(router, "route_from_pins", no_net)
     status, body = env.client.post("/api/route", {"pins": [PIN_A, [43.81, -79.98]]})
-    assert status == 502 and body["error"] == MAP_SERVERS_MESSAGE
+    assert status == 502 and body["error"] == MAP_SERVERS_MESSAGE and "far_pin" not in body
 
     def boom(pins, cache_dir=None, **kw):
         raise KeyError("bad data")
@@ -673,7 +680,8 @@ def test_route_loop(env, monkeypatch, forks_route):
     pins = [[p.lat, p.lon] for p in loop.pins[:-1]]
     status, body = env.client.post("/api/route", {"pins": pins, "loop": True})
     assert status == 200, body
-    assert body["loop"] is True and calls == [{"loop": True, "max_length_m": float("inf")}]
+    assert body["loop"] is True
+    assert calls == [{"loop": True, "max_length_m": float("inf"), "alternatives": 4}]
     assert body["line"][0] == body["line"][-1]  # the line on the map closes
     assert len(body["snapped"]) == 2  # one per point sent (the closing pin isn't repeated)
     assert body["length_m"] == pytest.approx(1000.0, abs=0.5)
@@ -741,3 +749,68 @@ def test_pin_letters():
     assert [pin_letter(i) for i in (0, 1, 2, 25, 26, 27, 49)] == [
         "A", "B", "C", "Z", "AA", "AB", "AX"
     ]  # fmt: skip
+
+
+# ---------------------------------------------------------------------------------------------
+# route options
+# ---------------------------------------------------------------------------------------------
+
+
+def _grid_osm(n: int = 5, step: float = 100.0):
+    """An n x n street grid near the Forks pins (A at its south-west corner)."""
+    from driftmaps.geo.overpass import OsmData, Way
+    from driftmaps.geo.project import LocalProjection
+
+    proj = LocalProjection(*PIN_A)
+    ways = []
+    for k in range(n):
+        rows = (1000 + k, [(c, k) for c in range(n)])
+        cols = (2000 + k, [(k, r) for r in range(n)])
+        for wid, pts in (rows, cols):
+            xy = np.array(pts, float) * step
+            lon, lat = proj.to_lonlat(xy[:, 0], xy[:, 1])
+            ids = tuple(100 * r + c + 1 for c, r in pts)
+            tags = {"highway": "residential", "name": f"Street {wid}"}
+            ways.append(Way(wid, ids, np.stack([lon, lat], -1), tags))
+    return OsmData(tuple(ways), "2026-01-01T00:00:00Z", "grid"), proj
+
+
+def test_route_options(env, monkeypatch):
+    osm, proj = _grid_osm()
+
+    def on_grid(pins, cache_dir=None, **kw):
+        keep = {k: kw[k] for k in ("loop", "alternatives") if k in kw}
+        return REAL_ROUTE_FROM_PINS(pins, osm=osm, **keep)
+
+    monkeypatch.setattr(router, "route_from_pins", on_grid)
+    a, b = proj.to_lonlat(50.0, 0.0), proj.to_lonlat(350.0, 400.0)
+    pins = [[a[1], a[0]], [b[1], b[0]]]
+    status, body = env.client.post("/api/route", {"pins": pins})
+    assert status == 200, body
+    options = body["alternatives"]
+    assert 2 <= len(options) <= 4
+    for opt in options:
+        assert set(opt) == {"route_id", "length_m", "line", "names", "warnings", "loop"}
+        stored = env.srv.app.routes.get(opt["route_id"])
+        assert stored is not None and stored.length_m == pytest.approx(opt["length_m"], abs=0.1)
+    assert len({o["route_id"] for o in options}) == len(options)
+    assert {k: body[k] for k in options[0]} == options[0]  # top level = the best option
+    lengths = [o["length_m"] for o in options]
+    assert lengths[0] == pytest.approx(700.0, abs=0.1) and lengths[1:] == sorted(lengths[1:])
+    assert max(lengths) <= 1.7 * lengths[0] + 0.1
+
+    # Reversed: every option driven the other way.
+    status, rev = env.client.post("/api/route", {"pins": pins[::-1], "reverse": True})
+    assert status == 200
+    assert len(rev["alternatives"]) == len(options)
+    for fwd, back in zip(options, rev["alternatives"], strict=True):
+        assert back["length_m"] == pytest.approx(fwd["length_m"], abs=0.1)
+        assert back["line"][0] == pytest.approx(fwd["line"][0], abs=1e-6)
+
+    # Building option 2 builds that route, not the best one.
+    status, res = env.client.post(
+        "/api/build", {"route_id": options[1]["route_id"], "name": "Option Two"}
+    )
+    assert status == 200, res
+    assert env.client.wait_job(res["job_id"])["state"] == "done"
+    assert env.build.calls[-1][0].length_m == pytest.approx(options[1]["length_m"], abs=0.1)

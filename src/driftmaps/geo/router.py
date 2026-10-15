@@ -39,7 +39,7 @@ import json
 import math
 import warnings
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -69,6 +69,7 @@ __all__ = [
     "RoutePolyline",
     "RouterOptions",
     "SnappedPin",
+    "route_alternatives",
     "route_from_pins",
     "route_on_graph",
     "snap_pin",
@@ -76,6 +77,11 @@ __all__ = [
 
 ROUTE_VERSION = 1
 DEFAULT_MAX_LENGTH_M = 25_000.0  # PLAN §5.1: v1 warns above this
+# Route options (route_alternatives): cost multiplier for roads already found, the most of a
+# new option that may run on an earlier one, and how much longer than the best it may be.
+ALT_PENALTY = 2.0
+ALT_MAX_OVERLAP = 0.6
+ALT_MAX_STRETCH = 1.7
 # Why a loop was refused (the app shows it as is).
 LOOP_MESSAGE = "Can't make a loop here - add a point on a different road back to the start."
 
@@ -190,6 +196,8 @@ class Route:
     options: Mapping[str, object] = field(default_factory=dict)
     version: int = ROUTE_VERSION
     closed: bool = False  # a loop: the last pin is the first, the end meets the start
+    # Other ways through the same pins (route_from_pins(alternatives=k)); never serialised.
+    alternatives: tuple[Route, ...] = field(default=(), compare=False, repr=False)
 
     # -- serialisation -----------------------------------------------------------------------
 
@@ -478,6 +486,7 @@ class _Search:
         self.snaps = snaps
         self.n = len(snaps)
         self.len_mm = graph.edge_len_mm.tolist()
+        self.w = list(self.len_mm)  # search cost of each edge (route_alternatives raises them)
         self.edge_seg = graph.edge_seg.tolist()
         self.edge_dir = graph.edge_dir.tolist()
         self.edge_u = graph.edge_u.tolist()
@@ -497,8 +506,16 @@ class _Search:
         }
 
     def offset(self, e: int, pos: float) -> int:
-        """Integer millimetres from the tail of edge e to parameter pos along it."""
-        return int(round(pos * self.len_mm[e]))
+        """Integer cost from the tail of edge e to parameter pos along it (millimetres unless
+        the edge was penalized)."""
+        return int(round(pos * self.w[e]))
+
+    def penalize(self, segs: set[int], factor: float) -> None:
+        """Multiply the cost of both directions of each segment in `segs` by `factor`."""
+        for s in sorted(segs):
+            for e in (int(self.seg_fwd[s]), int(self.seg_bwd[s])):
+                if e >= 0:
+                    self.w[e] = int(round(self.w[e] * factor))
 
     def advance(self, e: int, k: int, pos: float) -> tuple[int, float | None]:
         """Drive edge e from parameter `pos` with k pins passed; return (k', finish pos or None)."""
@@ -626,7 +643,7 @@ class _Search:
                 offer_finish(self.offset(e, fin) - self.offset(e, pos), e, fin, -1, pos)
                 continue
             st = e * n + k2
-            cost = self.len_mm[e] - self.offset(e, pos)
+            cost = self.w[e] - self.offset(e, pos)
             if cost < best.get(st, cost + 1):
                 best[st] = cost
                 start_pos[st] = pos
@@ -648,7 +665,7 @@ class _Search:
                     offer_finish(cost + tc + self.offset(e2, fin), e2, fin, st, 0.0)
                     continue
                 st2 = e2 * n + k2
-                c2 = cost + tc + self.len_mm[e2]
+                c2 = cost + tc + self.w[e2]
                 if c2 < best.get(st2, c2 + 1):
                     best[st2] = c2
                     pred[st2] = st
@@ -679,16 +696,52 @@ def route_on_graph(
     """Snap (lat, lon) pins onto `graph` and route through them in order (`loop`: and back
     to the first pin; the returned route's pins end with the first one again)."""
     options = options or RouterOptions()
+    pins, snaps = _snap_all(graph, pins, options, loop)
+    search = _Search(graph, snaps, options)
+    edges, start_t, end_t = search.run_loop() if loop else search.run()
+    return _build_route(
+        graph, pins, snaps, options, edges, start_t, end_t, osm_base, cache_key, loop
+    )
+
+
+def _snap_all(
+    graph: EdgeGraph, pins: Sequence[tuple[float, float]], options: RouterOptions, loop: bool
+) -> tuple[list[tuple[float, float]], list[_Snap]]:
     if len(pins) < 2:
         raise RouteError("need at least two pins")
     pins = list(pins)
     if loop:
         pins.append(pins[0])
-    snaps = [snap_pin(graph, lat, lon, options) for lat, lon in pins]
-    search = _Search(graph, snaps, options)
-    edges, start_t, end_t = search.run_loop() if loop else search.run()
-    g = graph
+    return pins, [snap_pin(graph, lat, lon, options) for lat, lon in pins]
 
+
+def _driven_mm(graph: EdgeGraph, edges: list[int], start_t: float, end_t: float) -> dict[int, int]:
+    """Millimetres driven on each segment (the first and last edges only in part)."""
+    out: dict[int, int] = {}
+    last = len(edges) - 1
+    for i, e in enumerate(edges):
+        full = int(graph.edge_len_mm[e])
+        a = int(round(start_t * full)) if i == 0 else 0
+        b = int(round(end_t * full)) if i == last else full
+        seg = int(graph.edge_seg[e])
+        out[seg] = out.get(seg, 0) + max(0, b - a)
+    return out
+
+
+def _build_route(
+    graph: EdgeGraph,
+    pins: list[tuple[float, float]],
+    snaps: list[_Snap],
+    options: RouterOptions,
+    edges: list[int],
+    start_t: float,
+    end_t: float,
+    osm_base: str | None,
+    cache_key: str | None,
+    loop: bool,
+) -> Route:
+    """The `Route` for a search result (edge indices on `graph`, start/end parameters)."""
+    g = graph
     total_mm = sum(int(g.edge_len_mm[e]) for e in edges)
     total_mm -= int(round(start_t * g.edge_len_mm[edges[0]]))
     total_mm -= int(g.edge_len_mm[edges[-1]]) - int(round(end_t * g.edge_len_mm[edges[-1]]))
@@ -765,6 +818,71 @@ def route_on_graph(
     )
 
 
+def route_alternatives(
+    graph: EdgeGraph,
+    pins: Sequence[tuple[float, float]],
+    k: int = 4,
+    options: RouterOptions | None = None,
+    osm_base: str | None = None,
+    cache_key: str | None = None,
+    *,
+    loop: bool = False,
+    penalty: float = ALT_PENALTY,
+    max_overlap: float = ALT_MAX_OVERLAP,
+    max_stretch: float = ALT_MAX_STRETCH,
+    max_rounds: int | None = None,
+) -> list[Route]:
+    """Up to `k` different routes through the pins (the whole route, every pin in order; with
+    `loop`, closed loops), best first.
+
+    Penalty method: route_on_graph's best route comes first; then the search cost of every
+    segment the last found route drove is multiplied by `penalty` and the search runs again,
+    up to `max_rounds` times (default 4k). A new route is kept when no more than
+    `max_overlap` of its length runs on any kept route and it is at most `max_stretch` times
+    the best route's length. The same rules as route_on_graph apply to every route (no
+    U-turns, pins in order, loops drive no stretch of road twice). The others follow the best
+    in order of length (ties: edge order), so the result is deterministic.
+    """
+    options = options or RouterOptions()
+    pins, snaps = _snap_all(graph, pins, options, loop)
+    search = _Search(graph, snaps, options)
+    run = search.run_loop if loop else search.run
+    first = run()  # no route at all: RouteError, as route_on_graph
+    found: list[tuple[int, tuple[int, ...], tuple[list[int], float, float]]] = []
+    kept_driven: list[dict[int, int]] = []
+
+    def keep(res: tuple[list[int], float, float]) -> dict[int, int]:
+        driven = _driven_mm(graph, *res)
+        found.append((sum(driven.values()), tuple(res[0]), res))
+        kept_driven.append(driven)
+        return driven
+
+    best_mm = sum(keep(first).values())
+    last = kept_driven[0]
+    rounds = max_rounds if max_rounds is not None else 4 * k
+    for _ in range(rounds):
+        if len(found) >= k:
+            break
+        search.penalize(set(last), penalty)
+        try:
+            res = run()
+        except RouteError:
+            break
+        last = driven = _driven_mm(graph, *res)
+        length = sum(driven.values())
+        if length > max_stretch * best_mm or any(tuple(res[0]) == f[1] for f in found):
+            continue
+        overlaps = (
+            sum(min(mm, other.get(seg, 0)) for seg, mm in driven.items()) for other in kept_driven
+        )
+        if all(ov < max_overlap * length for ov in overlaps):
+            keep(res)
+    ordered = found[:1] + sorted(found[1:], key=lambda f: (f[0], f[1]))
+    return [
+        _build_route(graph, pins, snaps, options, *f[2], osm_base, cache_key, loop) for f in ordered
+    ]
+
+
 def route_from_pins(
     pins: Sequence[tuple[float, float]],
     cache_dir: Path | str | None = None,
@@ -779,11 +897,14 @@ def route_from_pins(
     refresh: bool = False,
     max_length_m: float = DEFAULT_MAX_LENGTH_M,
     loop: bool = False,
+    alternatives: int = 1,
 ) -> Route:
     """Route through (lat, lon) pins on real roads. The CLI / web preview entry point.
 
     `loop=True` comes back to the first pin and returns a closed route (see the module
     docstring); a loop that can only come back along the same road raises `RouteError`.
+    `alternatives=k` (k > 1) also finds up to k-1 other ways through the pins
+    (`route_alternatives`); they are in the returned route's `alternatives`.
 
     Fetches (or reads from the cache) the drivable ways within `buffer_m` of the pin chain; if
     no route exists the corridor is doubled once (up to `max_buffer_m`, default 2 x buffer).
@@ -817,7 +938,15 @@ def route_from_pins(
         )
         graph = build_graph(data, proj, respect_oneway=options.respect_oneway)
         try:
-            route = route_on_graph(graph, pins, options, data.osm_base, data.cache_key, loop=loop)
+            if alternatives > 1:
+                found = route_alternatives(
+                    graph, pins, alternatives, options, data.osm_base, data.cache_key, loop=loop
+                )
+                route = replace(found[0], alternatives=tuple(found[1:]))
+            else:
+                route = route_on_graph(
+                    graph, pins, options, data.osm_base, data.cache_key, loop=loop
+                )
             break
         except RouteError as exc:
             last_error = exc
