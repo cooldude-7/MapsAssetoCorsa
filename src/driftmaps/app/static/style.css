@@ -68,6 +68,12 @@ body {
 
 [hidden] { display: none !important; }
 
+/* Fixed rows: the AC panel is display:none when hidden, so rows are pinned, not auto-placed. */
+.topbar { grid-row: 1; }
+.ac-panel { grid-row: 2; }
+.layout { grid-row: 3; }
+.footer { grid-row: 4; }
+
 a { color: var(--accent); }
 
 h1, h2, h3 { margin: 0; font-weight: 650; letter-spacing: 0.01em; }

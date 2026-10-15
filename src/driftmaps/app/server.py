@@ -427,6 +427,7 @@ class App:
             except Exception:
                 raise ApiError(502, MAP_SERVERS_MESSAGE) from None
             notes.append(STALE_MAP_WARNING)
+            return route, notes  # not remembered: try the map servers again next time
         with self._lock:
             self._by_pins[key] = route
             while len(self._by_pins) > ROUTE_MEMORY:
@@ -669,7 +670,8 @@ def static_root():
 def read_static(path: str) -> tuple[bytes, str] | None:
     """(bytes, content type) for a request path, or None. `/` is index.html; a `/static/`
     prefix is optional; unknown paths without a file extension fall back to index.html."""
-    parts = [urllib.parse.unquote(p) for p in path.split("/") if p]
+    # Decode first, then split: an encoded "%2F" must not hide a ".." inside one segment.
+    parts = [p for p in urllib.parse.unquote(path).split("/") if p]
     if parts and parts[0] == "static":
         parts = parts[1:]
     if not parts:
