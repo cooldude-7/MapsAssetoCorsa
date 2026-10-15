@@ -157,7 +157,9 @@ def test_stylesheet_has_dark_and_light_tokens():
 
 @needs_node
 def test_script_parses():
-    proc = subprocess.run([NODE, "--check", str(STATIC / "app.js")], capture_output=True, text=True)
+    proc = subprocess.run(
+        [NODE, "--check", str(STATIC / "app.js")], capture_output=True, text=True, encoding="utf-8"
+    )
     assert proc.returncode == 0, proc.stderr
 
 
@@ -205,7 +207,9 @@ def test_pure_helpers_under_node(tmp_path: Path):
     # app.js only boots when `document` exists, so under Node it just defines its helpers.
     script = tmp_path / "probe.js"
     script.write_text(read("app.js") + "\n;" + HELPER_PROBE, encoding="utf-8")
-    proc = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
+    proc = subprocess.run(
+        [NODE, str(script)], capture_output=True, text=True, encoding="utf-8", timeout=60
+    )
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout)
 
