@@ -16,6 +16,15 @@ exactly where it was cut from.
 | `usgs13_aurora.tif` | USGS 3DEP 1/3 arc-second, `USGS_13_n42w089.tif` (EPSG:4269) | -88.29689, 41.71712 | 203.173 m |
 | `glo30_ollioules.tif` | Copernicus GLO-30 DSM, `Copernicus_DSM_COG_10_N43_00_E005_00_DEM.tif` (EPSG:4326) | 5.85, 43.14 | 63.927 m |
 
+`hrdem_forks_5m.tif` (used by `tests/test_build.py`, the offline end-to-end track build) is
+different: a 351 x 329 px window at **5 m** around the first leg of the Forks of the Credit
+test route (pins (43.80410, -79.99231) -> (43.81060, -79.98185), local box E -300..1150 m,
+N -250..1050 m from the first pin), read on 2026-10-15 from the NRCan HRDEM 1 m mosaic
+`hrdem-mosaic-1m/8_2-mosaic-1m-dtm.tif` (EPSG:3979) with 5 x 5 **average** resampling, heights
+rounded to 0.01 m, written as a 64 x 64 tiled deflate GeoTIFF (float32, predictor 3, NoData
+-32767; 248 KB). Tags `SOURCE_URL`, `SOURCE_BOUNDS` and `RESAMPLING` record the cut. Its
+heights range 285-451 m (the Credit River valley).
+
 Licences and attribution:
 - HRDEM: Contains information licensed under the Open Government Licence - Canada
   (https://open.canada.ca/en/open-government-licence-canada). Source: Natural Resources Canada.
