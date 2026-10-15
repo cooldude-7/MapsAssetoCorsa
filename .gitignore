@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+# Build output and caches
+out/
+.cache/
+# Dev-only third-party test oracles (GPL etc.) are downloaded, never committed
+tools/oracles/
