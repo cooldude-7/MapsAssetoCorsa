@@ -863,8 +863,9 @@ def _t8_models_ini() -> SpikeTrack:
         title="Models Ini",
         description=(
             "drift-maps M0 test S8. models.ini loads four KN5 files: the main one (spawn points "
-            "and a 60 m start pad marked MAIN KN5) and three 100 m road pieces marked CHUNK 1, "
-            "2 and 3. PASS: it loads and you can drive the whole 360 m on road and grass."
+            "and a 60 m road-only start pad marked MAIN KN5, no grass, expected) and three 100 m "
+            "road pieces marked CHUNK 1, 2 and 3. PASS: it loads and you can drive the whole "
+            "360 m; road and grass from CHUNK 1 to the end."
         ),
         kn5=_finish(main, spawns),
         road=road,
@@ -979,6 +980,7 @@ def _t11_ai_loop() -> SpikeTrack:
 
 T12_START_S = 90.0
 T12_RUNOFF_M = 100.0
+T12_AI_START_S = 2.0
 
 
 def _t12_ai_ab() -> SpikeTrack:
@@ -997,12 +999,13 @@ def _t12_ai_ab() -> SpikeTrack:
         gates += _gate(prefix, road, s)
     _end_wall(scene, road)
     spawns = _spawn_grid(road, first_start_s=T12_START_S - 8.0, hotlap_s=6.0, starts=8, pits=8)
-    # Open AI line from the road start (behind every spawn) to 100 m past the finish, starting
+    # Open AI line from 2 m into the road (behind every spawn, but not on the mesh's outer
+    # edge where a downward ray could miss the road) to 100 m past the finish, starting
     # from standstill (cars spawn on it) and braking to a stop at its end. With the lookup grid
     # (unlike t11), so vanilla AC without CSP gets its best chance here too (ai_line.md §1.4,
     # spike S3; CSP's default ALT_GRID=1 ignores it and builds its own).
     ai = build_ai_line(
-        road.slice(0.0, finish_s + T12_RUNOFF_M),
+        road.slice(T12_AI_START_S, finish_s + T12_RUNOFF_M),
         half,
         half,
         closed=False,

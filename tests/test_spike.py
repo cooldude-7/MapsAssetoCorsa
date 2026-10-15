@@ -468,6 +468,7 @@ def test_t8_models_ini(out_dir: Path, specs) -> None:
         assert ini[s]["POSITION"] == "0,0,0" and ini[s]["ROTATION"] == "0,0,0"
     main = read_kn5(track / files[0])
     assert set(meshes(main)) == {"1ROAD_pad", "paint_label_main"}
+    assert "road-only" in specs["dm_t8_models_ini"].description  # no grass on the pad: said so
     assert all(n.name.startswith("AC_") for n in main.root.children if isinstance(n, Dummy))
     z_ranges = [(0.0, 60.0)]  # (north end, south end) as -z ranges: the pad spans z 60..0
     for k, name in enumerate(files[1:], start=1):
@@ -520,6 +521,14 @@ def test_ab_tracks_end_with_a_visible_wall(kn5s: dict[str, Kn5], specs) -> None:
             assert kn5.materials[meshes(kn5)[post_name].material_id].name == material
 
 
+def test_checklist_names_the_tracks_with_an_end_wall(kn5s: dict[str, Kn5], specs) -> None:
+    """Every other road just ends; the M0 checklist tells the tester which ones have a wall."""
+    walled = [f"T{specs[t].number}" for t in SPIKE_TRACK_IDS if "1WALL_END" in meshes(kn5s[t])]
+    assert walled == ["T4", "T5", "T12"]
+    text = " ".join((REPO_ROOT / "docs" / "checklists" / "M0.md").read_text().split())
+    assert f"Only {', '.join(walled[:-1])} and {walled[-1]} have a wall at the end." in text
+
+
 # --------------------------------------------------------------------------------------------
 # AI lines
 # --------------------------------------------------------------------------------------------
@@ -553,7 +562,65 @@ def test_ai_files(out_dir: Path, specs, track_id: str) -> None:
         s_end, _ = spec.road.nearest(line.positions[-1])
         assert s_end == pytest.approx(spec.gates["AC_AB_FINISH"] + 100.0, abs=0.01)
         assert spec.road.length - s_end >= 4.0  # still on the road at its end
-        assert spec.road.nearest(line.positions[0])[0] == pytest.approx(0.0, abs=1e-6)
+        s_start = spec.road.nearest(line.positions[0])[0]
+        assert s_start == pytest.approx(2.0, abs=1e-3)  # inside the road, not on its edge
+        spawns = [
+            n.transform[3, :3]
+            for n in spec.kn5.root.children
+            if isinstance(n, Dummy) and n.name in spec.spawn_heights
+        ]
+        assert s_start < min(spec.road.nearest(p)[0] for p in spawns)
+
+
+def world_triangles(kn5: Kn5, name_re: str) -> np.ndarray:
+    """(T, 3, 3) world-space triangles of every mesh whose name matches `name_re`."""
+    out: list[np.ndarray] = []
+
+    def walk(node: Dummy | Mesh, parent: np.ndarray) -> None:
+        if isinstance(node, Dummy):
+            world = node.transform.astype(np.float64) @ parent  # row vectors: p @ local @ parent
+            for child in node.children:
+                walk(child, world)
+        elif re.match(name_re, node.name):
+            p = np.c_[node.positions.astype(np.float64), np.ones(node.vertex_count)] @ parent
+            out.append(p[:, :3][node.indices.astype(np.int64).reshape(-1, 3)])
+
+    walk(kn5.root, np.eye(4))
+    return np.concatenate(out)
+
+
+def height_above_surface(points: np.ndarray, tris: np.ndarray) -> np.ndarray:
+    """Per point: height above the highest triangle straight below it (NaN if none is below)."""
+    a, b, c = (tris[:, k].astype(np.float64) for k in range(3))
+    lo = np.minimum(np.minimum(a, b), c)[:, [0, 2]]
+    hi = np.maximum(np.maximum(a, b), c)[:, [0, 2]]
+    e1, e2 = (b - a)[:, [0, 2]], (c - a)[:, [0, 2]]
+    det = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+    gaps = np.full(len(points), np.nan)
+    for i, p in enumerate(np.asarray(points, dtype=np.float64)):
+        xz = p[[0, 2]]
+        near = np.flatnonzero(np.all((lo <= xz + 1e-6) & (xz - 1e-6 <= hi), axis=1))
+        near = near[np.abs(det[near]) > 1e-12]
+        d = xz - a[near][:, [0, 2]]
+        u = (d[:, 0] * e2[near, 1] - d[:, 1] * e2[near, 0]) / det[near]
+        v = (e1[near, 0] * d[:, 1] - e1[near, 1] * d[:, 0]) / det[near]
+        inside = (u >= -1e-6) & (v >= -1e-6) & (u + v <= 1 + 1e-6)
+        k = near[inside]
+        y = a[k, 1] + u[inside] * (b[k, 1] - a[k, 1]) + v[inside] * (c[k, 1] - a[k, 1])
+        below = y[y <= p[1] + 1e-6]
+        if below.size:
+            gaps[i] = p[1] - below.max()
+    return gaps
+
+
+@pytest.mark.parametrize("track_id", AI_TRACKS)
+def test_ai_line_floats_above_the_road(out_dir: Path, kn5s: dict[str, Kn5], track_id: str) -> None:
+    """Game-recorded lines sit ~0.47 m above the road (sepang), not on it; CSP raycasts down
+    from each spline point, so there must be road under every point and no coplanar line."""
+    line = read_ai((out_dir / track_id / "ai" / "fast_lane.ai").read_bytes())
+    gaps = height_above_surface(line.positions, world_triangles(kn5s[track_id], r"^\d+ROAD"))
+    assert not np.isnan(gaps).any(), f"{np.isnan(gaps).sum()} points with no road below"
+    assert gaps.min() >= 0.3 and gaps.max() <= 0.6
 
 
 # --------------------------------------------------------------------------------------------

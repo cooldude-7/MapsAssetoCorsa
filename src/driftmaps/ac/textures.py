@@ -775,7 +775,7 @@ def read_dds_info(data: bytes) -> DdsInfo:
     fields = _DDS_HEADER.unpack_from(data, 0)
     magic, size, flags, height, width, linear, depth, mips = fields[:8]
     pf_size, pf_flags, fourcc = fields[19:22]
-    caps = fields[26]
+    caps = fields[27]  # dwCaps; fields[22:27] are the pixel format's bit count and masks
     if magic != DDS_MAGIC or size != DDS_HEADER_SIZE or pf_size != DDS_PIXELFORMAT_SIZE:
         raise ValueError("not a DDS file (bad magic or header size)")
     if not pf_flags & DDPF_FOURCC or fourcc not in _FORMAT_OF_FOURCC:

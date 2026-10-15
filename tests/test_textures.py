@@ -195,6 +195,7 @@ def test_dds_header_fields_and_mip_chain(fmt, fourcc, block):
     expected = sum(max(1, (s + 3) // 4) ** 2 * block for s in sides)
     assert len(data) == 128 + expected
     info = tx.read_dds_info(data)
+    assert info.caps == DDSCAPS_TEXTURE | DDSCAPS_COMPLEX | DDSCAPS_MIPMAP
     assert [(lv.width, lv.height) for lv in info.levels] == [(s, s) for s in sides]
     assert info.levels[-1].size == block and info.levels[-2].size == block
     assert info.format == fmt
@@ -279,6 +280,7 @@ def test_dds_size_rules():
     h = parse_header(data)
     assert (h["width"], h["height"], h["mips"]) == (20, 12, 1)
     assert h["caps"] == DDSCAPS_TEXTURE  # no COMPLEX/MIPMAP for a single surface
+    assert tx.read_dds_info(data).caps == DDSCAPS_TEXTURE
     assert len(data) == 128 + 5 * 3 * 8
     assert Image.open(io.BytesIO(data)).size == (20, 12)
 

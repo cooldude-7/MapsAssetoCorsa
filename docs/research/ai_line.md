@@ -322,7 +322,7 @@ This is the best manual fix-up path: generate, then nudge bad corners in the AI 
 | Field | Required? | Source |
 |---|---|---|
 | version=7, N, extraCount=N, layout | **Mandatory**. Readers throw on mismatch. | VERIFIED |
-| positions | **Mandatory**, on the road surface (y = road height + ~0; CSP raycasts down for metadata, and `SAFE_NORMALS_RAYCASTING` exists because "no physical surface below" crashes). | VERIFIED + ASSUMED |
+| positions | **Mandatory**, about 0.5 m above the road surface (y = road height + 0.5, `AI_HEIGHT_OFFSET_M`), with road under every point. OBSERVED: the game-recorded sepang `fast_lane.ai` and `pit_lane.ai` sit 0.46–0.49 m (median 0.47) above that track's road meshes. CSP's Traffic Planner exports splines with a default vertical offset of 0.5 m (`EditorTabLanes.lua`), and CSP's AI Spline Editor snaps at 0.3 m by default. CSP raycasts down for metadata, and `SAFE_NORMALS_RAYCASTING` exists because "no physical surface below" crashes. A line exactly on the road mesh is coplanar with it, so don't put it there. | OBSERVED + VERIFIED + ASSUMED |
 | cumulative length, id | Write them properly (trivial). | VERIFIED layout |
 | sides | **Write them.** The AI needs width. The game may derive them from `IS_VALID_TRACK` surfaces only when recording/baking. | COMMUNITY |
 | radius | **Write it.** AssettoServer traffic speed = sqrt(g·μ·R); 0 → stop. | VERIFIED |
@@ -364,7 +364,7 @@ Lateral offset α_i along n_i, with p_i = c_i + α_i n_i (2D, XZ plane).
    For open (A→B) roads, fix α at both ends to 0 (or to the start-grid offset). For loops, use wrap-around differences.
 3. Re-linearise. Recompute the normals of the new line? No: keep the reference normals and re-solve 2–3 times (the TUMFTM approach iterates as well).
 4. Optional blend: α = 0.7·α_mincurv on public roads (less aggressive cutting), or full on wide roads.
-5. Smooth the result, resample at uniform Δs, recompute the 3D height from the road surface (not the centreline height). On a banked or crowned road, lateral offset changes y.
+5. Smooth the result, resample at uniform Δs, recompute the 3D height from the road surface (not the centreline height), then add the 0.5 m spline height (§4.2). On a banked or crowned road, lateral offset changes y.
 
 **Reference implementation:** TUMFTM `trajectory_planning_helpers.opt_min_curv(reftrack[x,y,w_tr_right,w_tr_left], normvectors, A, kappa_bound, w_veh, closed=True|False, psi_s, psi_e, fix_s, fix_e)`. It's a QP via `quadprog` that "can be used for closed and unclosed tracks… for unclosed tracks the heading psi_s and psi_e is enforced". **VERIFIED** (docstring). LGPL-3.0, `pip install trajectory-planning-helpers`; deps numpy/scipy/quadprog/matplotlib.
 - Wrapper project: TUMFTM/global_racetrajectory_optimization (LGPL-3.0). Also offers shortest-path, min-time (CasADi) and iterative min-curvature.

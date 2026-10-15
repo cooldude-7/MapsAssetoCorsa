@@ -500,6 +500,23 @@ def test_grade_on_a_ramp() -> None:
     assert np.allclose(line.forward[:, 1], 0.05 / math.hypot(1, 0.05), rtol=1e-4)
 
 
+@pytest.mark.parametrize("closed", [False, True])
+def test_line_is_lifted_above_the_road(closed: bool) -> None:
+    """Game-recorded lines sit ~0.47 m above the road (sepang); ours sit 0.5 m above it."""
+    pts = circle(40.0) if closed else hairpin(15.0)  # both on the y = 0 road surface
+    lifted = build_ai_line(pts, 4.0, 4.0, closed=closed, with_grid=True)
+    flat = build_ai_line(pts, 4.0, 4.0, closed=closed, with_grid=True, height_offset_m=0.0)
+    assert ai.AI_HEIGHT_OFFSET_M == 0.5
+    assert np.all(lifted.positions[:, 1] == 0.5)
+    assert np.all(flat.positions[:, 1] == 0.0)
+    # A constant vertical lift changes nothing but y: same x/z, payload, lengths and grid.
+    assert np.array_equal(lifted.positions[:, [0, 2]], flat.positions[:, [0, 2]])
+    for name in ("lengths", "ids", *ai.PAYLOAD_FIELDS):
+        assert np.array_equal(getattr(lifted, name), getattr(flat, name)), name
+    assert isinstance(lifted.grid, AiGrid) and isinstance(flat.grid, AiGrid)
+    assert lifted.grid.to_bytes() == flat.grid.to_bytes()
+
+
 def test_banked_circle_is_faster() -> None:
     radius, bank = 50.0, math.radians(10.0)
     pts = circle(radius)

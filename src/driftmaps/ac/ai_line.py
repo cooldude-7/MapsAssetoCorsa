@@ -69,6 +69,8 @@ from pathlib import Path
 
 import numpy as np
 
+from driftmaps.ac.coords import WORLD_UP
+
 AI_VERSION = 7
 GRAVITY = 9.81
 
@@ -112,6 +114,13 @@ MIN_TARGET_SPEED_MPS = 1.0
 # CdA ~ 0.65 m^2, m ~ 1300 kg). Only used to derive cruise throttle. ASSUMED.
 DRAG_DECEL_PER_V2 = 3.0e-4
 DEFAULT_MAX_SPEED_MPS = 220.0 / 3.6  # PLAN.md §5.5 / ai_line.md §5.4 top-speed cap.
+# Height of the spline above the road surface. OBSERVED: 0.47 m (median; 0.46-0.49) in the
+# sepang fast_lane.ai and pit_lane.ai, measured against that track's own road meshes. CSP's Traffic
+# Planner exports splines with a default vertical offset of 0.5 m (EditorTabLanes.lua); CSP's
+# AI Spline Editor snaps points 0.3 m above the surface by default. A line exactly on the road
+# mesh is coplanar with it, and CSP raycasts down from spline points while preparing the AI
+# spline ("no physical surface below an AI spline" is a known crash, SAFE_NORMALS_RAYCASTING).
+AI_HEIGHT_OFFSET_M = 0.5
 
 # Original AC lookup grid defaults. OBSERVED in one file.
 GRID_SAMPLING_DENSITY = 10.0
@@ -820,6 +829,7 @@ def build_ai_line(
     end_speed_mps: float | None = None,
     curvature_smoothing: int = 5,
     with_grid: bool = False,
+    height_offset_m: float = AI_HEIGHT_OFFSET_M,
 ) -> AiLine:
     """Turn a driving line into a complete AI line with every payload field filled.
 
@@ -828,6 +838,8 @@ def build_ai_line(
     distances from that line to the left/right road edges, scalar or per input point;
     `surface_normals` (M, 3) is the road normal under each point (default straight up). The
     line is resampled linearly at about `spacing` metres, so it should already be smooth.
+    `centreline` lies on the road surface; the written positions are lifted `height_offset_m`
+    straight up from it (AI_HEIGHT_OFFSET_M, like game-recorded lines; flat roads only at M0).
 
     `closed=True` makes a loop: the last point is not repeated and every windowed quantity and
     the speed profile wrap around. Open (A->B) lines treat their ends as ends;
@@ -869,6 +881,9 @@ def build_ai_line(
         ]
     )
     p, a = _resample(pts, attrs, spacing, closed)
+    # Constant lift above the road: every quantity below is a difference of positions (or a
+    # horizontal one), so curvature, grade, length, sides and the grid cells are unchanged.
+    p = p + height_offset_m * WORLD_UP
     n = p.shape[0]
     hw_left, hw_right = a[:, 0], a[:, 1]
     normal = _unit_rows(a[:, 2:5])
