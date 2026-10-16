@@ -32,6 +32,16 @@ as well) is live too (real router and elevation, fake build): A and B on Snake R
 move onto the road, at least two route options, each profile from A's height to B's, picking
 option 2 (list, [ and ], clicking its grey line) and building it, dragging the line to add a
 point, and a click far from any road that is refused. Screenshots: out/app_screens/options_*.png.
+
+The turn-by-turn scenario (`test_browser_turn_by_turn`, opt-in with DRIFTMAPS_E2E_TBT=1 as
+well) is live too (real road tiles, route-path and elevation, fake build): the roads load round
+Snake Road with the "Loading roads" chip, it clicks the road near the bottom, picks the uphill
+direction with the up key, takes turns with the arrow keys, undoes one with Backspace, clicks
+further along a road (through junctions), Shift+clicks to finish mid-road, finishes with Enter,
+checks the length and the climb, creates the map (automatic guardrails), then drives a loop
+round a block in Waterdown with right turns and Back to start, and reloads the page to check
+the route comes back. Screenshots: out/app_screens/tbt_*.png. The other browser tests use the
+Quick A to B mode (turn by turn is the page's default).
 """
 
 from __future__ import annotations
@@ -952,17 +962,22 @@ def test_browser_route_options(browser_page, tmp_path):
 # ---------------------------------------------------------------------------------------------
 
 TBT_VIEW = {"center": [-79.885, 43.31], "zoom": 15}  # Snake Road climbing the escarpment
+WATERDOWN_BLOCK = (-79.8875, 43.3335)  # Mill Street South, Union, Main and Griffin Streets
 
 
-def _key_for_turn(branches: list[list]) -> str:
-    """The arrow key for a real turn at a junction: right, else left, else straight on (the
-    page's keyBranches rules; branches are [name, angle, allowed])."""
-    ok = [b for b in branches if b[2]]
-    if ok and (ok[-1][1] > 15 or len(ok) == 1):
-        return "ArrowRight"
-    if ok and ok[0][1] < -15:
-        return "ArrowLeft"
-    return "ArrowUp"
+KEY_NAMES = {"←": "ArrowLeft", "↑": "ArrowUp", "→": "ArrowRight"}
+
+
+def _key_for_turn(branches: list[dict]) -> str | None:
+    """The key (as its arrow shows it) for a real turn at a junction: onto a proper road (not
+    a driveway or a dead end), a turn rather than straight on if there is one."""
+    good = [
+        b
+        for b in branches
+        if b["allowed"] and b["key"] and b["highway"] not in ("service", "track") and b["ends"] > 2
+    ]
+    good.sort(key=lambda b: abs(b["angle"]) < 20)  # turns first
+    return KEY_NAMES.get(good[0]["key"], good[0]["key"]) if good else None
 
 
 def test_browser_turn_by_turn(browser_page, tmp_path):
@@ -1010,12 +1025,16 @@ def test_browser_turn_by_turn(browser_page, tmp_path):
         page.wait_for_timeout(300)
         return page.evaluate(
             f"""() => {{ const s = {S}, t = {T};
-              const keys = document.querySelectorAll('.tbt-arrow .tbt-key');
+              const keys = [...document.querySelectorAll('.tbt-arrow')]
+                .map(a => a.querySelector('.tbt-key'));
               return {{phase: t.phase(), path: t.path(),
                 legs: s.tbt.legs.map(l => [l.kind, l.name]),
-                branches: t.branches().map(b => [b.name, b.angle, b.allowed]),
+                branches: t.branches().map((b, i) => ({{name: b.name, angle: b.angle,
+                  allowed: b.allowed, highway: s.tbt.g.ways.get(b.way).highway,
+                  ends: (s.tbt.g.adj.get(b.run[b.run.length - 1]) || []).length,
+                  key: (keys[i] || {{}}).textContent || ''}})),
                 markers: document.querySelectorAll('.tbt-arrow').length,
-                keys: [...keys].map(e => e.textContent), line: t.line(), route: s.route,
+                keys: keys.map(e => e ? e.textContent : ''), line: t.line(), route: s.route,
                 error: s.routeError, loopPath: !!t.loopPath()}}; }}"""
         )
 
@@ -1088,19 +1107,20 @@ def test_browser_turn_by_turn(browser_page, tmp_path):
         assert st["error"] == "" and st["route"]["names"][0] == "Snake Road"
         shot("05_first_junction")
 
-        # Straight on up Snake Road (past the driveways), then two real turns.
+        # Straight on up Snake Road (past the driveways), then up to three real turns.
         st = press("ArrowUp")
         assert len(st["legs"]) == 2 and st["legs"][1][1] == "Snake Road", st
         keys = []
         paths = [st["path"]]
-        for _ in range(2):
-            if not any(b[2] for b in st["branches"]):
+        for _ in range(3):
+            key = _key_for_turn(st["branches"])
+            if key is None:
                 break
-            keys.append(_key_for_turn(st["branches"]))
-            st = press(keys[-1])
+            keys.append(key)
+            st = press(key)
             paths.append(st["path"])
             shot(f"06_turn_{len(keys)}")
-        assert len(keys) >= 1 and len(st["legs"]) == 2 + len(keys), (keys, st["legs"])
+        assert len(keys) >= 2 and len(st["legs"]) == 2 + len(keys), (keys, st["legs"])
         assert st["error"] == "", st["error"]
         assert not st["loopPath"]
         assert "Drive back to A" in page.text_content("#tbt-loop-hint")
@@ -1111,7 +1131,35 @@ def test_browser_turn_by_turn(browser_page, tmp_path):
         assert st["path"] == paths[-2] and len(st["legs"]) == 1 + len(keys), st["legs"]
         shot("07_undone")
 
-        # Finish at this junction (Enter): B goes there, the arrows go away.
+        # Clicking further along a road you can turn onto drives there (through junctions).
+        target = page.evaluate(
+            f"""() => {{ const ok = {T}.branches().filter(b => b.allowed);
+              const b = ok.find(b => b.run.length > 1) || ok[0];
+              const c = b.coords, i = Math.max(1, Math.floor(c.length * 0.7));
+              return [(c[i - 1][0] + c[i][0]) / 2, (c[i - 1][1] + c[i][1]) / 2]; }}"""
+        )
+        legs_before = len(st["legs"])
+        page.mouse.move(*screen(*target))
+        page.wait_for_timeout(300)
+        shot("08_hover_ahead")
+        page.mouse.click(*screen(*target))
+        page.wait_for_timeout(300)
+        st = settled()
+        assert len(st["legs"]) == legs_before + 1 and st["phase"] == "drive", st["legs"]
+        # Shift+click on that stretch: finish right there, mid-road (B where you clicked).
+        page.keyboard.down("Shift")
+        page.mouse.click(*screen(*target))
+        page.keyboard.up("Shift")
+        page.wait_for_timeout(300)
+        st = settled()
+        assert st["phase"] == "done" and 0 < page.evaluate(f"() => {S}.tbt.end.t") < 1
+        assert st["line"][-1] == pytest.approx(target, abs=2e-4)
+        idle()
+        shot("09_finished_mid_road")
+        # Backspace twice (the finish, the click), then finish at the junction with Enter.
+        press("Backspace")
+        st = press("Backspace")
+        assert st["path"] == paths[-2] and st["phase"] == "drive"
         st = press("Enter")
         assert st["phase"] == "done" and st["markers"] == 0, st
         route = st["route"]
@@ -1130,7 +1178,7 @@ def test_browser_turn_by_turn(browser_page, tmp_path):
         assert page.text_content("#profile-stats").startswith("Climb ")
         assert page.text_content("#route-length") != "–"
         idle()
-        shot("08_finished")
+        shot("10_finished")
 
         # Create map: the route as driven, automatic guardrails by default.
         page.click("#more-options summary")
@@ -1144,12 +1192,82 @@ def test_browser_turn_by_turn(browser_page, tmp_path):
             timeout=300_000,
         )
         page.wait_for_timeout(500)
-        shot("09_created")
+        shot("11_created")
         assert page.get_attribute("#job", "data-state") == "done", page.text_content("#job")
         ((built_route, options),) = built
         assert options.auto_guardrails is True and options.guardrails is True
         assert built_route.length_m == pytest.approx(route["length_m"], abs=1.0)
         assert is_driftmaps_track(ac / "content" / "tracks" / "dm_snake_road_turn_by_turn_test")
+
+        # A loop round a block in downtown Waterdown: start on Mill Street South heading south
+        # and keep turning right until the route is back on A's road, then Back to start.
+        page.click("#btn-clear")
+        assert page.evaluate(f"() => {T}.phase()") == "start"
+        page.evaluate("(c) => window.acmg.map.jumpTo({center: c, zoom: 16})", list(WATERDOWN_BLOCK))
+        page.wait_for_timeout(500)
+        settled()
+        idle()
+        start = page.evaluate(
+            f"""(c) => {{ const g = {S}.tbt.g; let best = null;
+              for (const w of g.ways.values()) {{
+                if (w.name !== 'Mill Street South') continue;
+                for (let i = 1; i < w.nodes.length; i++) {{
+                  const a = g.nodes.get(w.nodes[i - 1]), b = g.nodes.get(w.nodes[i]);
+                  if (!a || !b) continue;
+                  const p = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+                  const d = Math.hypot(p[0] - c[0], p[1] - c[1]);
+                  if (!best || d < best.d) best = {{d, p}};
+                }}
+              }}
+              return best && best.p; }}""",
+            list(WATERDOWN_BLOCK),
+        )
+        page.mouse.click(*screen(*start))
+        st = settled()
+        assert st["phase"] == "direction", st
+        st = press("ArrowDown")
+        assert page.text_content("#tbt-loop-hint").startswith("Drive back to A")
+        for _ in range(8):
+            if st["loopPath"]:
+                break
+            st = press("ArrowRight")
+        assert st["loopPath"], st["legs"]
+        assert page.is_enabled("#tbt-loop")
+        assert "Back to start closes the loop" in page.text_content("#tbt-loop-hint")
+        shot("12_back_on_A_road")
+        page.click("#tbt-loop")
+        page.wait_for_timeout(300)
+        st = settled()
+        assert st["phase"] == "done" and st["route"]["loop"] is True, st
+        assert st["legs"][-1][0] == "close"
+        assert page.text_content("#route-length-label") == "Lap length"
+        assert 300 < st["route"]["length_m"] < 1500, st["route"]["length_m"]
+        assert st["line"][0] == pytest.approx(st["line"][-1], abs=1e-6)  # closed at A
+        idle()
+        shot("13_loop_closed")
+
+        # A reload keeps the route: it is saved in the browser and put back once its roads are
+        # loaded again (the view opens on Snake Road, away from it).
+        path_before = st["path"]
+        page.reload()
+        page.wait_for_function("() => window.acmg && window.acmg.state.mapReady", timeout=60_000)
+        page.wait_for_function(f"() => {T}.phase() === 'done'", timeout=300_000)
+        st = settled()
+        assert st["path"] == path_before and st["route"]["loop"] is True
+        assert page.text_content("#route-length-label") == "Lap length"
+        page.click("#btn-fit")
+        idle()
+        shot("14_after_reload")
+        # Back to start again opens the loop (even with no undo history after the reload),
+        # and a third press closes it again.
+        page.click("#tbt-loop")
+        page.wait_for_timeout(300)
+        st = settled()
+        assert st["phase"] == "drive" and st["loopPath"] and st["legs"][-1][0] != "close"
+        page.click("#tbt-loop")
+        page.wait_for_timeout(300)
+        st = settled()
+        assert st["phase"] == "done" and st["path"] == path_before and st["route"]["loop"]
         assert problems == []
     finally:
         try:

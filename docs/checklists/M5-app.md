@@ -143,8 +143,11 @@ Tips for picking the road:
 - **Search:** type the road name. If road + town finds nothing, try the road name alone,
   because OpenStreetMap often files a road under a neighbouring town. You can also type
   coordinates like `43.30, -79.88`.
-- **Zoom in** before you click, so the points land on the road itself.
-- In **Quick A to B**:
+- **Zoom in** before you click, so you click the road itself.
+- The grey chips under the length list the roads the route uses: a quick check that it's the
+  road you meant.
+
+In **Quick A to B**:
 - **Points are lettered in the order you click them:** A is the start, each click adds the next
   letter at the end, and on an A to B road the last letter is the finish.
 - **Wrong way?** If the blue line takes a different road than you want, **Shift+click** on the
@@ -152,8 +155,6 @@ Tips for picking the road:
   You can also drag any point.
 - **Undo** (Ctrl+Z) and **Clear** (top of the panel) fix mistakes. Right-click a point to
   remove it. **Drive it the other way** is under **More options**.
-- The grey chips under the length list the roads the route uses: a quick check that it's the
-  road you meant.
 
 For each road, check:
 

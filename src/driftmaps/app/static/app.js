@@ -41,6 +41,7 @@ const STORE_KEYS = {
   job: "acmg.job",
   options: "acmg.options",
   mode: "acmg.mode",
+  tbt: "acmg.tbt",
 };
 const EMPTY_FC = { type: "FeatureCollection", features: [] };
 const EARTH_RADIUS_M = 6371008.8;
@@ -2084,6 +2085,7 @@ function tbtNew() {
     lastMouse: null,
     errorShown: 0,
     retried: false,
+    saved: null, // the route saved in the browser, waiting for its roads (see tbtTryRestore)
   };
 }
 
@@ -2148,9 +2150,27 @@ function tbtRestore(snap) {
 
 function tbtUndo() {
   const snap = state.tbt.history.pop();
-  if (!snap) return;
-  tbtRestore(snap);
+  if (snap) tbtRestore(snap);
+  else if (!tbtStepBack()) return;
   tbtChanged({ keepView: true });
+}
+
+/** Undo with no history (a route put back after a reload): one step back along the route. */
+function tbtStepBack() {
+  const t = state.tbt;
+  if (t.end) {
+    const last = t.legs[t.legs.length - 1];
+    if (t.end.loop && t.legs.length > 1 && last.kind === "close") t.legs.pop();
+    t.end = null;
+    tbtSettle(); // a finish mid-road drives on to the junction again
+  } else if (t.legs.length) {
+    t.legs.pop();
+  } else if (t.start) {
+    t.start = null;
+  } else {
+    return false;
+  }
+  return true;
 }
 
 function tbtClear() {
@@ -2280,9 +2300,13 @@ function tbtLoopPath() {
 }
 
 function tbtCloseLoop() {
+  const t = state.tbt;
+  if (t.end && t.end.loop) {
+    tbtUndo(); // pressed again: open the loop (closing it was the last change)
+    return;
+  }
   const closed = tbtLoopPath();
   if (!closed) return;
-  const t = state.tbt;
   const path = tbtPath();
   tbtPush();
   if (closed.length > path.length) {
@@ -2644,7 +2668,7 @@ function tbtKeepTipInView() {
   if (!p) return;
   const q = map.project(p);
   const c = map.getCanvas();
-  const pad = 90;
+  const pad = t.legs.length ? 90 : 120; // room for the arrows round the start point
   if (q.x < pad || q.y < pad || q.x > c.clientWidth - pad || q.y > c.clientHeight - pad) map.easeTo({ center: p, duration: 450 });
 }
 
@@ -2678,7 +2702,9 @@ function tbtRender() {
   const phase = tbtPhase();
   const zoomedOut = !state.map || state.map.getZoom() < ROADS_MIN_ZOOM;
   let hint;
-  if (phase === "start") {
+  if (phase === "start" && t.saved) {
+    hint = "Loading your route…";
+  } else if (phase === "start") {
     hint = zoomedOut
       ? "Zoom in on the map to where you want to drive, then click the road you start on."
       : "Click the road you want to start on.";
@@ -2686,8 +2712,13 @@ function tbtRender() {
     hint = "Which way? Click an arrow on the map, or press the arrow key that points that way.";
   } else if (phase === "drive") {
     const brs = tbtBranches();
-    if (!tbtIsLoaded(tbtTip())) hint = "Loading the roads ahead…";
-    else if (!brs.some((b) => b.allowed)) hint = "Dead end: there's no road you may take from here. Finish here, or press Backspace.";
+    const tip = t.g.nodes.get(tbtTip());
+    if (!tbtIsLoaded(tbtTip())) {
+      hint =
+        tip && t.tiles.get(tileKeyAt(tip[0], tip[1])) === "error"
+          ? "Couldn't load the roads ahead: the map servers are busy. Move the map a little to try again, or Finish here."
+          : "Loading the roads ahead…";
+    } else if (!brs.some((b) => b.allowed)) hint = "Dead end: there's no road you may take from here. Finish here, or press Backspace.";
     else hint = "Pick the next road: click an arrow, press ← ↑ →, or click further along a road to drive straight through junctions.";
   } else {
     hint = t.end.loop
@@ -2759,9 +2790,9 @@ function tbtRender() {
   const closed = !!(t.end && t.end.loop);
   $("tbt-finish").disabled = phase !== "drive";
   const loopBtn = $("tbt-loop");
-  loopBtn.disabled = !loopPath;
+  loopBtn.disabled = !loopPath && !closed;
   loopBtn.setAttribute("aria-pressed", String(closed));
-  loopBtn.title = loopPath ? "Close the loop back to A" : closed ? "The loop is closed" : "Drive back to A's road first";
+  loopBtn.title = loopPath ? "Close the loop back to A" : closed ? "Open the loop again" : "Drive back to A's road first";
   const loopHint = $("tbt-loop-hint");
   loopHint.textContent =
     phase !== "drive" ? "" : loopPath ? "You're back on A's road: Back to start closes the loop." : "Drive back to A to close the loop.";
@@ -2775,7 +2806,7 @@ function tbtWantTiles() {
   const t = state.tbt;
   const map = state.map;
   if (!t || !map || state.mode !== "tbt") return;
-  const want = [];
+  const want = t.saved ? t.saved.tiles.slice() : [];
   const tip = !t.end && t.legs.length ? t.g.nodes.get(tbtTip()) : null;
   if (tip) want.push(...tilesForBounds(tip[0], tip[1], tip[0], tip[1], 1));
   const z = map.getZoom();
@@ -2831,7 +2862,9 @@ async function tbtPump() {
     toast(problem, "error");
   }
   if (state.mode === "tbt") {
-    if (tbtSettle()) tbtChanged();
+    if (tbtTryRestore()) {
+      /* drawn by tbtChanged */
+    } else if (tbtSettle()) tbtChanged();
     else {
       tbtRender();
       tbtRenderMap();
@@ -2874,8 +2907,62 @@ function tbtRenderChip() {
 
 /* -- the route: POST /api/route-path for the path as it stands ----------------------------- */
 
+/** The route is kept in the browser, so a reload (or an app restart) doesn't lose it. */
+function tbtSave() {
+  const t = state.tbt;
+  if (!t.start) {
+    if (!t.saved) store.remove(STORE_KEYS.tbt);
+    return;
+  }
+  const keys = new Set([tileKeyAt(t.start.point[0], t.start.point[1])]);
+  for (const id of tbtPath()) {
+    const p = t.g.nodes.get(id);
+    if (p) keys.add(tileKeyAt(p[0], p[1]));
+  }
+  store.set(STORE_KEYS.tbt, { start: t.start, legs: t.legs, end: t.end, tiles: [...keys].slice(0, 400) });
+}
+
+/** At boot: load the saved route's tiles first; restored once they are in (see tbtTryRestore). */
+function tbtLoadSaved() {
+  const saved = store.get(STORE_KEYS.tbt);
+  const t = state.tbt;
+  if (!saved || !saved.start || !Array.isArray(saved.legs) || !Array.isArray(saved.tiles)) return;
+  if (!isLngLat(saved.start.point) || !saved.legs.every((l) => l && Array.isArray(l.nodes))) return;
+  t.saved = saved;
+}
+
+/** Put the saved route back when its roads are loaded and it still follows them. */
+function tbtTryRestore() {
+  const t = state.tbt;
+  const saved = t.saved;
+  if (!saved) return false;
+  if (t.start) {
+    t.saved = null; // you started another route meanwhile
+    return false;
+  }
+  const states = saved.tiles.map((k) => t.tiles.get(k));
+  if (states.some((st) => st !== "ok" && st !== "error")) return false; // still loading
+  t.saved = null;
+  const path = [];
+  for (const leg of saved.legs) path.push(...leg.nodes.map(String));
+  const s0 = saved.start;
+  const joined = (a, b) => (t.g.adj.get(a) || []).some((e) => e.to === b);
+  const ok =
+    states.every((st) => st === "ok") &&
+    joined(String(s0.a), String(s0.b)) &&
+    path.every((id, i) => i === 0 || joined(path[i - 1], id));
+  if (!ok) {
+    store.remove(STORE_KEYS.tbt);
+    return false;
+  }
+  tbtRestore(JSON.parse(JSON.stringify({ start: s0, legs: saved.legs, end: saved.end || null })));
+  tbtChanged({ keepView: true });
+  return true;
+}
+
 function tbtChanged(opts = {}) {
   const t = state.tbt;
+  tbtSave();
   t.hoverPlan = null;
   t.hot = -1;
   t.retried = false;
@@ -3046,7 +3133,7 @@ function renderHeadTools() {
   const tbt = state.mode === "tbt";
   const undoBtn = $("btn-undo");
   const clearBtn = $("btn-clear");
-  undoBtn.disabled = tbt ? !state.tbt.history.length : state.history.length === 0;
+  undoBtn.disabled = tbt ? !state.tbt.history.length && !state.tbt.start : state.history.length === 0;
   undoBtn.title = tbt ? "Undo the last turn (Backspace)" : "Undo (Ctrl+Z)";
   clearBtn.disabled = tbt ? !state.tbt.start : state.pins.length === 0;
   clearBtn.title = tbt ? "Start again" : "Remove all points";
@@ -3935,6 +4022,7 @@ function boot() {
     tbt: Object.freeze({ phase: tbtPhase, branches: tbtBranches, path: tbtPath, line: tbtLine, loopPath: tbtLoopPath }),
   });
   state.tbt = tbtNew();
+  tbtLoadSaved();
   state.mode = store.get(STORE_KEYS.mode) === "quick" ? "quick" : "tbt";
   setMapStyle(initialStyleKey());
   bindUi();
