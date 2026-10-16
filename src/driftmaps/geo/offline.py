@@ -774,6 +774,108 @@ def build_db(
     return BuildStats(out, counts, time.monotonic() - t0, out.stat().st_size, osm_base)
 
 
+PROGRESS_EVERY_S = 0.25  # build_db_isolated: progress messages from the child at most this often
+
+
+def _build_child(kwargs: dict, messages, stop) -> None:
+    """Body of `build_db_isolated`'s child process: `build_db`, its outcome sent as a message."""
+    last = [0.0, ""]
+
+    def progress(f: float, text: str) -> None:
+        now = time.monotonic()
+        if text != last[1] or now - last[0] >= PROGRESS_EVERY_S:
+            last[0], last[1] = now, text
+            messages.put(("progress", f, text))
+
+    try:
+        stats = build_db(**kwargs, progress=progress, cancel=stop)
+    except BuildCancelled:
+        messages.put(("cancelled",))
+    except BaseException as exc:  # noqa: BLE001 - reported to the parent
+        messages.put(("error", f"{type(exc).__name__}: {exc}"))
+    else:
+        messages.put(("done", stats))
+
+
+def build_db_isolated(
+    source: Path | str,
+    out: Path | str,
+    *,
+    region: str,
+    poly: shapely.Geometry | str | None = None,
+    source_name: str = "",
+    progress: ProgressFn | None = None,
+    cancel: threading.Event | None = None,
+) -> BuildStats:
+    """`build_db` in a child process, with the same progress, cancel and result.
+
+    libosmium never closes the file behind a file-based node index (its `create_map` opens it and
+    the map only maps it) and Windows can't delete an open file, so in this process the ~2 GB
+    `.nodes` file would stay on disk until the app quits. The child's handles go with it. The
+    child writes `<out>.new`; this process swaps it in, closing its own open copy of `out` first
+    (another process can't, and Windows can't replace an open file).
+    """
+    import multiprocessing
+    import queue
+
+    if not _REGION_RE.match(region):
+        raise ValueError(f"bad region name {region!r}")
+    out = Path(out)
+    new = out.with_name(out.name + ".new")
+    _remove(new)
+    ctx = multiprocessing.get_context("spawn")  # Windows' only kind; the same everywhere
+    messages = ctx.Queue()
+    stop = ctx.Event()
+    kwargs = {"source": str(source), "out": str(new), "region": region, "poly": poly,
+              "source_name": source_name}  # fmt: skip
+    child = ctx.Process(
+        target=_build_child, args=(kwargs, messages, stop), name="offline-roads", daemon=True
+    )
+    child.start()
+    stats: BuildStats | None = None
+    try:
+        while True:
+            if cancel is not None and cancel.is_set():
+                stop.set()
+            try:
+                msg = messages.get(timeout=0.2)
+            except queue.Empty:
+                if child.is_alive():
+                    continue
+                try:  # it ended: its last message may still be on the way
+                    msg = messages.get(timeout=2.0)
+                except queue.Empty:
+                    raise RuntimeError(
+                        f"processing the roads stopped unexpectedly (exit code {child.exitcode})"
+                    ) from None
+            if msg[0] == "progress":
+                if progress is not None:
+                    progress(msg[1], msg[2])
+            elif msg[0] == "done":
+                stats = msg[1]
+                break
+            elif msg[0] == "cancelled":
+                raise BuildCancelled()
+            else:
+                raise RuntimeError(msg[1])
+    finally:
+        stop.set()
+        child.join(timeout=60)
+        if child.is_alive():
+            child.terminate()
+            child.join(timeout=10)
+        messages.close()
+        _remove(new.with_name(new.name + ".nodes"))  # closed now that the child is gone
+        _remove(new.with_name(new.name + ".building"))  # only left by a killed child
+        if stats is None:
+            _remove(new)
+    with exclusive():
+        release(out)
+        os.replace(new, out)
+    stats.path = out
+    return stats
+
+
 # ---------------------------------------------------------------------------------------------
 # Reading
 # ---------------------------------------------------------------------------------------------

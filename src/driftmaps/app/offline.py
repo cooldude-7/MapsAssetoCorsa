@@ -414,7 +414,7 @@ class OfflineManager:
             shutil.copyfile(poly_file, poly_path)
         poly = poly_path.read_text(encoding="utf-8") if poly_path.is_file() else None
         report("processing", 0.0, "Processing roads")
-        stats = region_db.build_db(
+        stats = region_db.build_db_isolated(
             source_file,
             region_db.db_path(region, self.dir),
             region=region,

@@ -164,6 +164,25 @@ def test_build_falls_back_to_the_memory_index(region, tmp_path, monkeypatch, cap
     assert sorted(p.name for p in tmp_path.iterdir()) == ["m.sqlite"]  # no temp files left
 
 
+def test_isolated_build_runs_in_a_child_and_swaps_the_file_in_here(region, tmp_path, monkeypatch):
+    real_release, released = offline.release, []
+    monkeypatch.setattr(offline, "release", lambda p: released.append(p) or real_release(p))
+    out, steps = tmp_path / "iso.sqlite", []
+    stats = offline.build_db_isolated(
+        region["pbf"], out, region="iso", poly=POLY, progress=lambda f, t: steps.append((f, t))
+    )
+    assert stats.path == out and stats.counts == region["stats"].counts
+    assert steps[-1] == (1.0, "Ready") and released == [out]  # this process closed its copy
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["iso.sqlite"]  # no .nodes or .new
+    stop = threading.Event()
+    stop.set()
+    with pytest.raises(offline.BuildCancelled):
+        offline.build_db_isolated(region["osm"], tmp_path / "c.sqlite", region="c", cancel=stop)
+    with pytest.raises(RuntimeError, match="FileNotFoundError"):
+        offline.build_db_isolated(tmp_path / "none.osm", tmp_path / "e.sqlite", region="e")
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["iso.sqlite"]
+
+
 def test_parse_poly_reads_outer_rings_and_holes():
     text = "r\n1\n 0 0\n 10 0\n 10 10\n 0 10\n 0 0\nEND\n!2\n 4 4\n 6 4\n 6 6\n 4 6\nEND\nEND\n"
     geom = offline.parse_poly(text)

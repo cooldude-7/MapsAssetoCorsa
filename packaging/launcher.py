@@ -15,6 +15,7 @@ over HTTPS. Built by packaging/acmg.spec; also runs unfrozen: `uv run python pac
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import os
 import sys
 import tempfile
@@ -249,18 +250,24 @@ _SELFTEST_POLY = "t\n1\n -80.5 43.5\n -79.5 43.5\n -79.5 44.1\n -80.5 44.1\nEND\
 
 
 def _check_osmium() -> str:
-    """pyosmium reads an OSM file and the offline road database answers a tile from it."""
+    """pyosmium reads an OSM file and the offline road database answers a tile from it, built
+    in a child process as the app does (multiprocessing in the frozen app; the temporary
+    directory can only be removed if the child took its node-index file handle with it)."""
     from pathlib import Path
 
     import osmium.version
 
     from driftmaps.app.tiles import tile_xy
-    from driftmaps.geo.offline import OfflineDB, build_db
+    from driftmaps.geo.offline import OfflineDB, build_db_isolated
 
     with tempfile.TemporaryDirectory(prefix="acmg-selftest-") as tmp:
         src = Path(tmp) / "t.osm"
         src.write_text(_SELFTEST_OSM, encoding="utf-8")
-        stats = build_db(src, Path(tmp) / "t.sqlite", region="selftest", poly=_SELFTEST_POLY)
+        out = Path(tmp) / "t.sqlite"
+        stats = build_db_isolated(src, out, region="selftest", poly=_SELFTEST_POLY)
+        left = sorted(p.name for p in Path(tmp).iterdir() if p.name not in ("t.osm", out.name))
+        if left:
+            raise RuntimeError(f"the offline road build left files behind: {left}")
         db = OfflineDB(stats.path)
         try:
             ways, complete = db.tile_ways(*tile_xy(43.8043, -79.9919))
@@ -386,4 +393,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()  # the offline road build runs in a child process
     sys.exit(main())
