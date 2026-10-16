@@ -158,9 +158,16 @@ from driftmaps.geo.buildings import (
     fetch_buildings,
     fetch_ms_buildings,
 )
-from driftmaps.geo.overpass import OSM_ATTRIBUTION, OverpassError
+from driftmaps.geo.overpass import (
+    OSM_ATTRIBUTION,
+    NetworkData,
+    OverpassError,
+    default_cache_dir,
+    fetch_network,
+    load_cached,
+)
 from driftmaps.geo.project import LocalProjection
-from driftmaps.geo.router import Route
+from driftmaps.geo.router import Continuation, Route, route_continuations
 from driftmaps.geometry.barriers import (
     ScenePiece,
     barrier_pieces,
@@ -184,6 +191,16 @@ from driftmaps.geometry.buildings import (
     building_scene,
     place_buildings,
 )
+from driftmaps.geometry.network import (
+    MATERIALS as NETWORK_MATERIALS,
+)
+from driftmaps.geometry.network import (
+    NetNode,
+    NetWay,
+    NetworkOptions,
+    RoadNetwork,
+    build_network,
+)
 from driftmaps.geometry.primitives import MeshData, split
 from driftmaps.geometry.road import (
     RoadMeshes,
@@ -196,8 +213,11 @@ from driftmaps.geometry.road import (
     simplify,
     smooth_centreline,
 )
+from driftmaps.geometry.roundabouts import pavers_texture
+from driftmaps.geometry.street_items import StreetItem
 from driftmaps.geometry.terrain import (
     Terrain,
+    TerrainExtra,
     TerrainOptions,
     build_terrain,
     clamp_heights,
@@ -369,6 +389,13 @@ class BuildOptions:
     osm_barriers: Sequence[OsmBarrier] | None = None
     roadside_features: RoadsideFeatures | None = None  # water, rock, driveways (warrants)
     building_footprints: Sequence[Footprint] | None = None
+    # The road network (geometry.network): side roads, junctions, roundabouts, driveways and
+    # cul-de-sacs within `network_options.radius_m`; `real_run_ends`: the run-up and run-off
+    # follow the real roads beyond A and B. `osm_network`: the OSM data (None: fetched).
+    network: bool = True
+    real_run_ends: bool = True
+    network_options: NetworkOptions = field(default_factory=NetworkOptions)
+    osm_network: NetworkData | None = None
     # Called at each major step with a short plain-English step name and the overall progress
     # (0..1), e.g. for the local app's progress bar. None: no reports.
     progress: Callable[[str, float], None] | None = field(default=None, repr=False)
@@ -627,8 +654,54 @@ def _pad_mask(mask: np.ndarray, s: np.ndarray, pad_m: float) -> np.ndarray:
     return np.minimum(before, after) <= pad_m
 
 
-def prepare_geometry(route: Route, options: BuildOptions) -> TrackGeometry:
-    """Steps 2-3 of the pipeline: centreline, attributes per station and the height profile."""
+def run_up_length_m(options: BuildOptions) -> float:
+    """How far the road runs on behind A: `run_up_m`, or more to fit the grid and pits."""
+    return max(options.run_up_m, grid_length_m(options.pits) + GRID_TAIL_M)
+
+
+def _continued(
+    xz: np.ndarray,
+    param: np.ndarray,
+    proj: LocalProjection,
+    ends: tuple[Continuation | None, Continuation | None],
+    before_m: float,
+    after_m: float,
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """The OSM polyline with the real roads behind A and beyond B joined on (params below 0
+    before A, above the route length after B), and how much straight run-up and run-off is
+    still missing where the real road ended early."""
+    parts_xz, parts_p = [xz], [param]
+    missing = [before_m, after_m]
+    for k, cont in enumerate(ends):
+        if cont is None or len(cont.lonlat) < 2:
+            continue
+        en = proj.to_xy(cont.lonlat)
+        c = np.stack([en[:, 0], -en[:, 1]], axis=1)
+        c[0] = xz[0] if k == 0 else xz[-1]
+        d = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(c, axis=0), axis=1))])
+        keep = np.concatenate([[False], np.diff(d) > 1e-6])
+        c, d = c[keep], d[keep]
+        if not len(d):
+            continue
+        missing[k] = max(0.0, missing[k] - float(d[-1]))
+        if k == 0:
+            parts_xz.insert(0, c[::-1])
+            parts_p.insert(0, -d[::-1])
+        else:
+            parts_xz.append(c)
+            parts_p.append(param[-1] + d)
+    return np.concatenate(parts_xz), np.concatenate(parts_p), missing[0], missing[1]
+
+
+def prepare_geometry(
+    route: Route,
+    options: BuildOptions,
+    continuations: tuple[Continuation | None, Continuation | None] = (None, None),
+) -> TrackGeometry:
+    """Steps 2-3 of the pipeline: centreline, attributes per station and the height profile.
+
+    `continuations` (`geo.router.route_continuations`): the real roads behind A and beyond B;
+    the run-up and run-off follow them, and go on straight only where they end early."""
     pin_a = route.pins[0]
     proj = LocalProjection(pin_a.snap_lat, pin_a.snap_lon)
     nodes = route.polyline(step_m=1e9)
@@ -646,9 +719,10 @@ def prepare_geometry(route: Route, options: BuildOptions) -> TrackGeometry:
             cutoff_m=options.smoothing_cutoff_m,
         )
     else:
-        xz_f, p_f = fillet_corners(*simplify(xz, nodes.s, 0.3))
-        run_up = max(options.run_up_m, grid_length_m(options.pits) + GRID_TAIL_M)
-        xz_e, p_e = extend_straight(xz_f, p_f, run_up, options.run_off_m)
+        run_up = run_up_length_m(options)
+        xz_c, p_c, up, off = _continued(xz, nodes.s, proj, continuations, run_up, options.run_off_m)
+        xz_f, p_f = fillet_corners(*simplify(xz_c, p_c, 0.3))
+        xz_e, p_e = extend_straight(xz_f, p_f, up, off)
         xz_s, param = smooth_centreline(
             xz_e,
             p_e,
@@ -1009,6 +1083,7 @@ _IMAGES = {
     "wall_hidden": lambda: solid_texture((255, 0, 255), 16),
     "concrete": concrete_texture,  # bridges, parapets, jersey barriers, walls
     "steel": steel_texture,  # W-beam guardrails, steel bridge rails
+    "pavers": pavers_texture,  # roundabout truck aprons
 }
 
 
@@ -1060,6 +1135,9 @@ def _add_split(
     for p, piece in enumerate(pieces):
         scene.mesh(piece, name if len(pieces) == 1 else f"{name}_{p}", material, **flags)
         counts[key] = counts.get(key, 0) + piece.vertex_count
+
+
+_NETWORK_PREFIXES = tuple(sorted({prefix for prefix, *_ in NETWORK_MATERIALS.values()}))
 
 
 def _assemble_kn5(
@@ -1139,7 +1217,9 @@ def _assemble_kn5(
     extra: dict[str, object] = {"trees": TreeStats(), "buildings": BuildingStats()}
     if scenery is not None:
         for piece in scenery.pieces:
-            if piece.physical:
+            if piece.name.startswith(_NETWORK_PREFIXES):
+                key = "network"
+            elif piece.physical:
                 key = "scenery_collision"
             elif piece.name.startswith("bridge"):
                 key = "bridges"
@@ -1197,6 +1277,8 @@ class _Scenery:
     deck_intrusion_m: float = 0.0
     terrain_clamped: int = 0
     ground: Callable[[np.ndarray], np.ndarray] | None = field(default=None, repr=False)
+    network: RoadNetwork | None = field(default=None, repr=False)  # side roads, junctions ...
+    street_items: list[StreetItem] = field(default_factory=list)  # signs, mailboxes ...
 
 
 def _ground_fn(terrain: Terrain, road_height: Callable[[np.ndarray], np.ndarray]):
@@ -1217,6 +1299,90 @@ def _route_lonlat(geo: TrackGeometry, step: int = 5) -> np.ndarray:
     c = geo.model.centre[::step]
     lon, lat = geo.projection.to_lonlat(c[:, 0], -c[:, 2])
     return np.stack([np.asarray(lon), np.asarray(lat)], axis=1)
+
+
+# --------------------------------------------------------------------------------------------
+# The road network: side roads, junctions, roundabouts (geometry.network)
+# --------------------------------------------------------------------------------------------
+
+
+def _fetch_network(route: Route, options: BuildOptions) -> NetworkData | None:
+    """The OSM highways and tagged highway nodes around the route: `options.osm_network`, else
+    the region database / cache / Overpass, else the route's own cached routing corridor."""
+    if options.osm_network is not None:
+        return options.osm_network
+    try:
+        return fetch_network(
+            route.polyline(step_m=5.0).lonlat,
+            around_m=options.network_options.radius_m,
+            cache_dir=options.cache_dir,
+            offline=options.offline,
+        )
+    except _DATA_ERRORS as e:
+        reason = _short(e)
+    if route.cache_key:
+        cached = load_cached(Path(options.cache_dir or default_cache_dir()), route.cache_key)
+        if cached is not None:
+            return NetworkData(cached.ways, (), cached.osm_base, nodes_known=False)
+    warnings.warn(f"road network unavailable ({reason}); no side roads", stacklevel=2)
+    return None
+
+
+def _xz(projection: LocalProjection, lonlat: np.ndarray) -> np.ndarray:
+    en = projection.to_xy(np.asarray(lonlat, np.float64).reshape(-1, 2))
+    return np.stack([en[:, 0], -en[:, 1]], axis=1)
+
+
+def _network(
+    geo: TrackGeometry,
+    osm: NetworkData,
+    ends: tuple[Continuation | None, Continuation | None],
+    options: BuildOptions,
+) -> RoadNetwork:
+    """Side roads, junctions and roundabouts around the route (`geometry.network`)."""
+    proj = geo.projection
+    ways = [NetWay(w.id, w.nodes, _xz(proj, w.lonlat), w.tags) for w in osm.ways]
+    nodes = [NetNode(n.id, _xz(proj, np.array([n.lonlat]))[0], n.tags) for n in osm.nodes]
+    route = geo.route
+    route_nodes = set(route.node_path())
+    route_segments = {(min(e.u, e.v), max(e.u, e.v)) for e in route.edges}
+    for cont in ends:
+        if cont is not None:
+            route_nodes |= set(cont.nodes)
+            route_segments |= {
+                (min(a, b), max(a, b)) for a, b in zip(cont.nodes[:-1], cont.nodes[1:], strict=True)
+            }
+    highway = [route.ways.get(int(w), {}).get("highway", "") for w in geo.way_id.tolist()]
+    nopt = dataclasses.replace(
+        options.network_options,
+        source_resolution_m=geo.elevation.resolution_m(),
+        max_grade=options.max_grade,
+        max_vertical_curvature=options.max_vertical_curvature,
+        shoulder_m=options.shoulder_m,
+        verge_m=options.verge_m,
+    )
+    return build_network(
+        geo.model,
+        ways,
+        nodes,
+        route_nodes=route_nodes,
+        route_segments=route_segments,
+        route_highway=highway or None,
+        route_oneway=geo.oneway,
+        dtm=dtm_height_fn(geo),
+        driving_side=geo.driving_side,
+        options=nopt,
+        nodes_known=osm.nodes_known,
+    )
+
+
+def _terrain_extra(net: RoadNetwork | None) -> TerrainExtra | None:
+    if net is None or net.footprint.is_empty:
+        if net is not None and net.masks.hidden.any():
+            return TerrainExtra(shapely.Polygon(), np.zeros((0, 3)), hidden=net.masks.hidden)
+        return None
+    stations, outer = net.terrain_stations()
+    return TerrainExtra(net.footprint, net.edge_points, stations, outer, net.masks.hidden)
 
 
 def _bridges(
@@ -1506,6 +1672,12 @@ def _tree_exclusion(geo: TrackGeometry, sc: _Scenery) -> shapely.Geometry | None
     polys = [b.polygon for b in sc.buildings]
     if sc.footprints is not None:
         polys += [_footprint_polygon(fp, geo.projection) for fp in sc.footprints.footprints]
+    if sc.network is not None and not sc.network.paved.is_empty:
+        # Side roads, junctions, islands: trees stay out of their wall corridor too.
+        verge = sc.network.stats.get("verge_m", 4.0)
+        polys.append(
+            sc.network.paved.buffer(float(verge) + TREE_WALL_MARGIN_M - TREE_BUILDING_BUFFER_M)
+        )
     polys = [p for p in polys if p is not None and not p.is_empty]
     if not polys:
         return None
@@ -1707,20 +1879,44 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         progress("Getting elevation and shaping the road", 0.0)
-        geo = prepare_geometry(route, options)
+        osm_net = None
+        if options.network or (options.real_run_ends and not route.closed):
+            osm_net = _fetch_network(route, options)
+        ends: tuple[Continuation | None, Continuation | None] = (None, None)
+        if osm_net is not None and options.real_run_ends and not route.closed:
+            ends = route_continuations(
+                route, osm_net.ways, run_up_length_m(options), options.run_off_m
+            )
+        geo = prepare_geometry(route, options, ends)
+        street_items: list[StreetItem] = []
+        net: RoadNetwork | None = None
+        if osm_net is not None and options.network:
+            progress("Building side roads, junctions and roundabouts", 0.3)
+            net = _network(geo, osm_net, ends, options)
+            geo.model = net.model  # heights moved onto roundabout planes
         m = geo.model
         progress("Building the road and terrain", 0.35)
-        roads = build_road_meshes(m, chunk_m=options.chunk_m)
+        roads = build_road_meshes(m, chunk_m=options.chunk_m, keep=net.masks if net else None)
         terrain = build_terrain(
-            m, roads.left_outer, roads.right_outer, _terrain_height_fn(geo), options.terrain
+            m,
+            roads.left_outer,
+            roads.right_outer,
+            _terrain_height_fn(geo),
+            options.terrain,
+            _terrain_extra(net),
         )
         corridor = corridor_polygon(m, m.outer + options.verge_m)
+        if net is not None and not net.paved.is_empty:
+            corridor = shapely.union(corridor, net.corridor(options.verge_m))
         lines = wall_lines(corridor)
+        if net is not None:
+            lines.rings += net.island_walls
 
-        centre_tree = cKDTree(m.centre[:, [0, 2]])
+        centres = m.centre if net is None else np.concatenate([m.centre, net.centre_points()])
+        centre_tree = cKDTree(centres[:, [0, 2]])
 
         def road_height(xz: np.ndarray) -> np.ndarray:
-            return m.centre[centre_tree.query(xz)[1], 1]
+            return centres[centre_tree.query(xz)[1], 1]
 
         # Scenery (scenery.md §7): bridges first (they may lower the terrain under a deck).
         progress("Adding bridges, walls and guardrails", 0.45)
@@ -1729,6 +1925,10 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
         ground = _ground_fn(terrain, road_height)
         sc.ground = ground
         walls = wall_meshes(lines, ground, road_fn=road_height)
+        if net is not None:
+            sc.network = net
+            sc.pieces += net.pieces
+            street_items += net.street_items(ground)
         if options.guardrails:
             _barriers(geo, ground, options, sc)
         canopy: CanopyFn | None = None
@@ -1746,6 +1946,7 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
         for line in getattr(canopy, "attributions", None) or []:
             if line not in sc.attributions:  # lidar used for building heights only
                 sc.attributions.append(line)
+        sc.street_items = street_items
         progress("Adding the start, timing gates and AI line", 0.82)
         dummies = _dummies(geo, options)
         ai, ai_slice = _ai_line(geo, options)
@@ -1884,6 +2085,8 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
         "scenery": _scenery_stats(sc, geo, kn5_extra),
         "triangles_terrain": int(len(terrain.triangles)),
         "wall_length_m": lines.length,
+        "network": dict(sc.network.stats) if sc.network is not None else {},
+        "street_items": len(sc.street_items),
         "ai_points": ai.n_points,
         "build_s": time.perf_counter() - t0,
     }
@@ -1965,6 +2168,15 @@ def render_debug_png(
     for k, plan in enumerate(sc.plans):
         bc = m.at(0.5 * (plan.s0 + plan.s1))[0][[0, 2]]
         views.append((path.with_name(f"{path.stem}_bridge{k}.png"), (bc - 100.0, bc + 100.0)))
+    if sc.network is not None:
+        for k, rb in enumerate(sc.network.roundabouts):
+            rc = np.asarray(rb.centre)
+            views.append((path.with_name(f"{path.stem}_roundabout{k}.png"), (rc - 75.0, rc + 75.0)))
+        on_route = [j for j in sc.network.junctions if j.route_s is not None]
+        for k, j in enumerate(on_route[:4]):
+            views.append(
+                (path.with_name(f"{path.stem}_junction{k}.png"), (j.xz - 45.0, j.xz + 45.0))
+            )
     for target, (a, b) in views:
         scale = max(float(np.max(b - a)) / max_px, 0.15)
         w, h = (np.ceil((b - a) / scale).astype(int) + 1).tolist()
@@ -1989,13 +2201,21 @@ def render_debug_png(
 
         _draw_scenery_under(dr, px, a, b, scale, m, sc)
         hw = m.half_width
-        strip(roads.left_outer, roads.right_outer, (196, 176, 140))
-        strip(m.centre + hw[:, None] * m.left, m.centre - hw[:, None] * m.left, (70, 70, 74))
+        if sc.network is not None:
+            _draw_network(dr, px, a, b, sc.network)
+            shown = np.concatenate([~sc.network.masks.hidden, [True]])
+        else:
+            shown = np.ones(len(m), bool)
+        for run in _true_runs(shown):
+            strip(roads.left_outer[run], roads.right_outer[run], (196, 176, 140))
+            strip((m.centre + hw[:, None] * m.left)[run], (m.centre - hw[:, None] * m.left)[run],
+                  (70, 70, 74))  # fmt: skip
         edge = hw - 0.2
         for side in (1.0, -1.0):
-            dr.line(px(m.centre + side * edge[:, None] * m.left), fill=(250, 250, 250), width=1)
+            for run in _true_runs(shown):
+                dr.line(px((m.centre + side * edge[:, None] * m.left)[run]), fill=(250, 250, 250))
         centre_colour = (250, 200, 30) if m.double_yellow else (250, 250, 250)
-        on = np.flatnonzero(m.centre_line)
+        on = np.flatnonzero(m.centre_line & shown)
         for run in np.split(on, np.flatnonzero(np.diff(on) > 1) + 1):
             if len(run) > 1:
                 dr.line(px(m.centre[run]), fill=centre_colour, width=1)
@@ -2032,6 +2252,61 @@ _RAIL_RGB = (255, 150, 0)
 _AUTO_RAIL_RGB = (255, 235, 0)  # automatic (warrant) guardrails
 _PARAPET_RGB = (250, 250, 250)
 _ABUTMENT_RGB = (125, 95, 60)
+
+
+def _true_runs(mask: np.ndarray) -> list[slice]:
+    """Slices of the True runs of a station mask (with one station of overlap, for strips)."""
+    idx = np.flatnonzero(mask)
+    if not len(idx):
+        return []
+    cuts = np.flatnonzero(np.diff(idx) > 1) + 1
+    return [slice(int(r[0]), int(r[-1]) + 2) for r in np.split(idx, cuts) if len(r)]
+
+
+_NETWORK_RGB = {
+    "gravel": (196, 176, 140),
+    "asphalt": (78, 78, 82),
+    "islands": (120, 170, 90),
+}
+_ITEM_RGB = {
+    "sign:stop": (230, 20, 20),
+    "sign:yield": (255, 140, 0),
+    "sign:keep_right": (255, 255, 255),
+    "sign:roundabout_ahead": (255, 220, 0),
+    "sign:chevron_right": (255, 220, 0),
+    "sign:chevron_left": (255, 220, 0),
+    "mailbox": (40, 40, 200),
+}
+
+
+def _draw_network(dr, px, a: np.ndarray, b: np.ndarray, net: RoadNetwork) -> None:
+    """Side roads, junction mouths, roundabouts (gravel tan, asphalt grey, islands green),
+    their painted markings and the planned street items (coloured dots)."""
+    view = shapely.box(a[0] - 5, a[1] - 5, b[0] + 5, b[1] + 5)
+    for key in ("gravel", "asphalt", "islands"):
+        geom = net.polygons.get(key)
+        if geom is None or geom.is_empty:
+            continue
+        for poly in shapely.get_parts(geom.intersection(view)):
+            if isinstance(poly, shapely.Polygon) and poly.area > 0.01:
+                dr.polygon(px(np.asarray(poly.exterior.coords)), fill=_NETWORK_RGB[key])
+                for hole in poly.interiors:
+                    dr.polygon(px(np.asarray(hole.coords)), fill=(150, 150, 150))
+    for piece in net.pieces:
+        if piece.material not in ("paint_white", "paint_yellow"):
+            continue
+        colour = (250, 250, 250) if piece.material == "paint_white" else (250, 200, 30)
+        pos = piece.mesh.positions
+        inside = np.all((pos[:, [0, 2]] >= a - 5) & (pos[:, [0, 2]] <= b + 5), axis=1)
+        if not inside.any():
+            continue
+        for t in piece.mesh.triangles:
+            if inside[t].any():
+                dr.polygon(px(pos[t]), fill=colour)
+    for it in net.planned_items:
+        x, y = px(np.array([it.xz]))[0]
+        dr.ellipse((x - 3, y - 3, x + 3, y + 3), fill=_ITEM_RGB.get(it.kind, (255, 0, 255)),
+                   outline=(0, 0, 0))  # fmt: skip
 
 
 def _span_points(m: RoadModel, lateral: np.ndarray, s0: float, s1: float) -> np.ndarray:

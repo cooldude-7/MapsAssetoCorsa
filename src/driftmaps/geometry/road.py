@@ -714,9 +714,27 @@ def build_road_meshes(
     chunk_m: float = 250.0,
     lateral_segments: int = 4,
     edge_lines: bool = True,
+    keep: object | None = None,
 ) -> RoadMeshes:
-    """Asphalt, gravel shoulders and painted lines, chunked every ~`chunk_m` metres."""
+    """Asphalt, gravel shoulders and painted lines, chunked every ~`chunk_m` metres.
+
+    `keep` (e.g. `geometry.network.RouteMasks`): per segment (N - 1,) boolean arrays
+    `hidden` (no road, shoulders or lines: a roundabout replaces them), `shoulder_left`,
+    `shoulder_right`, `edge_left`, `edge_right` and `centre` (True = draw), where junction
+    mouths and islands take the shoulder's and the lines' place."""
     hw, outer = model.half_width, model.outer
+    n_seg = len(model) - 1
+    ones = np.ones(n_seg, bool)
+
+    def mask(name: str) -> np.ndarray:
+        value = getattr(keep, name, None) if keep is not None else None
+        return ones if value is None else np.asarray(value, bool)
+
+    hidden = getattr(keep, "hidden", None) if keep is not None else None
+    shown = ones if hidden is None else ~np.asarray(hidden, bool)
+    keep_sl, keep_sr = mask("shoulder_left") & shown, mask("shoulder_right") & shown
+    keep_el, keep_er = mask("edge_left") & shown, mask("edge_right") & shown
+    keep_c = mask("centre") & shown
     fracs = np.linspace(1.0, -1.0, lateral_segments + 1)
     road_cols = [road_columns(model, f * hw) for f in fracs]
     left_outer = road_columns(model, outer)
@@ -729,7 +747,7 @@ def build_road_meshes(
     # double yellow in North America).
     edge_off = hw - EDGE_LINE_INSET_M
     centre_ok = model.centre_line
-    seg_centre = centre_ok[:-1] & centre_ok[1:]
+    seg_centre = centre_ok[:-1] & centre_ok[1:] & keep_c
     if model.double_yellow:
         g = DOUBLE_YELLOW_GAP_M / 2 + CENTRE_LINE_WIDTH_M / 2
         yellow_centres = [np.full(len(model), g), np.full(len(model), -g)]
@@ -739,19 +757,21 @@ def build_road_meshes(
         period = CENTRE_LINE_DASH_M + CENTRE_LINE_GAP_M
         s_mid = 0.5 * (model.s[:-1] + model.s[1:])
         white_centre_keep = seg_centre & ((s_mid % period) < CENTRE_LINE_DASH_M)
-    all_quads = np.ones(len(model) - 1, bool)
 
     ranges = chunk_ranges(model.s, chunk_m)
     road, gravel, white, yellow = [], [], [], []
     for i0, i1 in ranges:
-        rm = _strip(road_cols, model, i0, i1, road_u, ROAD_V_TILE_M)
-        gl = _strip([left_outer, road_cols[0]], model, i0, i1, gravel_u_l, GRAVEL_TILE_M)
-        gr = _strip([road_cols[-1], right_outer], model, i0, i1, gravel_u_r, GRAVEL_TILE_M)
+        rm = _strip(road_cols, model, i0, i1, road_u, ROAD_V_TILE_M, keep_quads=shown)
+        gl = _strip([left_outer, road_cols[0]], model, i0, i1, gravel_u_l, GRAVEL_TILE_M,
+                    keep_quads=keep_sl)  # fmt: skip
+        gr = _strip([road_cols[-1], right_outer], model, i0, i1, gravel_u_r, GRAVEL_TILE_M,
+                    keep_quads=keep_sr)  # fmt: skip
         road.append(rm)
         gravel.append(_merge([m for m in (gl, gr) if m is not None]))
         w_parts: list[MeshData] = []
         if edge_lines:
-            w_parts += _lines(model, [edge_off, -edge_off], EDGE_LINE_WIDTH_M, i0, i1, all_quads)
+            w_parts += _lines(model, [edge_off], EDGE_LINE_WIDTH_M, i0, i1, keep_el)
+            w_parts += _lines(model, [-edge_off], EDGE_LINE_WIDTH_M, i0, i1, keep_er)
         if white_centre_keep is not None:
             w_parts += _lines(
                 model, [np.zeros(len(model))], CENTRE_LINE_WIDTH_M, i0, i1, white_centre_keep
@@ -765,7 +785,10 @@ def build_road_meshes(
         yellow.append(_merge(y_parts))
     for name, items in (("road", road), ("gravel", gravel)):
         for m in items:
-            if m is None or m.vertex_count > MAX_MESH_VERTICES:
+            # With masks a chunk may be all hidden or have no shoulder left (None).
+            if (m is None and keep is None) or (
+                m is not None and m.vertex_count > MAX_MESH_VERTICES
+            ):
                 raise ValueError(f"{name} chunk is empty or too large; use a smaller chunk_m")
     return RoadMeshes(road, gravel, white, yellow, ranges, left_outer, right_outer)
 

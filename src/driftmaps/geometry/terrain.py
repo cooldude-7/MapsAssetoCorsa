@@ -44,7 +44,14 @@ from scipy.spatial import Delaunay, cKDTree
 from driftmaps.geometry.primitives import MeshData, compute_tangents
 from driftmaps.geometry.road import RoadModel, footprint_polygon
 
-__all__ = ["Terrain", "TerrainOptions", "build_terrain", "clamp_heights", "terrain_points"]
+__all__ = [
+    "Terrain",
+    "TerrainExtra",
+    "TerrainOptions",
+    "build_terrain",
+    "clamp_heights",
+    "terrain_points",
+]
 
 HeightFn = Callable[[np.ndarray, bool], np.ndarray]
 
@@ -166,15 +173,56 @@ def _grid_in_band(
     return p[keep], fd[keep]
 
 
+@dataclass
+class TerrainExtra:
+    """More holes in the terrain beyond the route's own (the road network: side roads,
+    junction mouths, roundabouts, see `geometry.network`).
+
+    `footprint`: the area the network's meshes cover; `edge_points` (K, 3): the vertices on
+    the outer boundary of those meshes, with their heights (the terrain joins them exactly);
+    `stations` (S, 3) / `outer` (S,): more centreline points for the cut/fill batters;
+    `hidden` (N - 1,): route segments whose ribbon the network replaces (no route hole or
+    edge points there); grid cells are `fine_cell_m` within `fine_m` of the footprint."""
+
+    footprint: shapely.Geometry
+    edge_points: np.ndarray
+    stations: np.ndarray = field(default_factory=lambda: np.zeros((0, 3)))
+    outer: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    hidden: np.ndarray | None = None
+    fine_m: float = 12.0
+    fine_cell_m: float = 2.0
+
+
+def _route_segments(model: RoadModel, extra: TerrainExtra | None) -> np.ndarray:
+    """(N - 1,) segments that are part of the route's own hole (on the ground, not hidden)."""
+    ground = ~model.bridge
+    seg = ground[:-1] & ground[1:]
+    if extra is not None and extra.hidden is not None:
+        seg &= ~np.asarray(extra.hidden, bool)
+    return seg
+
+
 def terrain_points(
-    model: RoadModel, left_outer: np.ndarray, right_outer: np.ndarray, options: TerrainOptions
+    model: RoadModel,
+    left_outer: np.ndarray,
+    right_outer: np.ndarray,
+    options: TerrainOptions,
+    extra: TerrainExtra | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """(points (M, 2) XZ, footprint distance (M,), is_edge (M,), edge heights (M,) NaN for
     grid points). Edge points are the outer shoulder edges (minus points inside another part
-    of the road) and the two end caps; bridge stations get no edge points."""
+    of the road) and the two end caps; bridge stations get no edge points. `extra` adds the
+    network's holes and edge points, and a finer grid around them."""
     xz = model.centre[:, [0, 2]]
     ground = ~model.bridge
     lo, hi = xz.min(axis=0), xz.max(axis=0)
+    seg_ground = _route_segments(model, extra)
+    # Stations that get route edge points: on the ground and not inside a hidden stretch.
+    holed = ground.copy()
+    if extra is not None and extra.hidden is not None and len(model) > 1:
+        h = np.asarray(extra.hidden, bool)
+        inside = np.concatenate([h[:1], h[:-1] & h[1:], h[-1:]])
+        holed &= ~inside
 
     # Rings by distance to the whole road (so the fine ring also runs under bridge decks);
     # the clearance around the road hole only applies to ground stations.
@@ -192,26 +240,42 @@ def terrain_points(
             d, i = ground_tree.query(p)
             ok = d - model.outer[ground][i] >= options.edge_clearance_m
             grids[k], dists[k] = p[ok], np.maximum(dists[k][ok], 0.0)
+    extra_foot = extra.footprint if extra is not None else None
+    if extra_foot is not None and not extra_foot.is_empty:
+        grids, dists = _network_grid(grids, dists, tree, model, extra, options)
 
     # Edge points: outer shoulder edges of ground stations, plus the end caps.
-    seg_ground = ground[:-1] & ground[1:]
     foot = footprint_polygon(left_outer, right_outer, seg_ground)
-    inner = foot.buffer(-0.05) if not foot.is_empty else foot
     edges = []
     for edge in (left_outer, right_outer):
-        e = edge[ground]
-        edges.append(e)
+        edges.append(edge[holed])
     for i in () if model.closed else (0, len(model) - 1):  # a loop has no ends
+        if not holed[i]:
+            continue
         a, b = left_outer[i], right_outer[i]
         n = max(2, math.ceil(np.linalg.norm(b - a) / 1.0))
         t = np.linspace(0.0, 1.0, n + 1)[1:-1, None]
         edges.append(a + t * (b - a))
+    if extra is not None and len(extra.edge_points):
+        edges.append(np.asarray(extra.edge_points, np.float64).reshape(-1, 3))
     e3 = np.concatenate(edges)
     # Drop duplicates (merged fold-over points) and points inside another part of the road.
     _, first = np.unique(np.round(e3[:, [0, 2]], 4), axis=0, return_index=True)
     e3 = e3[np.sort(first)]
-    if not inner.is_empty:
-        e3 = e3[~shapely.contains_xy(inner, e3[:, 0], e3[:, 2])]
+    if not foot.is_empty:
+        e3 = e3[~shapely.contains_xy(foot.buffer(-0.05), e3[:, 0], e3[:, 2])]
+    if extra_foot is not None and not extra_foot.is_empty:
+        # Points inside the union of the route's hole and the network's (e.g. a route
+        # shoulder edge across a junction mouth) are not on the terrain's edge.
+        near = shapely.dwithin(extra_foot, shapely.points(e3[:, [0, 2]]), 0.5)
+        if near.any():
+            idx = np.flatnonzero(near)
+            local = foot.intersection(extra_foot.buffer(30.0)) if not foot.is_empty else foot
+            both = shapely.union(local, extra_foot).buffer(-0.05)
+            inside = shapely.contains_xy(both, e3[idx, 0], e3[idx, 2])
+            keep = np.ones(len(e3), bool)
+            keep[idx[inside]] = False
+            e3 = e3[keep]
     grid = np.concatenate(grids)
     fd = np.concatenate(dists)
     pts = np.concatenate([e3[:, [0, 2]], grid])
@@ -221,10 +285,63 @@ def terrain_points(
     return pts, fdist, is_edge, heights
 
 
+def _network_grid(
+    grids: list[np.ndarray],
+    dists: list[np.ndarray],
+    tree: cKDTree,
+    model: RoadModel,
+    extra: TerrainExtra,
+    options: TerrainOptions,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Clear the grid around the network's footprint (`edge_clearance_m`) and make it
+    `fine_cell_m` within `fine_m` of it (replacing coarser ring points there)."""
+    foot = extra.footprint
+    band = foot.buffer(extra.fine_m, quad_segs=4)
+    shapely.prepare(band)
+    shapely.prepare(foot)
+    cell = extra.fine_cell_m
+    out_g, out_d = [], []
+    for k, (p, fd) in enumerate(zip(grids, dists, strict=True)):
+        if not len(p):
+            out_g.append(p)
+            out_d.append(fd)
+            continue
+        drop = shapely.dwithin(foot, shapely.points(p), options.edge_clearance_m)
+        if options.rings[k][1] > cell:
+            drop |= shapely.contains_xy(band, p[:, 0], p[:, 1])
+        out_g.append(p[~drop])
+        out_d.append(fd[~drop])
+    x0, z0, x1, z1 = band.bounds
+    gx = np.arange(math.floor(x0 / cell), math.ceil(x1 / cell) + 1) * cell
+    gz = np.arange(math.floor(z0 / cell), math.ceil(z1 / cell) + 1) * cell
+    fine = []
+    for chunk in np.array_split(gx, max(1, len(gx) // 256)):
+        xx, zz = np.meshgrid(chunk, gz, indexing="ij")
+        q = np.stack([xx.ravel(), zz.ravel()], axis=1)
+        q = q[shapely.contains_xy(band, q[:, 0], q[:, 1])]
+        if len(q):
+            fine.append(q)
+    if fine:
+        q = np.concatenate(fine)
+        d, i = tree.query(q)
+        fd = d - model.outer[i]
+        first_ring = options.rings[0][0] if options.rings[0][1] <= cell else -np.inf
+        ok = (fd >= first_ring) & (fd >= options.edge_clearance_m) & (fd < options.far_m)
+        q, fd = q[ok], fd[ok]
+        ok = ~shapely.dwithin(foot, shapely.points(q), options.edge_clearance_m)
+        out_g.append(q[ok])
+        out_d.append(np.maximum(fd[ok], 0.0))
+    return out_g, out_d
+
+
 def _batter_bounds(
-    model: RoadModel, pts: np.ndarray, options: TerrainOptions
+    model: RoadModel,
+    pts: np.ndarray,
+    options: TerrainOptions,
+    network: TerrainExtra | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Lower/upper height bounds (M,) from the batter planes of nearby road stations."""
+    """Lower/upper height bounds (M,) from the batter planes of nearby road stations (and the
+    network's stations)."""
     step = max(1, options.station_step)
     idx = np.arange(0, len(model), step)
     if idx[-1] != len(model) - 1:
@@ -233,6 +350,12 @@ def _batter_bounds(
     z = model.centre[idx, 1]
     outer = model.outer[idx]
     bridge = model.bridge[idx]
+    if network is not None and len(network.stations):
+        st = np.asarray(network.stations, np.float64).reshape(-1, 3)
+        xz = np.concatenate([xz, st[:, [0, 2]]])
+        z = np.concatenate([z, st[:, 1]])
+        outer = np.concatenate([outer, np.asarray(network.outer, np.float64)])
+        bridge = np.concatenate([bridge, np.zeros(len(st), bool)])
     tree = cKDTree(xz)
     k = min(48, len(idx))
     lo = np.full(len(pts), -np.inf)
@@ -271,12 +394,14 @@ def build_terrain(
     right_outer: np.ndarray,
     height_fn: HeightFn,
     options: TerrainOptions | None = None,
+    extra: TerrainExtra | None = None,
 ) -> Terrain:
     """Triangulated corridor terrain. `height_fn(xz (M, 2), far)` returns DEM heights in AC Y
     (relative to the same reference as the road); `far` is True for points beyond `near_m`,
-    which may come from a coarser source. NaN heights are filled from the nearest valid point."""
+    which may come from a coarser source. NaN heights are filled from the nearest valid point.
+    `extra`: the road network's holes, edge points and batter stations (`TerrainExtra`)."""
     options = options or TerrainOptions()
-    pts, fdist, is_edge, heights = terrain_points(model, left_outer, right_outer, options)
+    pts, fdist, is_edge, heights = terrain_points(model, left_outer, right_outer, options, extra)
     grid = ~is_edge
     gi = np.flatnonzero(grid)
     far = fdist[gi] >= options.near_m
@@ -292,7 +417,7 @@ def build_terrain(
         good = np.flatnonzero(~bad)
         _, nn = cKDTree(pts[gi[good]]).query(pts[gi[bad]])
         dem[bad] = dem[good[nn]]
-    lo, hi = _batter_bounds(model, pts[gi], options)
+    lo, hi = _batter_bounds(model, pts[gi], options, extra)
     clamped = np.clip(dem, lo, hi)
     conflict = lo > hi
     clamped[conflict] = 0.5 * (lo[conflict] + hi[conflict])
@@ -303,9 +428,18 @@ def build_terrain(
     simplices = tri.simplices
     a, b, c = (pts[simplices[:, k]] for k in range(3))
     centroid = (a + b + c) / 3.0
-    seg_ground = (~model.bridge[:-1]) & (~model.bridge[1:])
+    seg_ground = _route_segments(model, extra)
     foot = footprint_polygon(left_outer, right_outer, seg_ground)
     keep = np.ones(len(simplices), bool)
+    if extra is not None and not extra.footprint.is_empty:
+        net = extra.footprint
+        shapely.prepare(net)
+        net_inner = net.buffer(-0.02)
+        shapely.prepare(net_inner)
+        keep &= ~shapely.contains_xy(net, centroid[:, 0], centroid[:, 1])
+        for p, q in ((a, b), (b, c), (c, a)):
+            mid = 0.5 * (p + q)
+            keep &= ~shapely.contains_xy(net_inner, mid[:, 0], mid[:, 1])
     if not foot.is_empty:
         inner = foot.buffer(-0.02)
         keep &= ~shapely.contains_xy(foot, centroid[:, 0], centroid[:, 1])
