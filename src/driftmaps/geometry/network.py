@@ -2239,16 +2239,22 @@ def build_driveways(
     route_left, route_right, left_outer, right_outer = net.route_columns
     outer_cls = [CentreLine(cl.xz, cl.y, cl.hw + sh) for _, cl, sh in roads]
 
+    stencil = np.array([[0, 0], [1.5, 0], [-1.5, 0], [0, 1.5], [0, -1.5]], np.float64)
+
     def height(xz: np.ndarray) -> np.ndarray:
-        g = np.asarray(ground(xz), np.float64)
+        xz = np.asarray(xz, np.float64).reshape(-1, 2)
+        g0 = np.asarray(ground(xz), np.float64)
+        # Draped on a 3 m grid over a terrain with its own grid: each vertex takes the highest
+        # ground within 1.5 m, so no bump of the terrain pokes through between vertices.
+        around = np.asarray(ground((xz[:, None, :] + stencil[None]).reshape(-1, 2)), np.float64)
+        g = np.maximum(g0, np.nanmax(around.reshape(len(xz), -1), axis=1))
         d = np.full(len(xz), np.inf)
         for cl in outer_cls:
             dd, _ = cl.project(xz, 30.0)
             d = np.minimum(d, dd)
-        lift = DRIVEWAY_SHOULDER_LIFT_M + (
-            DRIVEWAY_LIFT_M - DRIVEWAY_SHOULDER_LIFT_M
-        ) * _smoothstep(d / 1.0)
-        return g + lift
+        w = _smoothstep(d / 1.0)  # 0 over a road's shoulder: the road's own height there
+        lift = DRIVEWAY_SHOULDER_LIFT_M + (DRIVEWAY_LIFT_M - DRIVEWAY_SHOULDER_LIFT_M) * w
+        return g0 + (g - g0) * w + lift
 
     batch = Batcher(options.batch_m)
     sh_l = _quads(left_outer, route_left)

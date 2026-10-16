@@ -2107,6 +2107,13 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
             out_dir / "debug" / f"{track_id}.png", geo, roads, terrain, lines, ai, dummies,
             scenery=sc,
         )  # fmt: skip
+        if sc.street_items:  # what the furniture layer gets, for checking placements
+            items_path = out_dir / "debug" / f"{track_id}_street_items.json"
+            items_path.write_text(
+                json.dumps([dataclasses.asdict(it) for it in sc.street_items], indent=0) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
 
     z = m.centre[:, 1]
     grade = np.abs(np.diff(z) / np.diff(m.s))
