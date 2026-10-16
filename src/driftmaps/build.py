@@ -1864,6 +1864,27 @@ def _short(e: Exception) -> str:
     return text[0][:160] if text else type(e).__name__
 
 
+TOWN_RADIUS_M = 150.0  # a point with TOWN_BUILDINGS town buildings this close is in a town
+TOWN_BUILDINGS = 5
+
+
+def _town_at(sc: _Scenery) -> Callable[[np.ndarray], bool] | None:
+    """XZ -> True in a town: TOWN_BUILDINGS of the placed buildings in a town context
+    (`geometry.buildings._town_context`) within TOWN_RADIUS_M. None without buildings."""
+    town = [b.centroid for b in sc.buildings if b.town]
+    if not sc.buildings:
+        return None
+    if not town:
+        return lambda xz: False
+    tree = cKDTree(np.array(town))
+
+    def at(xz: np.ndarray) -> bool:
+        p = np.asarray(xz, np.float64).reshape(-1)[:2]
+        return len(tree.query_ball_point(p, TOWN_RADIUS_M)) >= TOWN_BUILDINGS
+
+    return at
+
+
 def _furniture(
     geo: TrackGeometry,
     ground: Callable[[np.ndarray], np.ndarray],
@@ -1911,7 +1932,7 @@ def _furniture(
     plan = plan_furniture(
         m, geo.projection, geo.route, ground, s_range=(geo.s_a, geo.s_b), way_id=geo.way_id,
         items=street_items, osm=osm, mapillary=mly, coverage=coverage, surface=surface,
-        options=options.furniture_options,
+        options=options.furniture_options, town_at=_town_at(sc),
     )  # fmt: skip
     sc.furniture = plan
     names = street_names(plan.items)

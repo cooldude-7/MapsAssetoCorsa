@@ -33,6 +33,11 @@ once before the pole lines and once after them (their gap-filling poles; wires f
 - Chevrons: on the outside of curves whose advisory speed (v = sqrt(127 R (e + f)),
   e = 0.06, f = 0.16) is at least 20 km/h below the limit and that turn 30 degrees or more;
   spacing by advisory speed from the MUTCD 2009 Table 2C-6 metric equivalents (12/24/36/48 m).
+  Rule-made chevrons only on rural roads (`_Planner.rural_at`): a limit of 60 km/h or more
+  (untagged: 50 on residential and service streets, 80 elsewhere, the Highway Traffic Act
+  s.128 defaults), no sidewalk or `lit=yes` tag, and outside towns (`town_at`, from the
+  buildings' context). Curvy suburban streets get none (the user's Oakville check,
+  2026-10-16); photographed chevrons stay wherever they are.
 - Hydro poles: Ontario wood distribution poles, 11 m above ground, 2.4 m crossarm 0.3 m below
   the top, three pin insulators; spans 30-70 m (gaps filled at the run's median span);
   wires sag 2 % of the span.
@@ -109,6 +114,11 @@ GroundFn = Callable[[np.ndarray], np.ndarray]
 # `street_items.SOURCE_PRIORITY` puts OSM first. OSM stop/give-way nodes sit on the road's
 # centreline, so a photographed sign gives the better position anyway.
 PRIORITY = ("municipal", "mapillary", "osm", "rule")
+# Streets that are urban without a `maxspeed` tag (50 km/h, HTA s.128), and the sidewalk tags
+# that make a road urban (chevrons: module notes).
+_URBAN_HIGHWAYS = frozenset({"residential", "living_street", "service", "pedestrian"})
+_SIDEWALK_KEYS = ("sidewalk", "sidewalk:both", "sidewalk:left", "sidewalk:right")
+_SIDEWALK_YES = frozenset({"both", "left", "right", "yes", "separate"})
 # A pole with no reliable position across the road stands this far beyond the gravel shoulder
 # (ASSUMED: rural Ontario pole lines run near the right-of-way limit, ~8 m from the centre of
 # a 7 m road with 1 m shoulders).
@@ -369,7 +379,9 @@ def _road_half(tags: Mapping[str, str] | None) -> float:
 
 
 class _Planner:
-    def __init__(self, model, projection, route, s_range, ground, way_id, options, coverage):
+    def __init__(self, model, projection, route, s_range, ground, way_id, options, coverage,
+                 town_at=None):  # fmt: skip
+        self.town_at = town_at  # XZ (2,) -> True in a town (subdivision, downtown)
         self.m = model
         self.proj = projection
         self.route = route
@@ -417,10 +429,25 @@ class _Planner:
         return it
 
     def _speed_at(self, s: float) -> int | None:
+        return parse_speed(self._tags_at(s).get("maxspeed"))
+
+    def _tags_at(self, s: float) -> Mapping[str, str]:
         if len(self.way_id) != len(self.m.s):
-            return None
+            return {}
         wid = int(self.way_id[self.m.index_at(s)])
-        return parse_speed((self.route.ways.get(wid) or {}).get("maxspeed"))
+        return self.route.ways.get(wid) or {}
+
+    def rural_at(self, s: float) -> bool:
+        """A rural road at station s (module notes, "Chevrons")."""
+        tags = self._tags_at(s)
+        v = parse_speed(tags.get("maxspeed"))
+        if v is None:
+            v = 50 if tags.get("highway") in _URBAN_HIGHWAYS else 80
+        if v < 60 or tags.get("lit") == "yes":
+            return False
+        if any(tags.get(k) in _SIDEWALK_YES for k in _SIDEWALK_KEYS):
+            return False
+        return not (self.town_at is not None and self.town_at(self.frame.point(s, 0.0)))
 
     # -- measured items -----------------------------------------------------------------------
 
@@ -713,6 +740,8 @@ class _Planner:
             v_adv = math.sqrt(127.0 * r_min * (0.06 + 0.16))
             if defl < self.o.min_curve_deflection_deg or v_adv > v - self.o.chevron_speed_drop_kmh:
                 continue
+            if not (self.rural_at(s_a) and self.rural_at(s_b) and self.rural_at((s_a + s_b) / 2)):
+                continue
             spacing = (
                 12.0 if v_adv <= 25 else 24.0 if v_adv <= 50 else 36.0 if v_adv <= 70 else 48.0
             )
@@ -937,16 +966,17 @@ def plan_furniture(
     coverage: np.ndarray | None = None,
     surface: DrivableSurface | None = None,
     options: FurnitureOptions | None = None,
+    town_at: Callable[[np.ndarray], bool] | None = None,
 ) -> FurniturePlan:
     """Every street item for the track (see the module notes), de-duplicated, with the pole
     wires and the route's markings. `coverage` is Mapillary's photo positions (N, 2) lon/lat
     (None: no photos, rules everywhere); `way_id` the OSM way per station (speed limits);
     `surface` the drivable surface items keep off (`geometry.clearance`; default: the route's
-    asphalt and shoulders)."""
+    asphalt and shoulders); `town_at(xz)` True in a town (no rule-made chevrons there)."""
     o = options or FurnitureOptions()
     s_range = s_range or (float(model.s[0]), float(model.s[-1]))
     way_id = np.asarray(way_id if way_id is not None else np.zeros(0), np.int64)
-    pl = _Planner(model, projection, route, s_range, ground, way_id, o, coverage)
+    pl = _Planner(model, projection, route, s_range, ground, way_id, o, coverage, town_at)
     pl.plan.covered_fraction = float(pl.covered.mean()) if len(pl.covered) else 0.0
     pl.add_mapillary(list(mapillary))
     pl.add_osm(osm)
