@@ -18,6 +18,7 @@ import pytest
 
 from driftmaps.geo.overpass import (
     OverpassError,
+    build_bbox_query,
     build_query,
     fetch_corridor,
     load_cached,
@@ -46,6 +47,21 @@ def test_build_query_corridor():
     assert query_cache_key(q) != query_cache_key(build_query(FORKS_PINS, 401))
     with pytest.raises(ValueError):
         build_query([])
+
+
+def test_build_bbox_query():
+    q = build_bbox_query([(43.80, -80.0, 43.82, -79.97)], timeout_s=40)
+    assert q.startswith("[out:json][timeout:40];")
+    assert '["service"!~"^(parking_aisle|driveway' in q and "(43.8,-80,43.82,-79.97);" in q
+    assert q.count("way[") == 2 and q.rstrip().endswith("out body geom;")  # roads + paved tracks
+    # Several boxes: one union, the same statements for each box.
+    q2 = build_bbox_query([(1, 2, 3, 4), (5, 6, 7, 8)], include_tracks="none")
+    assert q2.count("way[") == 2 and "(1,2,3,4);" in q2 and "(5,6,7,8);" in q2
+    assert q2.count("\nout body geom;") == 1
+    with pytest.raises(ValueError):
+        build_bbox_query([])
+    with pytest.raises(ValueError):
+        build_bbox_query([(1, 2, 3, 4)], include_tracks="some")
 
 
 def test_parse_fixture():
@@ -122,20 +138,87 @@ def test_post_query_falls_through_mirrors():
 
 
 def test_post_query_races_mirrors():
-    """The first good answer wins without waiting for a slow mirror."""
+    """The next mirror is asked when the first is slow; the first good answer wins without
+    waiting for the slow one."""
     body = FIXTURE.read_bytes()
     release = threading.Event()
+    asked: list[str] = []
 
     def opener(request, timeout):
+        asked.append(request.full_url)
         if request.full_url == "https://slow":
             release.wait(5)
             raise urllib.error.URLError("too late")
         return body
 
     t0 = time.monotonic()
-    out = post_query("q", ["https://slow", "https://fast"], opener=opener, sleep=lambda s: None)
-    assert out == body and time.monotonic() - t0 < 2.0
+    out = post_query(
+        "q", ["https://slow", "https://fast"], opener=opener, sleep=lambda s: None, stagger_s=0.3
+    )
+    assert out == body and 0.25 < time.monotonic() - t0 < 2.0
+    assert asked == ["https://slow", "https://fast"]
     release.set()
+    # All at once (no stagger): no wait at all.
+    t0 = time.monotonic()
+    release.clear()
+    post_query("q", ["https://slow", "https://fast"], opener=opener, stagger_s=0)
+    assert time.monotonic() - t0 < 0.25
+    release.set()
+
+
+def test_post_query_hedges_only_when_needed():
+    """A mirror that answers in time is the only one asked; one that fails fast hands over
+    to the next at once."""
+    body = FIXTURE.read_bytes()
+    asked: list[str] = []
+
+    def opener(request, timeout):
+        asked.append(request.full_url)
+        if request.full_url == "https://down":
+            raise urllib.error.URLError("connection reset")
+        time.sleep(0.1)
+        return body
+
+    mirrors = ["https://a", "https://b", "https://c"]
+    assert post_query("q", mirrors, opener=opener, stagger_s=5.0) == body
+    assert asked == ["https://a"]
+    asked.clear()
+    t0 = time.monotonic()
+    assert post_query("q", ["https://down", "https://b"], opener=opener, stagger_s=5.0) == body
+    assert asked == ["https://down", "https://b"] and time.monotonic() - t0 < 2.0
+
+
+def test_post_query_asks_for_gzip():
+    """A real HTTP round trip (local server): gzip is asked for and unpacked."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    body = FIXTURE.read_bytes()
+    seen: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802 - stdlib name
+            self.rfile.read(int(self.headers["Content-Length"]))
+            seen.append(dict(self.headers))
+            packed = gzip.compress(body)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(packed)))
+            self.end_headers()
+            self.wfile.write(packed)
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_address[1]}/api/interpreter"
+        assert post_query("q", [url], rounds=1, timeout_s=10) == body
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert seen[0]["Accept-Encoding"] == "gzip"
 
 
 def test_post_query_backoff_and_failure():

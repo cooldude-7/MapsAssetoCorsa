@@ -5,8 +5,8 @@ Binds 127.0.0.1 only. Endpoints (all JSON; errors are `{"error": "<plain English
 - `GET /` and other GETs: the single-page app from `driftmaps/app/static/` (read through
   `importlib.resources`, so it also works when frozen by PyInstaller).
 - `GET /api/status`, `POST /api/settings {ac_root}`: app name/version and where AC is;
-  `build` is `{version, commit, date}` from `_build_info.py` (written by CI), else
-  `{version: "dev"}`.
+  `build` is `{version, commit (7 characters), date}` from `_build_info.py` (written by CI),
+  else `{version: "dev"}`.
 - `POST /api/route {pins: [[lat, lon], ...], reverse, loop}`: route over real roads; the route
   is kept by `route_id` (in memory and as `<app data>/routes/<route_id>.json`).
   `snapped[i]` is where request pin i landed on the road (request order, even with
@@ -20,14 +20,23 @@ Binds 127.0.0.1 only. Endpoints (all JSON; errors are `{"error": "<plain English
   `far_pin` (its request index) beside `error`.
 - `POST /api/profile {route_id}`: ground height every ~20 m along the route.
 - `POST /api/build {route_id, name, track_id, install, options, loop}` -> `{job_id}`;
+  `options` (all optional): `trees`, `buildings`, `guardrails` (OSM-mapped rails; false = no
+  rails at all), `auto_guardrails` (also where Ontario road rules call for one; default true),
+  `scenery_density` (0..2);
   `GET /api/jobs/<job_id>`: one build at a time, the rest queued (see `jobs.py`). A loop route
   builds a circuit; `loop` is optional and, if sent, must match the route.
 - `POST /api/roads {tiles: ["14/x/y", ...]}` (at most 16): the drivable roads crossing those
   z14 map tiles, for the turn-by-turn builder: `{tiles: {"14/x/y": "ok"|"error"},
   nodes: {"<id>": [lon, lat]}, ways: [{id, name, ref, highway, oneway, nodes}], error}`.
   Cached per tile (see `tiles.py`); the missing tiles are fetched in one Overpass query.
+  `oneway` is 1 (drive only in the way's node order), -1 (only against it) or 0.
 - `POST /api/route-path {path: [node ids], start_t, end_t, loop}`: a route along an explicit
-  node path (from the tiles above; no pathfinding), answered and kept like `/api/route`.
+  node path (from the tiles above; no pathfinding), answered and kept like `/api/route`
+  (`alternatives` is just itself), so `/api/profile` and `/api/build` take its `route_id`.
+  Consecutive nodes must be neighbours on a road, never the wrong way along a one-way.
+  `start_t`/`end_t` (0..1) are where it starts on the first segment and ends on the last;
+  with `loop` the path ends at its first node and the lap closes at `start_t`. 409 when the
+  road data for a node isn't loaded any more (load its tiles again).
 - `GET /api/tracks`, `DELETE /api/tracks/<id>`: tracks this app made (marker file or the
   "drift-maps" tag), in AC's `content/tracks` and the app's output folder. Other tracks are
   never listed or touched.
@@ -242,6 +251,30 @@ def route_error_message(exc: Exception, pins: list[tuple[float, float]]) -> str:
     return f"Couldn't make a route: {text}"
 
 
+def path_error_message(exc: Exception) -> str:
+    """A plain-English message for a `route_from_path` RouteError."""
+    text = str(exc)
+    if "no loop" in text:
+        return (
+            "That loop drives part of the road twice - come back to the start along a "
+            "different road."
+        )
+    if text.startswith("one-way:"):
+        road = getattr(exc, "road", None)
+        return (
+            f"That route goes the wrong way along {road}, a one-way road."
+            if road
+            else "That route goes the wrong way along a one-way road."
+        )
+    if "turns back" in text:
+        return "That route turns straight back on itself - U-turns aren't allowed."
+    if "first node" in text:
+        return "To make a loop, drive back to the start (A) first."
+    if "ends before it starts" in text or "no length" in text:
+        return "That route is too short - drive a bit further."
+    return f"That route doesn't follow the roads: {text}."
+
+
 def display_line(route: Route, max_points: int = MAX_LINE_POINTS) -> list[list[float]]:
     """The route as `[[lon, lat], ...]`, Douglas-Peucker simplified to <= `max_points`."""
     import numpy as np
@@ -330,9 +363,9 @@ def build_info() -> dict[str, str]:
         return {"version": "dev"}
     out = {"version": str(getattr(_build_info, "VERSION", "") or "dev")}
     for key in ("commit", "date"):
-        value = getattr(_build_info, key.upper(), None)
+        value = str(getattr(_build_info, key.upper(), None) or "").strip()
         if value:
-            out[key] = str(value)
+            out[key] = value[:7] if key == "commit" else value
     return out
 
 
@@ -656,6 +689,9 @@ class App:
         from driftmaps.geo.router import RouteError, route_from_path
 
         path = _parse_path(body.get("path"))
+        path = [n for i, n in enumerate(path) if i == 0 or n != path[i - 1]]  # legs' joins
+        if len(path) < 2:
+            raise ApiError(400, "That route is too short - drive a bit further.")
         start_t = _parse_t(body, "start_t", 0.0)
         end_t = _parse_t(body, "end_t", 1.0)
         loop = bool(body.get("loop", False))
@@ -665,10 +701,7 @@ class App:
         try:
             route = route_from_path(osm, path, start_t, end_t, loop=loop)
         except RouteError as exc:
-            text = str(exc)
-            if "no loop" in text:
-                raise ApiError(400, route_error_message(exc, [])) from None
-            raise ApiError(400, f"That route doesn't follow the roads: {text}.") from None
+            raise ApiError(400, path_error_message(exc)) from None
         except Exception as exc:
             log.exception("route-path failed")
             raise ApiError(500, f"Something went wrong while making the route: {exc}") from None
@@ -824,6 +857,7 @@ class App:
                 trees=bool(opts.get("trees", True)),
                 buildings=bool(opts.get("buildings", True)),
                 guardrails=bool(opts.get("guardrails", True)),
+                auto_guardrails=bool(opts.get("auto_guardrails", True)),
                 scenery_density=density,
             )
         )

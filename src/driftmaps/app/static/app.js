@@ -3,6 +3,11 @@
  * Plain modern JS, no build step, no framework. Talks to the local app server on the same origin
  * (GET /api/status, POST /api/route, POST /api/build, ...). The pure helpers come first so the
  * tests can run them under Node; boot() only runs in a browser.
+ *
+ * Two ways to pick the road: turn by turn (the default: click the road you start on, pick a
+ * direction, then a road at every junction; roads come from POST /api/roads in z14 tiles and
+ * the junctions are worked out here, then POST /api/route-path makes the route) and quick
+ * A to B (click points; POST /api/route finds the roads between them).
  */
 "use strict";
 
@@ -10,6 +15,8 @@ const API = {
   status: "/api/status",
   settings: "/api/settings",
   route: "/api/route",
+  roads: "/api/roads",
+  routePath: "/api/route-path",
   profile: "/api/profile",
   build: "/api/build",
   jobs: "/api/jobs/",
@@ -33,6 +40,7 @@ const STORE_KEYS = {
   pins: "acmg.pins",
   job: "acmg.job",
   options: "acmg.options",
+  mode: "acmg.mode",
 };
 const EMPTY_FC = { type: "FeatureCollection", features: [] };
 const EARTH_RADIUS_M = 6371008.8;
@@ -457,9 +465,28 @@ function nodeDegree(g, id) {
   return list ? list.length : 0;
 }
 
-/** A junction: 3+ segment ends meet, or a dead end. Nodes with 2 are just road. */
-function isJunction(g, id) {
-  return nodeDegree(g, id) !== 2;
+/** Unnamed service roads and tracks: driveways, parking aisles, lanes into fields. */
+function isMinorWay(w) {
+  return !!w && (w.highway === "service" || w.highway === "track") && !wayName(w);
+}
+
+/** The one way on from `cur` (arrived from `prev`) when `cur` isn't a junction worth stopping
+ * at: plain road (two segment ends), or a road passing only driveways and other minor roads
+ * (see isMinorWay; not when you are on one). Null at a junction or a dead end. */
+function throughEdge(g, prev, cur) {
+  const edges = g.adj.get(cur) || [];
+  const out = edges.filter((e) => e.to !== prev);
+  if (edges.length === 2) return out.length === 1 ? out[0] : null;
+  if (edges.length < 2 || out.length !== edges.length - 1) return null;
+  const inEdge = edges.find((e) => e.to === prev);
+  if (isMinorWay(g.ways.get(inEdge.way))) return null;
+  const major = out.filter((e) => !isMinorWay(g.ways.get(e.way)));
+  return major.length === 1 ? major[0] : null;
+}
+
+/** A junction: where the route stops to ask which way (see throughEdge). */
+function isJunction(g, prev, id) {
+  return !throughEdge(g, prev, id);
 }
 
 /** May a car drive half-edge `e` (respects one-way streets)? */
@@ -531,18 +558,17 @@ function turnWord(angle) {
   return `sharp ${side}`;
 }
 
-/** Drive on from `cur` (arrived from `prev`) through plain road nodes (2 segment ends) to the
- * next junction. Returns the nodes after `cur`, ending at the junction. Stops early at a node
- * whose roads aren't loaded yet (`isLoaded`), a one-way the wrong way (unless `anyWay`), or
- * after going all round a ring. */
+/** Drive on from `cur` (arrived from `prev`) through plain road nodes (and past driveways, see
+ * throughEdge) to the next junction. Returns the nodes after `cur`, ending at the junction.
+ * Stops early at a node whose roads aren't loaded yet (`isLoaded`), a one-way the wrong way
+ * (unless `anyWay`), or after going all round a ring. */
 function continueRun(g, prev, cur, isLoaded, anyWay) {
   const out = [];
   const seen = new Set();
   for (let guard = 0; guard < 100000; guard++) {
     if (isLoaded && !isLoaded(cur)) break;
-    const edges = g.adj.get(cur) || [];
-    if (edges.length !== 2 || seen.has(cur)) break;
-    const next = edges[0].to === prev ? edges[1] : edges[1].to === prev ? edges[0] : null;
+    if (seen.has(cur)) break;
+    const next = throughEdge(g, prev, cur);
     if (!next || next.to === prev || (!anyWay && !canDrive(g, next))) break;
     seen.add(cur);
     prev = cur;
@@ -733,6 +759,115 @@ function buildLabel(build) {
   return parts.join(" · ");
 }
 
+/** The first `m` metres of a [lon, lat] line (all of it if it is shorter). */
+function lineHead(line, m) {
+  if (!Array.isArray(line) || line.length < 2) return Array.isArray(line) ? line.slice() : [];
+  const out = [line[0]];
+  let s = 0;
+  for (let i = 1; i < line.length; i++) {
+    const d = distanceM(line[i - 1], line[i]);
+    if (s + d >= m) {
+      const f = d > 0 ? (m - s) / d : 0;
+      out.push([line[i - 1][0] + (line[i][0] - line[i - 1][0]) * f, line[i - 1][1] + (line[i][1] - line[i - 1][1]) * f]);
+      return out;
+    }
+    s += d;
+    out.push(line[i]);
+  }
+  return out;
+}
+
+/** Display angles for arrows round one point: the bearings (degrees), nudged apart so no two
+ * are closer than `minGap` (same order as given). Keeps arrows for roads that leave a junction
+ * at nearly the same angle from sitting on top of each other. */
+function spreadAngles(bearings, minGap = 40) {
+  const norm = (b) => ((b % 360) + 360) % 360;
+  const n = bearings.length;
+  if (n < 2) return bearings.map(norm);
+  const gap = Math.min(minGap, 360 / n);
+  const order = [...bearings.keys()].sort((i, j) => norm(bearings[i]) - norm(bearings[j]));
+  const a = order.map((i) => norm(bearings[i]));
+  for (let pass = 0; pass < 50; pass++) {
+    let moved = false;
+    for (let k = 0; k < n; k++) {
+      const k2 = (k + 1) % n;
+      const d = a[k2] - a[k] + (k2 === 0 ? 360 : 0);
+      if (d < gap - 1e-6) {
+        const push = (gap - d) / 2;
+        a[k] -= push;
+        a[k2] += push;
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+  const out = new Array(n);
+  order.forEach((i, k) => {
+    out[i] = norm(a[k]);
+  });
+  return out;
+}
+
+const COMPASS = ["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest"];
+
+function compassWord(bearing) {
+  return COMPASS[Math.round((((bearing % 360) + 360) % 360) / 45) % 8];
+}
+
+const KEY_BEARING = { ArrowUp: 0, ArrowRight: 90, ArrowDown: 180, ArrowLeft: 270 };
+const KEY_GLYPH = { ArrowUp: "↑", ArrowRight: "→", ArrowDown: "↓", ArrowLeft: "←" };
+
+/** The arrow key that points most nearly along `bearing` ("ArrowUp" for north...). */
+function keyForBearing(bearing) {
+  return ["ArrowUp", "ArrowRight", "ArrowDown", "ArrowLeft"][Math.round((((bearing % 360) + 360) % 360) / 90) % 4];
+}
+
+/** Which of the options (bearings; null = not allowed) an arrow key points at: the nearest
+ * within 89 degrees of the key's direction, or -1. */
+function optionForKey(bearings, key) {
+  const kb = KEY_BEARING[key];
+  if (kb == null) return -1;
+  let best = -1;
+  let bestD = 89;
+  bearings.forEach((b, i) => {
+    if (b == null) return;
+    const d = Math.abs(turnAngle(kb, b));
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  });
+  return best;
+}
+
+/** The key shown on each road's arrow at a junction: ←, ↑ or → (what keyBranches gives those
+ * keys), or its number among the roads you may take (always numbers when there are more than
+ * three). Returns one label per branch ("" for a road you may not take). */
+function branchKeyLabels(branches) {
+  const ok = branches.filter((b) => b.allowed);
+  const k = keyBranches(branches);
+  return branches.map((b) => {
+    const n = ok.indexOf(b);
+    if (n < 0) return "";
+    if (ok.length > 3) return String(n + 1);
+    if (b === k.straight) return "↑";
+    if (b === k.left) return "←";
+    if (b === k.right) return "→";
+    return String(n + 1);
+  });
+}
+
+/** The branch a key takes at a junction: arrows via keyBranches, digits by number. */
+function branchForKey(branches, key) {
+  const ok = branches.filter((b) => b.allowed);
+  if (/^[1-9]$/.test(key)) return ok[Number(key) - 1] || null;
+  const k = keyBranches(branches);
+  if (key === "ArrowLeft") return k.left;
+  if (key === "ArrowUp") return k.straight;
+  if (key === "ArrowRight") return k.right;
+  return null;
+}
+
 /* ------------------------------------------------------------------------------------------
  * Small browser utilities
  * ---------------------------------------------------------------------------------------- */
@@ -911,6 +1046,8 @@ const state = {
   map: null,
   mapReady: false,
   styleKey: "light",
+  mode: "tbt", // "tbt" (turn by turn) or "quick" (A to B points)
+  tbt: null, // turn-by-turn state (see tbtNew)
   pins: [], // [{lngLat: [lon, lat], marker, el}] in driving order: A, B, C, ... (click order)
   reversed: false, // drive the routed road backwards (sent as `reverse` to /api/route)
   loop: false, // "Back to start": the route comes back to A (sent as `loop` to /api/route)
@@ -991,8 +1128,20 @@ function initMap() {
   map.on("click", onMapClick);
   map.on("mousemove", onMapMouseMove);
   map.on("mouseout", () => {
-    if (!state.lineDrag) setMapHover(-1, false);
+    if (state.mode === "tbt") tbtHoverOff();
+    else if (!state.lineDrag) setMapHover(-1, false);
   });
+  if (state.mode === "tbt") map.keyboard.disable(); // the arrow keys take turns
+  let roadsTimer = 0;
+  map.on("moveend", () => {
+    clearTimeout(roadsTimer);
+    roadsTimer = setTimeout(() => {
+      if (state.mode !== "tbt") return;
+      tbtWantTiles();
+      if (tbtPhase() === "start") tbtRender();
+    }, 200);
+  });
+  map.on("zoomend", () => tbtRenderChip());
   map.on("mousedown", "dm-route-hit", onRouteLineDown);
   map.on("mouseup", onRouteLineUp);
   window.addEventListener("mouseup", () => setTimeout(cancelLineDrag, 0));
@@ -1048,6 +1197,8 @@ function addRouteLayers() {
     "dm-snap": snapData(),
     "dm-hover": hoverData(),
     "dm-drag": EMPTY_FC,
+    "dm-tbt-hover": EMPTY_FC,
+    "dm-tbt-branches": tbtBranchData(),
   };
   for (const [id, data] of Object.entries(sources)) {
     if (!map.getSource(id)) map.addSource(id, { type: "geojson", data });
@@ -1063,6 +1214,42 @@ function addRouteLayers() {
     source: "dm-snap",
     filter: isLine,
     paint: { "line-color": "#ffffff", "line-width": 1.5, "line-dasharray": [2, 2], "line-opacity": 0.85 },
+  });
+  // Turn by turn: the road under the mouse, the roads out of the junction, a click's preview.
+  add({
+    id: "dm-tbt-road",
+    type: "line",
+    source: "dm-tbt-hover",
+    filter: ["==", ["get", "kind"], "road"],
+    layout: { "line-join": "round", "line-cap": "round" },
+    paint: {
+      "line-color": ROUTE_COLOR,
+      "line-width": ["interpolate", ["linear"], ["zoom"], 12, 5, 17, 14],
+      "line-opacity": 0.45,
+    },
+  });
+  add({
+    id: "dm-tbt-stub-casing",
+    type: "line",
+    source: "dm-tbt-branches",
+    filter: ["all", isLine, ["==", ["get", "allowed"], true]],
+    layout: { "line-join": "round", "line-cap": "round" },
+    paint: { "line-color": CASING_COLOR, "line-width": ["case", ["get", "hot"], 10, 8], "line-opacity": 0.7 },
+  });
+  add({
+    id: "dm-tbt-stub",
+    type: "line",
+    source: "dm-tbt-branches",
+    filter: ["all", isLine, ["==", ["get", "allowed"], true]],
+    layout: { "line-join": "round", "line-cap": "round" },
+    paint: { "line-color": ["case", ["get", "hot"], ALT_HOVER_COLOR, "#ffffff"], "line-width": ["case", ["get", "hot"], 6, 4] },
+  });
+  add({
+    id: "dm-tbt-stub-no",
+    type: "line",
+    source: "dm-tbt-branches",
+    filter: ["all", isLine, ["==", ["get", "allowed"], false]],
+    paint: { "line-color": "#f05252", "line-width": 3, "line-dasharray": [1.5, 1.5], "line-opacity": 0.8 },
   });
   // The other route options: thinner grey lines under the selected one.
   add({
@@ -1155,6 +1342,28 @@ function addRouteLayers() {
       "circle-stroke-width": 3,
     },
   });
+  add({
+    id: "dm-tbt-ahead",
+    type: "line",
+    source: "dm-tbt-hover",
+    filter: ["==", ["get", "kind"], "ahead"],
+    layout: { "line-join": "round", "line-cap": "round" },
+    paint: { "line-color": ROUTE_COLOR, "line-width": 4, "line-dasharray": [1.2, 1.2], "line-opacity": 0.9 },
+  });
+  add({
+    id: "dm-tbt-junction",
+    type: "circle",
+    source: "dm-tbt-branches",
+    filter: isPoint,
+    paint: { "circle-radius": 6, "circle-color": "#ffffff", "circle-stroke-color": CASING_COLOR, "circle-stroke-width": 2.5 },
+  });
+  add({
+    id: "dm-tbt-finish",
+    type: "circle",
+    source: "dm-tbt-hover",
+    filter: isPoint,
+    paint: { "circle-radius": 6, "circle-color": "#ef4444", "circle-stroke-color": "#ffffff", "circle-stroke-width": 2.5 },
+  });
   // Invisible, wider copies of the lines: what the mouse hovers, clicks and drags.
   const hit = (id, source) =>
     add({
@@ -1201,7 +1410,8 @@ function altsData() {
 }
 
 function routeData() {
-  const line = state.route && Array.isArray(state.route.line) ? state.route.line : [];
+  let line = state.route && Array.isArray(state.route.line) ? state.route.line : [];
+  if (state.mode === "tbt") line = state.tbt ? tbtLine() : []; // drawn as you drive, no wait
   if (line.length < 2) return EMPTY_FC;
   return {
     type: "FeatureCollection",
@@ -1211,6 +1421,7 @@ function routeData() {
 
 /** Snapped points (where the pins landed on the road) plus dashed leaders from far-off pins. */
 function snapData() {
+  if (state.mode === "tbt") return EMPTY_FC;
   const snapped = state.route && Array.isArray(state.route.snapped) ? state.route.snapped : [];
   const pts = snapped.filter((p) => Array.isArray(p) && p.length === 2).map((p) => [p[1], p[0]]);
   if (!pts.length) return EMPTY_FC;
@@ -1272,7 +1483,7 @@ function setAltHover(i) {
 function applyStaleStyle() {
   const map = state.map;
   if (!map || !map.getLayer("dm-route-line")) return;
-  const stale = state.routeStale;
+  const stale = state.routeStale && state.mode !== "tbt";
   map.setPaintProperty("dm-route-line", "line-opacity", stale ? 0.4 : 1);
   map.setPaintProperty("dm-route-casing", "line-opacity", stale ? 0.3 : 0.85);
   map.setPaintProperty("dm-route-arrows", "icon-opacity", stale ? 0.3 : 1);
@@ -1281,10 +1492,14 @@ function applyStaleStyle() {
 function fitToRoute() {
   const map = state.map;
   if (!map) return;
-  const coords =
+  let coords =
     state.route && state.route.line && state.route.line.length >= 2
       ? state.route.line
       : state.pins.map((p) => p.lngLat);
+  if (state.mode === "tbt") {
+    coords = tbtLine();
+    if (!coords.length && state.tbt.start) coords = [state.tbt.start.point];
+  }
   if (!coords.length) return;
   if (coords.length === 1) {
     map.flyTo({ center: coords[0], zoom: Math.max(map.getZoom(), 14) });
@@ -1499,8 +1714,13 @@ function setWaypointMode(on) {
 function onMapClick(e) {
   const target = e.originalEvent && e.originalEvent.target;
   if (target && target.closest && target.closest(".dm-pin")) return;
+  if (target && target.closest && target.closest(".tbt-arrow")) return;
   if (Date.now() - state.lastDragEnd < 300) return;
   closeSearch();
+  if (state.mode === "tbt") {
+    tbtClick(e);
+    return;
+  }
   const shift = !!(e.originalEvent && e.originalEvent.shiftKey);
   const between = state.waypointMode || shift;
   const alt = between ? -1 : altAt(e.point);
@@ -1531,6 +1751,10 @@ function setMapHover(alt, onRoute) {
 function onMapMouseMove(e) {
   const map = state.map;
   if (!map) return;
+  if (state.mode === "tbt") {
+    tbtMouseMove(e);
+    return;
+  }
   const drag = state.lineDrag;
   if (drag) {
     if (!drag.moved && Math.hypot(e.point.x - drag.start.x, e.point.y - drag.start.y) <= LINE_DRAG_PX) return;
@@ -1560,6 +1784,7 @@ function onMapMouseMove(e) {
 function onRouteLineDown(e) {
   const ev = e.originalEvent;
   const r = state.route;
+  if (state.mode !== "quick") return;
   if (!r || state.routeStale || state.pins.length < 2 || !Array.isArray(r.line) || r.line.length < 2) return;
   if ((ev && ev.button !== 0) || (ev && ev.shiftKey) || state.waypointMode) return;
   e.preventDefault(); // no map panning while dragging the line
@@ -1656,9 +1881,8 @@ function renderPins() {
   loopBtn.setAttribute("aria-pressed", String(loop));
   $("loop-state").textContent = loop ? "On" : "Off";
   loopBtn.title = n < 2 ? "Add at least two points first" : loop ? "Make it A to B again" : "Come back to A along the roads: a loop you can lap";
-  $("btn-undo").disabled = state.history.length === 0;
   $("btn-reverse").disabled = n < 2;
-  $("btn-clear").disabled = n === 0;
+  renderHeadTools();
 }
 
 /* ------------------------------------------------------------------------------------------
@@ -1798,7 +2022,7 @@ function renderRouteInfo() {
   status.classList.toggle("error", !!state.routeError);
   status.textContent = state.routeError
     ? state.routeError
-    : state.routeStale
+    : state.routeStale && state.mode !== "tbt"
       ? "Finding the road…"
       : "";
   const r = state.route;
@@ -1821,6 +2045,1011 @@ function applyDefaultName() {
   const name = state.route ? defaultTrackName(state.route.names, !!state.route.loop) : "";
   input.placeholder = name || "Snake Road";
   if (!state.nameTouched) input.value = name;
+}
+
+/* ------------------------------------------------------------------------------------------
+ * Turn by turn (in the browser): roads in z14 tiles, the route as legs, arrows at junctions
+ *
+ * The route is the start (a point on one road segment) plus legs: the first leg's nodes are the
+ * start segment's two ends in the chosen driving direction and on to the next junction; each
+ * later leg is the nodes after the junction it leaves from. `end` finishes it (t along the last
+ * segment) or closes it back to A (`loop`). Every edit pushes a snapshot, so Backspace undoes.
+ * ---------------------------------------------------------------------------------------- */
+
+const TBT_PICK_PX = 14; // a click this close (screen pixels) to a road picks it
+const TBT_ARROW_PX = 58; // the arrows sit this far from the junction
+const TBT_STUB_M = 80; // the start of each road out of a junction, drawn under its arrow
+const TILE_RETRY_MS = 20000; // a tile that failed to load is asked for again after this
+
+function tbtNew() {
+  return {
+    g: createRoadGraph(),
+    tiles: new Map(), // "14/x/y" -> "loading" | "ok" | "error"
+    failedAt: new Map(),
+    want: [], // tiles to load next, nearest first
+    loading: null, // {since, keys}: the /api/roads request in flight
+    chipTimer: 0,
+    version: 0, // bumped whenever roads arrive
+    start: null, // {a, b, w, t, point}: segment a-b of way w, t from a
+    legs: [], // [{kind: "start" | "turn" | "close", nodes, way, name, angle}]
+    end: null, // {t, loop}
+    history: [],
+    branchCache: null,
+    markers: [],
+    markerSig: "",
+    pins: { a: null, b: null },
+    hot: -1, // the arrow under the mouse: its whole road is highlighted
+    hoverPlan: null,
+    hoverRaf: 0,
+    lastMouse: null,
+    errorShown: 0,
+    retried: false,
+  };
+}
+
+function tbtIsLoaded(id) {
+  const t = state.tbt;
+  const p = t.g.nodes.get(id);
+  return !!p && t.tiles.get(tileKeyAt(p[0], p[1])) === "ok";
+}
+
+function tbtPath() {
+  const out = [];
+  for (const leg of state.tbt.legs) for (const id of leg.nodes) out.push(id);
+  return out;
+}
+
+function tbtPhase() {
+  const t = state.tbt;
+  if (!t || !t.start) return "start";
+  if (!t.legs.length) return "direction";
+  return t.end ? "done" : "drive";
+}
+
+/** How far along the first segment (in driving order) the route starts. */
+function tbtStartT() {
+  const t = state.tbt;
+  if (!t.start || !t.legs.length) return 0;
+  return t.legs[0].nodes[0] === t.start.a ? t.start.t : 1 - t.start.t;
+}
+
+/** The route as drawn: from the start point to the finish, or round to the start again. */
+function tbtLine() {
+  const t = state.tbt;
+  if (!t || !t.legs.length) return [];
+  const st = tbtStartT();
+  const line = pathLine(t.g, tbtPath(), st, t.end ? t.end.t : 1);
+  if (t.end && t.end.loop && st > 0 && line.length) line.push(t.start.point.slice());
+  return line;
+}
+
+function tbtTip() {
+  const path = tbtPath();
+  return path.length ? path[path.length - 1] : null;
+}
+
+function tbtSnapshot() {
+  const t = state.tbt;
+  return JSON.parse(JSON.stringify({ start: t.start, legs: t.legs, end: t.end }));
+}
+
+function tbtPush() {
+  const t = state.tbt;
+  t.history.push(tbtSnapshot());
+  if (t.history.length > 300) t.history.shift();
+}
+
+function tbtRestore(snap) {
+  const t = state.tbt;
+  t.start = snap.start;
+  t.legs = snap.legs;
+  t.end = snap.end;
+}
+
+function tbtUndo() {
+  const snap = state.tbt.history.pop();
+  if (!snap) return;
+  tbtRestore(snap);
+  tbtChanged({ keepView: true });
+}
+
+function tbtClear() {
+  if (!state.tbt.start) return;
+  tbtPush();
+  tbtRestore({ start: null, legs: [], end: null });
+  tbtChanged({ keepView: true });
+}
+
+/** Cut the legs so the path has `len` nodes. */
+function tbtTruncate(len) {
+  const t = state.tbt;
+  const legs = [];
+  let count = 0;
+  for (const leg of t.legs) {
+    if (count >= len) break;
+    const take = Math.min(leg.nodes.length, len - count);
+    legs.push({ ...leg, nodes: leg.nodes.slice(0, take) });
+    count += take;
+  }
+  t.legs = legs;
+}
+
+/** The two ways you can drive off from the start point. */
+function tbtDirections() {
+  const t = state.tbt;
+  const s = t.start;
+  if (!s) return [];
+  const g = t.g;
+  const name = wayName(g.ways.get(s.w));
+  return [
+    [s.a, s.b, s.t],
+    [s.b, s.a, 1 - s.t],
+  ].map(([from, to, tt]) => {
+    const e = (g.adj.get(from) || []).find((x) => x.to === to && x.way === s.w);
+    const nodes = [from, to, ...continueRun(g, from, to, tbtIsLoaded)];
+    const coords = pathLine(g, nodes, tt, 1);
+    const bearing = bearingDeg(s.point, pointAtDistance(coords, 25));
+    return { nodes, way: s.w, name, allowed: !e || canDrive(g, e), bearing, coords };
+  });
+}
+
+/** The roads you can take at the junction the route has reached (cached until it changes). */
+function tbtBranches() {
+  const t = state.tbt;
+  if (tbtPhase() !== "drive") return [];
+  const path = tbtPath();
+  const n = path.length;
+  const sig = `${t.version}|${t.legs.length}|${n}|${path[n - 2]}|${path[n - 1]}`;
+  if (t.branchCache && t.branchCache.sig === sig) return t.branchCache.list;
+  const list = tbtIsLoaded(path[n - 1]) ? branchesAt(t.g, path, tbtIsLoaded) : [];
+  t.branchCache = { sig, list };
+  return list;
+}
+
+/** A leg that stopped where the roads weren't loaded yet drives on to the real junction once
+ * they are. True if the route grew. */
+function tbtSettle() {
+  const t = state.tbt;
+  if (t.end || !t.legs.length) return false;
+  let grew = false;
+  for (let guard = 0; guard < 50; guard++) {
+    const path = tbtPath();
+    const n = path.length;
+    const tip = path[n - 1];
+    if (!tbtIsLoaded(tip)) break;
+    const more = continueRun(t.g, path[n - 2], tip, tbtIsLoaded);
+    if (!more.length) break;
+    t.legs[t.legs.length - 1].nodes.push(...more);
+    grew = true;
+  }
+  return grew;
+}
+
+function tbtAddLeg(leg, end) {
+  tbtPush();
+  state.tbt.legs.push(leg);
+  if (end) state.tbt.end = end;
+  tbtSettle();
+  tbtChanged();
+}
+
+function tbtLegFor(br, nodes) {
+  return { kind: "turn", nodes, way: br.way, name: br.name, angle: Math.round(br.angle) };
+}
+
+function tbtTake(br) {
+  if (!br || !br.allowed || tbtPhase() !== "drive") return;
+  tbtAddLeg(tbtLegFor(br, br.run.slice()));
+}
+
+function tbtPickDirection(d) {
+  if (!d || !d.allowed || tbtPhase() !== "direction") return;
+  tbtAddLeg({ kind: "start", nodes: d.nodes.slice(), way: d.way, name: d.name, angle: 0 });
+}
+
+function tbtSetStart(seg) {
+  const t = state.tbt;
+  const pa = t.g.nodes.get(seg.a);
+  const pb = t.g.nodes.get(seg.b);
+  const tt = clamp(seg.t, 0.001, 0.999);
+  tbtPush();
+  t.start = { a: seg.a, b: seg.b, w: seg.w, t: tt, point: [pa[0] + (pb[0] - pa[0]) * tt, pa[1] + (pb[1] - pa[1]) * tt] };
+  t.legs = [];
+  t.end = null;
+  const ok = tbtDirections().filter((d) => d.allowed);
+  if (ok.length === 1) {
+    // A one-way street: there is only one way to go.
+    t.legs.push({ kind: "start", nodes: ok[0].nodes.slice(), way: ok[0].way, name: ok[0].name, angle: 0 });
+    tbtSettle();
+    toast(`${ok[0].name || "This road"} is one-way, so you drive it the way it goes.`);
+  }
+  tbtChanged();
+}
+
+function tbtFinish() {
+  if (tbtPhase() !== "drive") return;
+  tbtPush();
+  state.tbt.end = { t: 1, loop: false };
+  tbtChanged({ keepView: true });
+}
+
+/** The path closed back to A, when the route has come back round to A's road. */
+function tbtLoopPath() {
+  if (tbtPhase() !== "drive") return null;
+  return closeLoopPath(state.tbt.g, tbtPath(), tbtIsLoaded);
+}
+
+function tbtCloseLoop() {
+  const closed = tbtLoopPath();
+  if (!closed) return;
+  const t = state.tbt;
+  const path = tbtPath();
+  tbtPush();
+  if (closed.length > path.length) {
+    const nodes = closed.slice(path.length);
+    const br = tbtBranches().find((b) => b.to === nodes[0]);
+    t.legs.push({
+      kind: "close",
+      nodes,
+      way: br ? br.way : edgeWay(t.g, path[path.length - 1], nodes[0]),
+      name: br ? br.name : wayName(t.g.ways.get(t.start.w)),
+      angle: br ? Math.round(br.angle) : 0,
+    });
+  } else {
+    tbtTruncate(closed.length);
+  }
+  t.end = { t: 1, loop: true };
+  tbtChanged({ keepView: true });
+}
+
+/** Metres per screen pixel at latitude `lat` at the map's zoom (512 px tiles). */
+function metresPerPixel(lat) {
+  const z = state.map ? state.map.getZoom() : 15;
+  return (40075016.686 * Math.cos(toRad(lat))) / (512 * 2 ** z);
+}
+
+function tbtSegAt(lngLat) {
+  const p = [lngLat.lng, lngLat.lat];
+  return nearestSegment(state.tbt.g, p, clamp(TBT_PICK_PX * metresPerPixel(p[1]), 3, 300));
+}
+
+/** Where segment `seg` is from the end of the route: on the last leg (`behind`: cut = its
+ * index in the path) or ahead ({nodes to add, cut = the segment's end in nodes, branch});
+ * `t` is how far along the segment the click is, in driving order. Null: not reachable. */
+function tbtPlanTo(seg) {
+  const t = state.tbt;
+  const path = tbtPath();
+  const n = path.length;
+  const last = t.legs[t.legs.length - 1];
+  const from = Math.max(1, n - last.nodes.length);
+  for (let k = n - 1; k >= from; k--) {
+    const fwd = path[k - 1] === seg.a && path[k] === seg.b;
+    if (fwd || (path[k - 1] === seg.b && path[k] === seg.a)) return { behind: true, cut: k, t: fwd ? seg.t : 1 - seg.t };
+  }
+  const ahead = findAhead(t.g, path, seg, tbtIsLoaded);
+  if (!ahead) return null;
+  return { behind: false, nodes: ahead.nodes, cut: ahead.cut, t: ahead.forward ? seg.t : 1 - seg.t, branch: ahead.branch };
+}
+
+function tbtDriveClick(seg, shift) {
+  const plan = tbtPlanTo(seg);
+  if (!plan) {
+    toast("You can't get there from the end of your route. Pick the next road with the arrows, or click further along a road you can turn onto.");
+    return;
+  }
+  const t = clamp(plan.t, 0.001, 1);
+  if (plan.behind) {
+    if (!shift) {
+      toast("That's on your route already. Shift+click it to finish there.");
+      return;
+    }
+    if (plan.cut === 1 && t <= tbtStartT() + 0.01) {
+      toast("Finish after the start (A).");
+      return;
+    }
+    tbtPush();
+    tbtTruncate(plan.cut + 1);
+    state.tbt.end = { t, loop: false };
+    tbtChanged({ keepView: true });
+    return;
+  }
+  if (shift) tbtAddLeg(tbtLegFor(plan.branch, plan.nodes.slice(0, plan.cut + 1)), { t, loop: false });
+  else tbtAddLeg(tbtLegFor(plan.branch, plan.nodes));
+}
+
+function tbtClick(e) {
+  const t = state.tbt;
+  const shift = !!(e.originalEvent && e.originalEvent.shiftKey);
+  const phase = tbtPhase();
+  const seg = tbtSegAt(e.lngLat);
+  if (!seg) {
+    if (state.map.getZoom() < ROADS_MIN_ZOOM) toast("Zoom in closer to pick a road.");
+    else if (t.loading) toast("The roads here are still loading. Try again in a moment.");
+    else if (phase === "start" || phase === "direction") toast("Click right on a road to start there.");
+    return;
+  }
+  if (phase === "start" || phase === "direction") {
+    tbtSetStart(seg);
+  } else if (phase === "done") {
+    toast(t.end.loop ? "The loop is closed. Press Backspace to open it again." : "Your route is finished. Press Backspace to keep driving.");
+  } else {
+    tbtDriveClick(seg, shift);
+  }
+}
+
+/* -- hover: the road under the mouse, or where a click would take the route ---------------- */
+
+function tbtMouseMove(e) {
+  const t = state.tbt;
+  t.lastMouse = { lngLat: e.lngLat, shift: !!(e.originalEvent && e.originalEvent.shiftKey) };
+  if (!t.hoverRaf) t.hoverRaf = requestAnimationFrame(tbtUpdateHover);
+}
+
+function tbtHoverPlan(seg, phase) {
+  const t = state.tbt;
+  const key = `${t.version}|${t.history.length}|${t.legs.length}|${phase}|${seg.a}|${seg.b}`;
+  if (t.hoverPlan && t.hoverPlan.key === key) return t.hoverPlan;
+  let plan = { key, kind: "none" };
+  if (phase === "start" || phase === "direction") {
+    plan = { key, kind: "road", coords: coordsOf(t.g, runAround(t.g, seg.a, seg.b)) };
+  } else if (phase === "drive") {
+    const p = tbtPlanTo(seg);
+    if (p) plan = { key, kind: p.behind ? "behind" : "ahead", p };
+  }
+  t.hoverPlan = plan;
+  return plan;
+}
+
+function tbtUpdateHover() {
+  const t = state.tbt;
+  t.hoverRaf = 0;
+  const m = t.lastMouse;
+  const features = [];
+  let pointer = false;
+  const phase = tbtPhase();
+  if (m && state.mode === "tbt" && phase !== "done" && state.map) {
+    const seg = tbtSegAt(m.lngLat);
+    if (seg) {
+      const plan = tbtHoverPlan(seg, phase);
+      const line = (coords, kind) => ({ type: "Feature", properties: { kind }, geometry: { type: "LineString", coordinates: coords } });
+      const dot = (p) => ({ type: "Feature", properties: { kind: "finish" }, geometry: { type: "Point", coordinates: p } });
+      if (plan.kind === "road" && plan.coords.length >= 2) {
+        features.push(line(plan.coords, "road"));
+        pointer = true;
+      } else if (plan.kind === "ahead") {
+        const g = t.g;
+        const tip = g.nodes.get(tbtTip());
+        const p = plan.p;
+        const coords = m.shift
+          ? [tip, ...coordsOf(g, p.nodes.slice(0, p.cut)), seg.point]
+          : [tip, ...coordsOf(g, p.nodes)];
+        features.push(line(coords, "ahead"));
+        if (m.shift) features.push(dot(seg.point));
+        pointer = true;
+      } else if (plan.kind === "behind" && m.shift) {
+        features.push(dot(seg.point));
+        pointer = true;
+      }
+    }
+  }
+  setSourceData("dm-tbt-hover", features.length ? { type: "FeatureCollection", features } : EMPTY_FC);
+  const canvas = state.map && state.map.getCanvas();
+  if (canvas && state.mode === "tbt") canvas.style.cursor = pointer ? "pointer" : "";
+}
+
+function tbtHoverOff() {
+  const t = state.tbt;
+  if (!t) return;
+  t.lastMouse = null;
+  setSourceData("dm-tbt-hover", EMPTY_FC);
+}
+
+/* -- the arrows: the ways to go from the start point or the junction ---------------------- */
+
+/** What the arrows offer now: {at: [lon, lat], items: [{key, title, allowed, bearing, coords,
+ * act}]}. */
+function tbtChoices() {
+  const t = state.tbt;
+  const phase = tbtPhase();
+  if (phase === "direction") {
+    const dirs = tbtDirections();
+    return {
+      at: t.start.point,
+      items: dirs.map((d, i) => ({
+        key: d.allowed ? KEY_GLYPH[keyForBearing(d.bearing)] : "",
+        num: i + 1,
+        title: d.allowed ? `Drive ${compassWord(d.bearing)}${d.name ? ` on ${d.name}` : ""}` : `${d.name || "This road"} is one-way the other way`,
+        icon: d.bearing,
+        allowed: d.allowed,
+        bearing: d.bearing,
+        coords: d.coords,
+        act: () => tbtPickDirection(d),
+      })),
+    };
+  }
+  if (phase === "drive") {
+    const brs = tbtBranches();
+    const keys = branchKeyLabels(brs);
+    const at = t.g.nodes.get(tbtTip());
+    return {
+      at,
+      items: brs.map((b, i) => ({
+        key: keys[i],
+        num: i + 1,
+        title: b.allowed
+          ? legLabel({ kind: "turn", name: b.name, angle: b.angle }, wayName(t.g.ways.get(t.legs[t.legs.length - 1].way)))
+          : `${b.name || "This road"}: one-way, no entry`,
+        icon: b.angle,
+        allowed: b.allowed,
+        bearing: b.bearing,
+        coords: b.coords,
+        act: () => tbtTake(b),
+      })),
+    };
+  }
+  return { at: null, items: [] };
+}
+
+function tbtClearMarkers() {
+  const t = state.tbt;
+  for (const m of t.markers) m.remove();
+  t.markers = [];
+  t.markerSig = "";
+}
+
+const ARROW_SVG =
+  '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M12 20V5M5.5 11.5L12 5l6.5 6.5"/></svg>';
+const NO_ENTRY_SVG =
+  '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round">' +
+  '<path d="M6 12h12"/></svg>';
+
+function tbtArrowIcon(deg, allowed) {
+  const span = h("span", { class: "tbt-icon", style: allowed ? `transform: rotate(${Math.round(deg)}deg)` : null });
+  span.innerHTML = allowed ? ARROW_SVG : NO_ENTRY_SVG; // static markup, no user data
+  return span;
+}
+
+function tbtSetHot(i) {
+  const t = state.tbt;
+  if (t.hot === i) return;
+  t.hot = i;
+  setSourceData("dm-tbt-branches", tbtBranchData());
+  for (const [k, m] of t.markers.entries()) m.getElement().classList.toggle("hot", k === i);
+  const list = $("tbt-choice-list");
+  [...list.querySelectorAll("button")].forEach((b, k) => b.classList.toggle("hot", k === i));
+}
+
+/** The arrow buttons on the map round the junction (or the start point). */
+function tbtRenderMarkers() {
+  const t = state.tbt;
+  const map = state.map;
+  if (!map || !window.maplibregl) return;
+  const ch = state.mode === "tbt" ? tbtChoices() : { at: null, items: [] };
+  const sig = ch.at ? `${ch.at.join(",")}|${ch.items.map((c) => `${c.bearing.toFixed(1)}/${c.allowed}/${c.key}`).join(";")}` : "";
+  if (sig === t.markerSig) return;
+  tbtClearMarkers();
+  t.markerSig = sig;
+  t.hot = -1;
+  if (!ch.at) return;
+  const angles = spreadAngles(ch.items.map((c) => c.bearing), 42);
+  // Round the start point the arrows sit a little further out, clear of the A pin.
+  const r = tbtPhase() === "direction" ? TBT_ARROW_PX + 10 : TBT_ARROW_PX;
+  ch.items.forEach((c, i) => {
+    const a = toRad(angles[i]);
+    const el = h(
+      "button",
+      {
+        type: "button",
+        class: `tbt-arrow${c.allowed ? "" : " no"}`,
+        title: c.allowed ? `${c.title}${c.key ? ` (${c.key})` : ""}` : c.title,
+        "aria-label": c.title,
+        disabled: !c.allowed,
+        onclick: (e) => {
+          e.stopPropagation();
+          c.act();
+        },
+        onmouseenter: () => tbtSetHot(i),
+        onmouseleave: () => tbtSetHot(-1),
+      },
+      tbtArrowIcon(angles[i], c.allowed),
+      c.key ? h("span", { class: "tbt-key" }, c.key) : null,
+    );
+    el.addEventListener("mousedown", (e) => e.stopPropagation());
+    const marker = new window.maplibregl.Marker({
+      element: el,
+      anchor: "center",
+      offset: [Math.sin(a) * r, -Math.cos(a) * r],
+    })
+      .setLngLat(ch.at)
+      .addTo(map);
+    t.markers.push(marker);
+  });
+}
+
+/** The first stretch of each road out of the junction (and the whole of the hovered one), plus
+ * the junction itself. */
+function tbtBranchData() {
+  const t = state.tbt;
+  if (!t || state.mode !== "tbt") return EMPTY_FC;
+  const ch = tbtChoices();
+  if (!ch.at) return EMPTY_FC;
+  const features = ch.items.map((c, i) => ({
+    type: "Feature",
+    properties: { i, allowed: c.allowed, hot: i === t.hot },
+    geometry: { type: "LineString", coordinates: i === t.hot ? c.coords : lineHead(c.coords, TBT_STUB_M) },
+  }));
+  features.push({ type: "Feature", properties: { i: -1 }, geometry: { type: "Point", coordinates: ch.at } });
+  return { type: "FeatureCollection", features };
+}
+
+function tbtPin(role, label) {
+  const shape = h("span", { class: "dm-pin-shape" });
+  shape.innerHTML = PIN_SVG; // static markup, no user data
+  const el = h("div", { class: `dm-pin dm-pin--fixed dm-pin--${role}` }, shape, h("span", { class: "dm-pin-label" }, label));
+  return new window.maplibregl.Marker({ element: el, anchor: "bottom" });
+}
+
+/** A at the start, B at the finish (A doubles as the finish on a loop). */
+function tbtRenderPins() {
+  const t = state.tbt;
+  const map = state.map;
+  if (!map || !window.maplibregl) return;
+  const show = state.mode === "tbt";
+  if (show && t.start) {
+    if (!t.pins.a) t.pins.a = tbtPin("start", "A");
+    const loop = !!(t.end && t.end.loop);
+    const el = t.pins.a.getElement();
+    el.classList.toggle("dm-pin--loop", loop);
+    el.title = loop ? "A: start and finish" : "A: start";
+    t.pins.a.setLngLat(t.start.point);
+    if (!el.isConnected) t.pins.a.addTo(map);
+  } else if (t.pins.a) {
+    t.pins.a.remove();
+  }
+  const line = tbtLine();
+  if (show && t.end && !t.end.loop && line.length) {
+    if (!t.pins.b) t.pins.b = tbtPin("finish", "B");
+    t.pins.b.getElement().title = "B: finish";
+    t.pins.b.setLngLat(line[line.length - 1]);
+    if (!t.pins.b.getElement().isConnected) t.pins.b.addTo(map);
+  } else if (t.pins.b) {
+    t.pins.b.remove();
+  }
+}
+
+function tbtRenderMap() {
+  drawRoute();
+  tbtRenderMarkers();
+  tbtRenderPins();
+  setSourceData("dm-tbt-branches", tbtBranchData());
+  tbtUpdateHover();
+}
+
+function tbtClearMap() {
+  const t = state.tbt;
+  tbtClearMarkers();
+  if (t.pins.a) t.pins.a.remove();
+  if (t.pins.b) t.pins.b.remove();
+  tbtHoverOff();
+  setSourceData("dm-tbt-branches", EMPTY_FC);
+}
+
+/** Pan so the junction you're at stays on screen while you drive with the keys. */
+function tbtKeepTipInView() {
+  const map = state.map;
+  const t = state.tbt;
+  if (!map || !t.start || t.end) return;
+  const p = t.legs.length ? t.g.nodes.get(tbtTip()) : t.start.point;
+  if (!p) return;
+  const q = map.project(p);
+  const c = map.getCanvas();
+  const pad = 90;
+  if (q.x < pad || q.y < pad || q.x > c.clientWidth - pad || q.y > c.clientHeight - pad) map.easeTo({ center: p, duration: 450 });
+}
+
+/* -- the sidebar --------------------------------------------------------------------------- */
+
+const LEG_ICONS = {
+  loop:
+    '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v5h-5"/></svg>',
+};
+
+function tbtLegLengths() {
+  const t = state.tbt;
+  const g = t.g;
+  const st = tbtStartT();
+  const out = [];
+  let prev = null;
+  t.legs.forEach((leg, i) => {
+    const last = i === t.legs.length - 1;
+    const ids = i === 0 ? leg.nodes : [prev, ...leg.nodes];
+    let len = lineLengthM(pathLine(g, ids, i === 0 ? st : 0, last && t.end ? t.end.t : 1));
+    if (last && t.end && t.end.loop && st > 0) len += distanceM(g.nodes.get(leg.nodes[leg.nodes.length - 1]) || t.start.point, t.start.point);
+    out.push(len);
+    prev = leg.nodes[leg.nodes.length - 1];
+  });
+  return out;
+}
+
+function tbtRender() {
+  const t = state.tbt;
+  const phase = tbtPhase();
+  const zoomedOut = !state.map || state.map.getZoom() < ROADS_MIN_ZOOM;
+  let hint;
+  if (phase === "start") {
+    hint = zoomedOut
+      ? "Zoom in on the map to where you want to drive, then click the road you start on."
+      : "Click the road you want to start on.";
+  } else if (phase === "direction") {
+    hint = "Which way? Click an arrow on the map, or press the arrow key that points that way.";
+  } else if (phase === "drive") {
+    const brs = tbtBranches();
+    if (!tbtIsLoaded(tbtTip())) hint = "Loading the roads ahead…";
+    else if (!brs.some((b) => b.allowed)) hint = "Dead end: there's no road you may take from here. Finish here, or press Backspace.";
+    else hint = "Pick the next road: click an arrow, press ← ↑ →, or click further along a road to drive straight through junctions.";
+  } else {
+    hint = t.end.loop
+      ? "Loop closed: the road comes back round to A. Create your map, or press Backspace to change it."
+      : "Finished at B. Create your map, or press Backspace to keep driving.";
+  }
+  $("tbt-hint").textContent = hint;
+
+  // The legs: "Start on Snake Road · 420 m", "Left onto Mountain Brow Road · 1.2 km", ...
+  const lengths = tbtLegLengths();
+  const legsEl = $("tbt-legs");
+  let prevName = "";
+  const groups = []; // straight on along the same road: one row
+  t.legs.forEach((leg, i) => {
+    const last = groups[groups.length - 1];
+    const straight = leg.kind === "turn" && turnWord(leg.angle || 0) === "straight";
+    if (last && straight && leg.name && leg.name === last.leg.name) last.len += lengths[i];
+    else groups.push({ leg, len: lengths[i] });
+  });
+  const rows = groups.map(({ leg, len }) => {
+    const label = legLabel(leg, prevName);
+    prevName = leg.name;
+    let icon;
+    if (leg.kind === "start") icon = h("span", { class: "pin-badge start", "aria-hidden": "true" }, "A");
+    else if (leg.kind === "close") {
+      icon = h("span", { class: "leg-icon", "aria-hidden": "true" });
+      icon.innerHTML = LEG_ICONS.loop; // static markup
+    } else {
+      icon = h("span", { class: "leg-icon", "aria-hidden": "true" }, tbtArrowIcon(leg.angle || 0, true));
+    }
+    return h("li", { class: `leg leg-${leg.kind}` }, icon, h("span", { class: "leg-text" }, label), h("span", { class: "leg-len" }, formatLength(len)));
+  });
+  if (t.end && !t.end.loop) {
+    rows.push(h("li", { class: "leg leg-finish" }, h("span", { class: "pin-badge finish", "aria-hidden": "true" }, "B"), h("span", { class: "leg-text" }, "Finish")));
+  }
+  legsEl.replaceChildren(...rows);
+  legsEl.scrollTop = legsEl.scrollHeight;
+
+  // The choices, as buttons too (the same as the arrows on the map).
+  const ch = tbtChoices();
+  $("tbt-choices").hidden = !ch.items.length;
+  $("tbt-choices-label").textContent = phase === "direction" ? "Which way?" : "Next road";
+  $("tbt-choice-list").replaceChildren(
+    ...ch.items.map((c, i) =>
+      h(
+        "li",
+        {},
+        h(
+          "button",
+          {
+            type: "button",
+            class: "tbt-choice",
+            disabled: !c.allowed,
+            title: c.title,
+            onclick: () => c.act(),
+            onmouseenter: () => tbtSetHot(i),
+            onmouseleave: () => tbtSetHot(-1),
+          },
+          tbtArrowIcon(c.icon, c.allowed),
+          h("span", { class: "tbt-choice-text" }, c.title),
+          c.key ? h("kbd", {}, c.key) : null,
+        ),
+      ),
+    ),
+  );
+
+  $("tbt-tools").hidden = phase === "start" || phase === "direction";
+  const loopPath = tbtLoopPath();
+  const closed = !!(t.end && t.end.loop);
+  $("tbt-finish").disabled = phase !== "drive";
+  const loopBtn = $("tbt-loop");
+  loopBtn.disabled = !loopPath;
+  loopBtn.setAttribute("aria-pressed", String(closed));
+  loopBtn.title = loopPath ? "Close the loop back to A" : closed ? "The loop is closed" : "Drive back to A's road first";
+  const loopHint = $("tbt-loop-hint");
+  loopHint.textContent =
+    phase !== "drive" ? "" : loopPath ? "You're back on A's road: Back to start closes the loop." : "Drive back to A to close the loop.";
+  loopHint.classList.toggle("ready", !!loopPath);
+  renderHeadTools();
+}
+
+/* -- roads: z14 tiles round the view and round the end of the route ------------------------ */
+
+function tbtWantTiles() {
+  const t = state.tbt;
+  const map = state.map;
+  if (!t || !map || state.mode !== "tbt") return;
+  const want = [];
+  const tip = !t.end && t.legs.length ? t.g.nodes.get(tbtTip()) : null;
+  if (tip) want.push(...tilesForBounds(tip[0], tip[1], tip[0], tip[1], 1));
+  const z = map.getZoom();
+  if (z >= ROADS_MIN_ZOOM) {
+    const b = map.getBounds();
+    want.push(...tilesForBounds(b.getWest(), b.getSouth(), b.getEast(), b.getNorth(), z >= 14 ? 1 : 0));
+  }
+  const now = Date.now();
+  t.want = [...new Set(want)].filter((k) => {
+    const s = t.tiles.get(k);
+    return !s || (s === "error" && now - (t.failedAt.get(k) || 0) > TILE_RETRY_MS);
+  });
+  tbtPump();
+  tbtRenderChip();
+}
+
+async function tbtPump() {
+  const t = state.tbt;
+  if (t.loading || state.mode !== "tbt") return;
+  const keys = t.want.filter((k) => t.tiles.get(k) !== "ok" && t.tiles.get(k) !== "loading").slice(0, ROADS_BATCH);
+  t.want = t.want.filter((k) => !keys.includes(k));
+  if (!keys.length) {
+    tbtRenderChip();
+    return;
+  }
+  for (const k of keys) t.tiles.set(k, "loading");
+  t.loading = { since: Date.now(), keys };
+  tbtRenderChip();
+  let problem = "";
+  try {
+    const res = await api(API.roads, { method: "POST", body: { tiles: keys } });
+    addRoads(t.g, res);
+    const got = (res && res.tiles) || {};
+    for (const k of keys) {
+      if (got[k] === "ok") t.tiles.set(k, "ok");
+      else {
+        t.tiles.set(k, "error");
+        t.failedAt.set(k, Date.now());
+      }
+    }
+    if (res && res.error) problem = String(res.error);
+  } catch (err) {
+    for (const k of keys) {
+      t.tiles.set(k, "error");
+      t.failedAt.set(k, Date.now());
+    }
+    problem = err.message;
+  }
+  t.loading = null;
+  t.version++;
+  if (problem && Date.now() - t.errorShown > 15000) {
+    t.errorShown = Date.now();
+    toast(problem, "error");
+  }
+  if (state.mode === "tbt") {
+    if (tbtSettle()) tbtChanged();
+    else {
+      tbtRender();
+      tbtRenderMap();
+    }
+  }
+  tbtPump();
+}
+
+function tbtRenderChip() {
+  const t = state.tbt;
+  const chip = $("roads-chip");
+  const stop = () => {
+    clearInterval(t.chipTimer);
+    t.chipTimer = 0;
+  };
+  if (state.mode !== "tbt" || !state.map) {
+    chip.hidden = true;
+    stop();
+    return;
+  }
+  if (t.loading) {
+    const s = Math.floor((Date.now() - t.loading.since) / 1000);
+    $("roads-chip-text").textContent = `Loading roads… ${s} s`;
+    $("roads-spinner").hidden = false;
+    chip.dataset.kind = "loading";
+    chip.hidden = false;
+    if (!t.chipTimer) t.chipTimer = setInterval(tbtRenderChip, 1000);
+    return;
+  }
+  stop();
+  if (state.map.getZoom() < ROADS_MIN_ZOOM && tbtPhase() === "start") {
+    $("roads-chip-text").textContent = "Zoom in to pick a road";
+    $("roads-spinner").hidden = true;
+    chip.dataset.kind = "zoom";
+    chip.hidden = false;
+    return;
+  }
+  chip.hidden = true;
+}
+
+/* -- the route: POST /api/route-path for the path as it stands ----------------------------- */
+
+function tbtChanged(opts = {}) {
+  const t = state.tbt;
+  t.hoverPlan = null;
+  t.hot = -1;
+  t.retried = false;
+  tbtRender();
+  tbtRenderMap();
+  tbtWantTiles();
+  if (!opts.keepView) tbtKeepTipInView();
+  tbtScheduleRoute();
+}
+
+function tbtScheduleRoute() {
+  clearTimeout(state.routeTimer);
+  if (state.routeAbort) state.routeAbort.abort();
+  state.routeAbort = null;
+  state.routeSeq++;
+  state.routeOptions = [];
+  state.optionIndex = 0;
+  state.altHover = -1;
+  setBusy(false);
+  if (tbtPath().length < 2) {
+    state.route = null;
+    state.routeCum = null;
+    state.routeStale = false;
+    state.routeError = "";
+    drawRoute();
+    renderRouteInfo();
+    resetProfile();
+    updateBuildPanel();
+    return;
+  }
+  state.routeStale = true;
+  state.routeError = "";
+  renderRouteInfo();
+  updateBuildPanel();
+  state.routeTimer = setTimeout(requestTbtRoute, 300);
+}
+
+async function requestTbtRoute() {
+  const seq = state.routeSeq;
+  const ctrl = new AbortController();
+  state.routeAbort = ctrl;
+  const t = state.tbt;
+  const path = tbtPath();
+  const loop = !!(t.end && t.end.loop);
+  const round6 = (x) => Math.round(x * 1e6) / 1e6;
+  const body = {
+    path: path.map(Number),
+    start_t: round6(tbtStartT()),
+    end_t: loop ? 1 : round6(t.end ? t.end.t : 1),
+    loop,
+  };
+  try {
+    const route = await api(API.routePath, { method: "POST", body, signal: ctrl.signal });
+    if (seq !== state.routeSeq) return;
+    state.routeOptions = [route];
+    state.routeSnapped = route.snapped;
+    state.routeStale = false;
+    state.routeError = "";
+    selectOption(0, true);
+  } catch (err) {
+    if ((err && err.name === "AbortError") || seq !== state.routeSeq) return;
+    if (err.status === 409 && !t.retried) {
+      // The app forgot the roads (restarted?): send it the tiles again, then try once more.
+      t.retried = true;
+      const keys = [...new Set(path.map((id) => t.g.nodes.get(id)).filter(Boolean).map((p) => tileKeyAt(p[0], p[1])))];
+      try {
+        for (let i = 0; i < keys.length; i += ROADS_BATCH) {
+          await api(API.roads, { method: "POST", body: { tiles: keys.slice(i, i + ROADS_BATCH) } });
+        }
+      } catch {
+        /* the retry reports it */
+      }
+      if (seq === state.routeSeq) requestTbtRoute();
+      return;
+    }
+    state.route = null;
+    state.routeCum = null;
+    state.routeStale = false;
+    state.routeError = err.message || "Couldn't make the route.";
+    drawRoute();
+    renderRouteInfo();
+    resetProfile("No route yet, so no elevation profile.");
+  } finally {
+    if (seq === state.routeSeq) {
+      state.routeAbort = null;
+      updateBuildPanel();
+    }
+  }
+}
+
+/** Keys while driving. True if the key was used. */
+function tbtKey(e) {
+  const phase = tbtPhase();
+  if (e.key === "Backspace") {
+    tbtUndo();
+    return true;
+  }
+  if (e.key === "Enter" && phase === "drive" && !(e.target && e.target.closest && e.target.closest("button"))) {
+    tbtFinish();
+    return true;
+  }
+  const isArrow = e.key in KEY_BEARING;
+  const isDigit = /^[1-9]$/.test(e.key);
+  if (!isArrow && !isDigit) return false;
+  if (phase === "direction") {
+    const dirs = tbtDirections();
+    const i = isDigit ? Number(e.key) - 1 : optionForKey(dirs.map((d) => (d.allowed ? d.bearing : null)), e.key);
+    if (dirs[i] && dirs[i].allowed) tbtPickDirection(dirs[i]);
+    return true;
+  }
+  if (phase === "drive") {
+    const br = branchForKey(tbtBranches(), e.key);
+    if (br) tbtTake(br);
+    return true;
+  }
+  return isArrow && phase !== "start";
+}
+
+/* -- switching between turn by turn and quick A to B --------------------------------------- */
+
+function applyModeUi() {
+  const m = state.mode;
+  $("mode-tbt").setAttribute("aria-pressed", String(m === "tbt"));
+  $("mode-quick").setAttribute("aria-pressed", String(m === "quick"));
+  $("tbt-panel").hidden = m !== "tbt";
+  $("quick-panel").hidden = m !== "quick";
+  $("btn-reverse").hidden = m === "tbt";
+  $("map").setAttribute("aria-label", m === "tbt" ? "Map. Click the road you start on, then pick each turn." : "Map. Click to add points.");
+  const map = state.map;
+  if (map && map.keyboard) {
+    if (m === "tbt") map.keyboard.disable(); // the arrow keys take turns
+    else map.keyboard.enable();
+  }
+}
+
+function setMode(mode) {
+  const m = mode === "quick" ? "quick" : "tbt";
+  if (m === state.mode) return;
+  state.mode = m;
+  store.set(STORE_KEYS.mode, m);
+  closeSearch();
+  if (m === "tbt") {
+    setWaypointMode(false);
+    cancelLineDrag();
+    setPins([]); // the points stay saved for when you come back
+    setMapHover(-1, false);
+  } else {
+    tbtClearMap();
+    restorePins();
+  }
+  applyModeUi();
+  enterMode();
+}
+
+function enterMode() {
+  if (state.mode === "tbt") {
+    tbtChanged({ keepView: true });
+  } else {
+    renderPins();
+    scheduleRoute();
+  }
+  tbtRenderChip();
+  updateBuildPanel();
+}
+
+/** The Undo and Clear buttons in the card's head, for whichever mode is on. */
+function renderHeadTools() {
+  const tbt = state.mode === "tbt";
+  const undoBtn = $("btn-undo");
+  const clearBtn = $("btn-clear");
+  undoBtn.disabled = tbt ? !state.tbt.history.length : state.history.length === 0;
+  undoBtn.title = tbt ? "Undo the last turn (Backspace)" : "Undo (Ctrl+Z)";
+  clearBtn.disabled = tbt ? !state.tbt.start : state.pins.length === 0;
+  clearBtn.title = tbt ? "Start again" : "Remove all points";
 }
 
 /* ------------------------------------------------------------------------------------------
@@ -1864,7 +3093,9 @@ function resetProfile(message) {
   $("profile-stats").textContent = "";
   $("profile-source").textContent = "";
   $("profile-tip").hidden = true;
-  showProfileMessage(message || "Click two points to see the elevation profile.");
+  showProfileMessage(
+    message || (state.mode === "tbt" ? "Start on a road to see the elevation profile." : "Click two points to see the elevation profile."),
+  );
   setSourceData("dm-hover", EMPTY_FC);
   drawProfile();
 }
@@ -2199,6 +3430,10 @@ function setPill(kind, text, title) {
 
 function applyStatus(st) {
   state.status = st || null;
+  const label = $("build-label");
+  label.textContent = buildLabel(st && st.build);
+  const b = (st && st.build) || {};
+  label.title = b.commit ? `Version ${b.version || "dev"}, commit ${b.commit}${b.date ? `, built ${b.date}` : ""}` : "A development build";
   if (st && st.ac_found) {
     setPill("ok", "Assetto Corsa found", `${st.ac_root || ""}\nClick to change the folder.`);
   } else {
@@ -2266,7 +3501,13 @@ async function saveAcRoot(e) {
  * Build
  * ---------------------------------------------------------------------------------------- */
 
-const OPTION_IDS = ["opt-trees", "opt-buildings", "opt-guardrails", "opt-install"];
+const OPTION_IDS = ["opt-trees", "opt-buildings", "opt-install"];
+const GUARDRAIL_MODES = ["auto", "mapped", "off"];
+const GUARDRAIL_HINTS = {
+  auto: "Rails where Ontario's road rules call for them (steep drops, high embankments, deep water, bridge ends), plus any mapped in OpenStreetMap.",
+  mapped: "Only the guardrails and barriers mapped in OpenStreetMap.",
+  off: "No guardrails at all.",
+};
 
 function loadOptions() {
   const saved = store.get(STORE_KEYS.options);
@@ -2274,12 +3515,14 @@ function loadOptions() {
     for (const id of OPTION_IDS) if (typeof saved[id] === "boolean") $(id).checked = saved[id];
     const d = Number(saved.density);
     if (Number.isFinite(d)) $("opt-density").value = String(clamp(d, 0, 2));
+    if (GUARDRAIL_MODES.includes(saved.guardrails)) $("opt-guardrails").value = saved.guardrails;
+    else if (saved["opt-guardrails"] === false) $("opt-guardrails").value = "off"; // the old on/off switch
   }
   renderDensity();
 }
 
 function saveOptions() {
-  const out = { density: Number($("opt-density").value) };
+  const out = { density: Number($("opt-density").value), guardrails: $("opt-guardrails").value };
   for (const id of OPTION_IDS) out[id] = $(id).checked;
   store.set(STORE_KEYS.options, out);
 }
@@ -2289,13 +3532,15 @@ function renderDensity() {
   const trees = $("opt-trees").checked;
   $("opt-density").disabled = !trees;
   $("density-out").textContent = trees ? `${densityLabel(v)} (${v.toFixed(1)}x)` : "No trees";
+  $("guardrails-hint").textContent = GUARDRAIL_HINTS[$("opt-guardrails").value] || "";
 }
 
 function buildOptions() {
   return {
     trees: $("opt-trees").checked,
     buildings: $("opt-buildings").checked,
-    guardrails: $("opt-guardrails").checked,
+    guardrails: $("opt-guardrails").value !== "off",
+    auto_guardrails: $("opt-guardrails").value === "auto",
     scenery_density: Number($("opt-density").value),
   };
 }
@@ -2307,13 +3552,16 @@ function updateBuildPanel() {
   btn.disabled = !ready || busy;
   btn.textContent = busy ? "Creating map…" : "Create map";
   let hint;
+  const tbt = state.mode === "tbt";
   if (busy) hint = "You can keep exploring. The map is made while the app is open.";
-  else if (state.pins.length < 2) hint = "Click at least two points on the map first.";
+  else if (tbt && !(state.tbt && state.tbt.legs.length)) hint = "Pick your road on the map first.";
+  else if (!tbt && state.pins.length < 2) hint = "Click at least two points on the map first.";
   else if (state.routeStale) hint = "Waiting for the route…";
   else if (!state.route) hint = "Fix the route above first.";
   else if ($("opt-install").checked && state.status && !state.status.ac_found)
     hint = "Assetto Corsa wasn't found, so the track is saved in the app's folder instead.";
   else if (state.route.loop) hint = "A loop: you can race it lap after lap. Takes a few minutes.";
+  else if (tbt && !state.tbt.end) hint = "The track ends where the blue line ends. Keep picking turns, or create it now.";
   else hint = "Takes a few minutes. The first map in a new area downloads map data.";
   $("build-hint").textContent = hint;
 }
@@ -2583,17 +3831,26 @@ function onKeyDown(e) {
   }
   const t = e.target;
   const typing = t && t.closest && t.closest("input, textarea, select, [contenteditable='true']");
+  if (e.key === "Shift" && state.mode === "tbt" && state.tbt.lastMouse) {
+    state.tbt.lastMouse.shift = true;
+    tbtUpdateHover();
+  }
   if (typing || e.altKey) return;
+  if ($("confirm-dialog").open) return;
   const key = e.key.toLowerCase();
-  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && key === "z") {
+  const tbt = state.mode === "tbt";
+  if (tbt && !e.ctrlKey && !e.metaKey && tbtKey(e)) {
     e.preventDefault();
-    undo();
+  } else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && key === "z") {
+    e.preventDefault();
+    if (tbt) tbtUndo();
+    else undo();
   } else if (!e.ctrlKey && !e.metaKey && e.key === "/") {
     e.preventDefault();
     $("search").focus();
-  } else if (!e.ctrlKey && !e.metaKey && key === "w" && state.pins.length >= 2) {
+  } else if (!tbt && !e.ctrlKey && !e.metaKey && key === "w" && state.pins.length >= 2) {
     setWaypointMode(!state.waypointMode);
-  } else if (!e.ctrlKey && !e.metaKey && (e.key === "[" || e.key === "]") && state.routeOptions.length > 1) {
+  } else if (!tbt && !e.ctrlKey && !e.metaKey && (e.key === "[" || e.key === "]") && state.routeOptions.length > 1) {
     e.preventDefault();
     selectOption(state.optionIndex + (e.key === "]" ? 1 : -1));
   }
@@ -2602,9 +3859,17 @@ function onKeyDown(e) {
 function bindUi() {
   $("style-toggle").addEventListener("click", toggleMapStyle);
   $("btn-loop").addEventListener("click", toggleLoop);
-  $("btn-undo").addEventListener("click", undo);
+  $("btn-undo").addEventListener("click", () => (state.mode === "tbt" ? tbtUndo() : undo()));
   $("btn-reverse").addEventListener("click", reverseRoute);
-  $("btn-clear").addEventListener("click", clearPins);
+  $("btn-clear").addEventListener("click", () => (state.mode === "tbt" ? tbtClear() : clearPins()));
+  $("mode-tbt").addEventListener("click", () => setMode("tbt"));
+  $("mode-quick").addEventListener("click", () => setMode("quick"));
+  $("tbt-finish").addEventListener("click", tbtFinish);
+  $("tbt-loop").addEventListener("click", tbtCloseLoop);
+  $("opt-guardrails").addEventListener("change", () => {
+    renderDensity();
+    saveOptions();
+  });
   $("btn-fit").addEventListener("click", fitToRoute);
   $("btn-build").addEventListener("click", startBuild);
   $("btn-tracks-refresh").addEventListener("click", loadTracks);
@@ -2634,6 +3899,12 @@ function bindUi() {
   if (typeof ResizeObserver === "function") new ResizeObserver(() => drawProfile()).observe($("profile-body"));
   else window.addEventListener("resize", drawProfile);
   document.addEventListener("keydown", onKeyDown);
+  document.addEventListener("keyup", (e) => {
+    if (e.key === "Shift" && state.mode === "tbt" && state.tbt.lastMouse) {
+      state.tbt.lastMouse.shift = false;
+      tbtUpdateHover();
+    }
+  });
   initSearch();
 }
 
@@ -2658,17 +3929,22 @@ function initialStyleKey() {
 function boot() {
   // Read-only handle for troubleshooting from the browser console and for the end-to-end test
   // (tests/test_app_e2e.py clicks map positions through map.project).
-  window.acmg = Object.freeze({ state, get map() { return state.map; } });
+  window.acmg = Object.freeze({
+    state,
+    get map() { return state.map; },
+    tbt: Object.freeze({ phase: tbtPhase, branches: tbtBranches, path: tbtPath, line: tbtLine, loopPath: tbtLoopPath }),
+  });
+  state.tbt = tbtNew();
+  state.mode = store.get(STORE_KEYS.mode) === "quick" ? "quick" : "tbt";
   setMapStyle(initialStyleKey());
   bindUi();
   initMap();
-  restorePins();
+  applyModeUi();
+  if (state.mode === "quick") restorePins();
   loadOptions();
-  renderPins();
   renderRouteInfo();
   resetProfile();
-  scheduleRoute();
-  updateBuildPanel();
+  enterMode();
   loadStatus();
   loadTracks();
   resumeJob();

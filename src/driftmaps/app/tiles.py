@@ -4,7 +4,8 @@ Tiles are standard slippy-map tiles ("14/x/y", Web Mercator). Each tile holds ev
 way that crosses it, whole (the same road classes as the router's corridor query), cached
 gzip'd on disk under `<cache_dir>/tiles/14/<x>/<y>.json.gz` and in memory. A cached tile
 answers instantly; the tiles a request is missing are fetched in ONE Overpass query (the bbox
-of those tiles, or a union of their boxes when they are scattered).
+of those tiles, or a union of their boxes when they are scattered). Requests for different
+tiles download side by side; one that needs a tile already being downloaded waits for it.
 
 The same data serves `POST /api/route-path` (a route along an explicit node path, built from
 the tiles in memory) and lets `/api/route` skip Overpass when cached tiles cover its corridor.
@@ -54,8 +55,11 @@ MAX_TILES = 16  # tiles per /api/roads request
 TILE_FORMAT = 1
 MEMORY_TILES = 192  # tiles kept parsed in memory (route-path looks for its nodes there)
 # Interactive Overpass calls: a short server-side limit and quick retries.
-QUERY_TIMEOUT_S = 40
-POST_KWARGS = {"rounds": 2, "backoff_s": 2.0, "timeout_s": 45.0}
+# On 2026-10-16 the one mirror answering from the dev sandbox (maps.mail.ru) took 15-30 s for
+# 1 to 16 tiles, and timed out once at 45 s.
+QUERY_TIMEOUT_S = 60
+POST_KWARGS = {"rounds": 3, "backoff_s": 2.0, "timeout_s": 70.0}  # 504s come fast: retry
+WAIT_OTHER_S = 300.0  # longest wait for another request's download (post_query ends sooner)
 _TILE_RE = re.compile(r"^(\d{1,2})/(\d{1,7})/(\d{1,7})$")
 
 Tile = tuple[int, int, int]
@@ -210,7 +214,9 @@ class TileStore:
         self.memory = memory
         self._mem: OrderedDict[Tile, _TileData] = OrderedDict()
         self._lock = threading.Lock()
-        self._fetch_lock = threading.Lock()
+        # Tiles being downloaded right now -> set when that download is over. A request waits
+        # for another's download of its tiles instead of asking again, and never for others.
+        self._inflight: dict[Tile, threading.Event] = {}
 
     # -- cache -------------------------------------------------------------------------------
 
@@ -300,18 +306,33 @@ class TileStore:
         if not missing:
             return out, None
         error = None
-        with self._fetch_lock:  # one download at a time; another may have fetched ours
-            still = [t for t in missing if self.cached(t) is None]
+        done = threading.Event()
+        with self._lock:
+            theirs = {self._inflight[t] for t in missing if t in self._inflight}
+            mine = [t for t in missing if t not in self._inflight]
+            for t in mine:
+                self._inflight[t] = done
+        try:
+            still = [t for t in mine if self.cached(t) is None]  # saved in the meantime?
             if still:
                 try:
                     self._download(still)
                 except (OverpassError, OSError, ValueError) as exc:
                     log.warning("road tiles download failed: %s", exc)
                     error = str(exc)
+        finally:
+            with self._lock:
+                for t in mine:
+                    self._inflight.pop(t, None)
+            done.set()
+        for other in theirs:  # another request is downloading some of ours
+            other.wait(WAIT_OTHER_S)
         for t in missing:
             data = self.cached(t)
             if data is not None:
                 out[t] = data
+        if error is None and len(out) < len(dict.fromkeys(tiles)):
+            error = "the road data download failed"
         return out, error
 
     # -- views -----------------------------------------------------------------------------------
@@ -350,15 +371,29 @@ class TileStore:
         )
 
     def for_nodes(self, node_ids: Iterable[int]) -> tuple[OsmData, set[int]]:
-        """Ways through any of the nodes, from the tiles in memory; and the nodes not found."""
+        """Ways through any of the nodes, from the tiles in memory; and the nodes not found.
+
+        The cached tiles (memory or disk) holding the nodes found are added too, so every road
+        meeting the path at a junction is there (a road is only in the tiles it crosses).
+        """
         want = {int(n) for n in node_ids}
         with self._lock:
             datas = list(reversed(self._mem.values()))
-        hits = [d for d in datas if not want.isdisjoint(d.nodes.keys())]
-        found: set[int] = set()
-        for d in hits:
-            found |= want & d.nodes.keys()
-        return self.osm_data(hits, want), want - found
+        hits = {id(d): d for d in datas if not want.isdisjoint(d.nodes.keys())}
+        found: dict[int, tuple[float, float]] = {}
+        for d in hits.values():
+            for n in want & d.nodes.keys():
+                found.setdefault(n, d.nodes[n])
+        if found:
+            lonlat = np.array(list(found.values()), dtype=np.float64)
+            xf, yf = _tile_float(lonlat[:, 0], lonlat[:, 1], TILE_ZOOM)
+            xs, ys = np.floor(xf).astype(int).tolist(), np.floor(yf).astype(int).tolist()
+            cells = set(zip(xs, ys, strict=True))
+            for x, y in sorted(cells):
+                data = self.cached((TILE_ZOOM, x, y))
+                if data is not None:
+                    hits.setdefault(id(data), data)
+        return self.osm_data(hits.values(), want), want - found.keys()
 
     def covering(
         self, south: float, west: float, north: float, east: float, max_tiles: int = 48

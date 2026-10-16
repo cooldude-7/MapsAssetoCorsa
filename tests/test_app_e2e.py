@@ -421,6 +421,7 @@ def test_browser_flow(browser_page, tmp_path, monkeypatch, forks_route):
     try:
         page.goto(srv.url)
         page.wait_for_function("() => window.acmg && window.acmg.state.mapReady", timeout=60_000)
+        page.click("#mode-quick")  # turn by turn is the default way to pick the road
         idle()
         page.wait_for_function("() => document.getElementById('ac-pill').dataset.kind === 'ok'")
         shot("01_home")
@@ -577,6 +578,7 @@ def test_browser_loop(browser_page, tmp_path, monkeypatch):
     try:
         page.goto(srv.url)
         page.wait_for_function("() => window.acmg && window.acmg.state.mapReady", timeout=60_000)
+        page.click("#mode-quick")  # turn by turn is the default way to pick the road
         page.wait_for_function("() => document.getElementById('ac-pill').dataset.kind === 'ok'")
         assert page.text_content("#btn-build").strip() == "Create map"
         assert not page.locator("#opt-trees").is_visible()  # under the closed "More options"
@@ -799,6 +801,7 @@ def test_browser_route_options(browser_page, tmp_path):
     try:
         page.goto(srv.url)
         page.wait_for_function("() => window.acmg && window.acmg.state.mapReady", timeout=60_000)
+        page.click("#mode-quick")  # turn by turn is the default way to pick the road
         a, b = OPTIONS_A, OPTIONS_B
         page.evaluate(
             "(b) => window.acmg.map.fitBounds(b, {padding: 120, duration: 0})",
@@ -936,6 +939,217 @@ def test_browser_route_options(browser_page, tmp_path):
         st = wait_route()
         assert len(page.evaluate(f"() => {js_state}.pins")) == 3
         assert st["route"]["route_id"] == before
+        assert problems == []
+    finally:
+        try:
+            shot("zz_last")
+        finally:
+            srv.stop()
+
+
+# ---------------------------------------------------------------------------------------------
+# In a real browser: the turn-by-turn builder on Snake Road, live roads (opt-in)
+# ---------------------------------------------------------------------------------------------
+
+TBT_VIEW = {"center": [-79.885, 43.31], "zoom": 15}  # Snake Road climbing the escarpment
+
+
+def _key_for_turn(branches: list[list]) -> str:
+    """The arrow key for a real turn at a junction: right, else left, else straight on (the
+    page's keyBranches rules; branches are [name, angle, allowed])."""
+    ok = [b for b in branches if b[2]]
+    if ok and (ok[-1][1] > 15 or len(ok) == 1):
+        return "ArrowRight"
+    if ok and ok[0][1] < -15:
+        return "ArrowLeft"
+    return "ArrowUp"
+
+
+def test_browser_turn_by_turn(browser_page, tmp_path):
+    if os.environ.get("DRIFTMAPS_E2E_TBT") != "1":
+        pytest.skip("live turn-by-turn test: set DRIFTMAPS_E2E_TBT=1 (downloads map data)")
+    page, problems = browser_page
+    ac = make_ac(tmp_path / "assettocorsa")
+    built: list = []
+
+    def record_build(route, out_dir, options):
+        built.append((route, options))
+        return fake_build(route, out_dir, options)
+
+    # Real road tiles (/api/roads), route-path and elevation (DRIFTMAPS_CACHE_DIR keeps the
+    # downloads); the build itself is a fake.
+    app = App(Settings(tmp_path / "appdata", discover=lambda: ac), build_fn=record_build)
+    srv = AppServer(app, port=0).start()
+    SCREENS.mkdir(parents=True, exist_ok=True)
+    S = "window.acmg.state"
+    T = "window.acmg.tbt"
+
+    def shot(name: str) -> None:
+        page.screenshot(path=str(SCREENS / f"tbt_{name}.png"))
+
+    def idle() -> None:
+        page.wait_for_function(
+            "() => window.acmg.map && window.acmg.map.loaded() && !window.acmg.map.isMoving()",
+            timeout=60_000,
+        )
+        page.wait_for_timeout(400)
+
+    def screen(lon: float, lat: float) -> tuple[float, float]:
+        x, y = page.evaluate(
+            "([lon, lat]) => { const p = window.acmg.map.project([lon, lat]); return [p.x, p.y]; }",
+            [lon, lat],
+        )
+        box = page.locator("#map").bounding_box()
+        return box["x"] + x, box["y"] + y
+
+    def settled() -> dict:
+        """Roads loaded and the route made for the path as it stands; the state then."""
+        page.wait_for_function(
+            f"() => {{ const s = {S}; return !s.tbt.loading && !s.routeStale; }}", timeout=300_000
+        )
+        page.wait_for_timeout(300)
+        return page.evaluate(
+            f"""() => {{ const s = {S}, t = {T};
+              const keys = document.querySelectorAll('.tbt-arrow .tbt-key');
+              return {{phase: t.phase(), path: t.path(),
+                legs: s.tbt.legs.map(l => [l.kind, l.name]),
+                branches: t.branches().map(b => [b.name, b.angle, b.allowed]),
+                markers: document.querySelectorAll('.tbt-arrow').length,
+                keys: [...keys].map(e => e.textContent), line: t.line(), route: s.route,
+                error: s.routeError, loopPath: !!t.loopPath()}}; }}"""
+        )
+
+    def press(key: str) -> dict:
+        page.keyboard.press(key)
+        page.wait_for_timeout(300)
+        st = settled()
+        idle()
+        return st
+
+    try:
+        page.add_init_script(
+            f"localStorage.setItem('acmg.view', '{json.dumps(TBT_VIEW)}');"
+            "localStorage.removeItem('acmg.mode');"
+        )
+        page.goto(srv.url)
+        page.wait_for_function("() => window.acmg && window.acmg.state.mapReady", timeout=60_000)
+        assert page.get_attribute("#mode-tbt", "aria-pressed") == "true"
+        label = page.text_content("#build-label").strip()
+        assert label == "dev build" or label.startswith("Update "), label
+        # The roads load in z14 tiles round the view, with a chip counting the seconds.
+        page.wait_for_function(
+            f"() => !document.getElementById('roads-chip').hidden || {S}.tbt.g.segments > 0",
+            timeout=60_000,
+        )
+        if page.is_visible("#roads-chip"):
+            assert "Loading roads" in page.text_content("#roads-chip")
+            shot("01_loading_roads")
+        page.wait_for_function(
+            f"() => !{S}.tbt.loading && {S}.tbt.g.segments > 500", timeout=300_000
+        )
+        tiles = page.evaluate(f"() => [...{S}.tbt.tiles.entries()]")
+        assert all(st == "ok" for _, st in tiles), tiles
+        idle()
+        assert page.is_hidden("#roads-chip")
+        shot("02_roads_loaded")
+
+        # Click Snake Road near the bottom of the view.
+        start = page.evaluate(
+            f"""() => {{ const g = {S}.tbt.g; let best = null;
+              for (const w of g.ways.values()) {{
+                if (w.name !== 'Snake Road' || w.highway === 'service') continue;
+                for (let i = 1; i < w.nodes.length; i++) {{
+                  const a = g.nodes.get(w.nodes[i - 1]), b = g.nodes.get(w.nodes[i]);
+                  if (!a || !b) continue;
+                  const p = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], d = Math.abs(p[1] - 43.3075);
+                  if (!best || d < best.d) best = {{d, p}};
+                }}
+              }}
+              return best && best.p; }}"""
+        )
+        assert start, "Snake Road isn't in the loaded roads"
+        page.mouse.move(*screen(*start))
+        page.wait_for_timeout(300)
+        shot("03_hover_start_road")
+        page.mouse.click(*screen(*start))
+        st = settled()
+        assert st["phase"] == "direction", st
+        assert st["markers"] == 2 and sorted(st["keys"]) == ["↑", "↓"], st
+        assert page.locator("#tbt-choice-list button").count() == 2
+        idle()
+        shot("04_which_way")
+
+        # Uphill is north: Snake Road climbs the escarpment.
+        st = press("ArrowUp")
+        assert st["phase"] == "drive" and st["legs"][0] == ["start", "Snake Road"], st
+        line = st["line"]
+        assert line[-1][1] > line[0][1]  # heading north
+        assert st["markers"] == len(st["branches"]) >= 2, st
+        assert st["error"] == "" and st["route"]["names"][0] == "Snake Road"
+        shot("05_first_junction")
+
+        # Straight on up Snake Road (past the driveways), then two real turns.
+        st = press("ArrowUp")
+        assert len(st["legs"]) == 2 and st["legs"][1][1] == "Snake Road", st
+        keys = []
+        paths = [st["path"]]
+        for _ in range(2):
+            if not any(b[2] for b in st["branches"]):
+                break
+            keys.append(_key_for_turn(st["branches"]))
+            st = press(keys[-1])
+            paths.append(st["path"])
+            shot(f"06_turn_{len(keys)}")
+        assert len(keys) >= 1 and len(st["legs"]) == 2 + len(keys), (keys, st["legs"])
+        assert st["error"] == "", st["error"]
+        assert not st["loopPath"]
+        assert "Drive back to A" in page.text_content("#tbt-loop-hint")
+        assert page.is_disabled("#tbt-loop")
+
+        # Backspace takes the last turn back.
+        st = press("Backspace")
+        assert st["path"] == paths[-2] and len(st["legs"]) == 1 + len(keys), st["legs"]
+        shot("07_undone")
+
+        # Finish at this junction (Enter): B goes there, the arrows go away.
+        st = press("Enter")
+        assert st["phase"] == "done" and st["markers"] == 0, st
+        route = st["route"]
+        assert route and not route["loop"] and st["error"] == ""
+        line_m = page.evaluate(
+            "(line) => line.reduce((s, p, i) => i ? s + Math.hypot((p[0] - line[i - 1][0]) *"
+            " Math.cos(p[1] * Math.PI / 180) * 111320, (p[1] - line[i - 1][1]) * 110540) : 0, 0)",
+            st["line"],
+        )
+        assert route["length_m"] > 2000, route["length_m"]  # the whole climb
+        assert route["length_m"] == pytest.approx(line_m, rel=0.03)
+        assert "Snake Road" in route["names"]
+        page.wait_for_function(f"() => !!{S}.profile", timeout=300_000)
+        z = page.evaluate(f"() => {S}.profile.z")
+        assert max(z) - z[0] > 60, (z[0], max(z))  # up the escarpment
+        assert page.text_content("#profile-stats").startswith("Climb ")
+        assert page.text_content("#route-length") != "–"
+        idle()
+        shot("08_finished")
+
+        # Create map: the route as driven, automatic guardrails by default.
+        page.click("#more-options summary")
+        assert page.input_value("#opt-guardrails") == "auto"
+        assert page.locator("#opt-guardrails option").count() == 3
+        page.click("#more-options summary")
+        page.fill("#track-name", "Snake Road (Turn by Turn Test)")
+        page.click("#btn-build")
+        page.wait_for_function(
+            "() => ['done', 'error'].includes(document.getElementById('job').dataset.state)",
+            timeout=300_000,
+        )
+        page.wait_for_timeout(500)
+        shot("09_created")
+        assert page.get_attribute("#job", "data-state") == "done", page.text_content("#job")
+        ((built_route, options),) = built
+        assert options.auto_guardrails is True and options.guardrails is True
+        assert built_route.length_m == pytest.approx(route["length_m"], abs=1.0)
+        assert is_driftmaps_track(ac / "content" / "tracks" / "dm_snake_road_turn_by_turn_test")
         assert problems == []
     finally:
         try:

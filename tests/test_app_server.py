@@ -836,3 +836,230 @@ def test_route_options(env, monkeypatch):
     assert status == 200, res
     assert env.client.wait_job(res["job_id"])["state"] == "done"
     assert env.build.calls[-1][0].length_m == pytest.approx(options[1]["length_m"], abs=0.1)
+
+
+# ---------------------------------------------------------------------------------------------
+# turn-by-turn: /api/roads and /api/route-path; build info; auto guardrails; build dates
+# ---------------------------------------------------------------------------------------------
+
+ROUTE_TILE = "14/4551/5969"  # holds PIN_A and PIN_B
+
+
+class FakeOverpass:
+    """Answers every Overpass query with the Forks of the Credit fixture (or fails)."""
+
+    def __init__(self) -> None:
+        self.body = (FIXTURES / "osm" / "forks_of_the_credit.json").read_bytes()
+        self.error: Exception | None = None
+        self.queries: list[str] = []
+
+    def __call__(self, query: str) -> bytes:
+        self.queries.append(query)
+        if self.error is not None:
+            raise self.error
+        return self.body
+
+
+@pytest.fixture
+def overpass(env) -> FakeOverpass:
+    from driftmaps.app.tiles import TileStore
+
+    fake = FakeOverpass()
+    env.srv.app._tiles = TileStore(env.settings.cache_dir, post=fake)
+    return fake
+
+
+def test_status_build_info(env, monkeypatch):
+    import sys
+    from types import ModuleType
+
+    import driftmaps.app
+
+    monkeypatch.delattr(driftmaps.app, "_build_info", raising=False)
+    monkeypatch.setitem(sys.modules, "driftmaps.app._build_info", None)  # a dev checkout
+    status, body = env.client.get("/api/status")
+    assert status == 200 and body["build"] == {"version": "dev"}
+
+    info = ModuleType("driftmaps.app._build_info")
+    info.VERSION = "Update 3"
+    info.COMMIT = "0123456789abcdef0123456789abcdef01234567"
+    info.DATE = "2026-10-16 01:02 UTC"
+    monkeypatch.setitem(sys.modules, "driftmaps.app._build_info", info)
+    status, body = env.client.get("/api/status")
+    assert body["build"] == {"version": "Update 3", "commit": "0123456", "date": info.DATE}
+    assert body["app"] == APP_NAME  # the rest of the status is still there
+
+
+def test_roads(env, overpass):
+    tiles = [ROUTE_TILE, "14/4552/5969"]
+    status, body = env.client.post("/api/roads", {"tiles": tiles})
+    assert status == 200, body
+    assert body["tiles"] == {t: "ok" for t in tiles} and body["error"] is None
+    assert len(overpass.queries) == 1  # one query for both tiles
+    ways = body["ways"]
+    assert ways and all(set(w) == {"id", "name", "ref", "highway", "oneway", "nodes"} for w in ways)
+    assert all(str(n) in body["nodes"] for w in ways for n in w["nodes"])
+    lon, lat = body["nodes"][str(ways[0]["nodes"][0])]
+    assert -80.1 < lon < -79.9 and 43.7 < lat < 43.9
+    assert any(w["name"] == "Forks of the Credit Road" for w in ways)
+    # Cached: the same answer without asking Overpass again.
+    assert env.client.post("/api/roads", {"tiles": tiles[::-1]})[1]["ways"] == ways
+    assert len(overpass.queries) == 1
+    assert (env.settings.cache_dir / "tiles" / "14" / "4551" / "5969.json.gz").is_file()
+
+
+def test_roads_rejects_bad_requests(env, overpass):
+    for body in ({}, {"tiles": []}, {"tiles": "14/1/1"}, {"tiles": ["13/1/1"]},
+                 {"tiles": ["14/x/y"]}, {"tiles": [f"14/{i}/1" for i in range(17)]}):
+        status, out = env.client.post("/api/roads", body)
+        assert status == 400 and out["error"], body
+    assert not overpass.queries
+
+
+def test_roads_when_overpass_fails(env, overpass):
+    overpass.error = OverpassError("all Overpass mirrors failed")
+    status, body = env.client.post("/api/roads", {"tiles": [ROUTE_TILE]})
+    assert status == 200
+    assert body["tiles"] == {ROUTE_TILE: "error"} and body["error"] == MAP_SERVERS_MESSAGE
+    assert body["ways"] == [] and body["nodes"] == {}
+    overpass.error = None  # the next request tries again
+    status, body = env.client.post("/api/roads", {"tiles": [ROUTE_TILE]})
+    assert body["tiles"] == {ROUTE_TILE: "ok"} and body["error"] is None
+
+
+def test_route_path_profile_and_build(env, overpass, monkeypatch, forks_route):
+    assert env.client.post("/api/roads", {"tiles": [ROUTE_TILE]})[0] == 200
+    path = forks_route.node_path()
+    req = {"path": [str(n) for n in path], "start_t": forks_route.start_t,
+           "end_t": forks_route.end_t, "loop": False}  # fmt: skip
+    status, body = env.client.post("/api/route-path", req)
+    assert status == 200, body
+    option = {k: body[k] for k in ("route_id", "length_m", "line", "names", "warnings", "loop")}
+    assert body["alternatives"] == [option] and set(body) == {*option, "snapped", "alternatives"}
+    assert body["length_m"] == pytest.approx(forks_route.length_m, abs=0.1)
+    assert body["loop"] is False and "Forks of the Credit Road" in body["names"]
+    assert body["snapped"][0] == pytest.approx(PIN_A, abs=2e-4)
+    assert body["snapped"][-1] == pytest.approx(PIN_B, abs=2e-4)
+    assert body["line"][0] == pytest.approx(PIN_A[::-1], abs=2e-4)
+    stored = env.srv.app.routes.get(body["route_id"])
+    assert stored.edges == forks_route.edges and stored.cache_key == "tiles-z14"
+    # A node repeated where two legs join is taken once.
+    twice = {**req, "path": [*path[:3], path[2], *path[3:]]}
+    assert env.client.post("/api/route-path", twice)[1]["length_m"] == body["length_m"]
+    assert not env.route_calls  # no pathfinding
+
+    def fake_sample(lon, lat, cache_dir=None, **kw):
+        n = len(lon)
+        info = SourceInfo("hrdem-1m", "NRCan HRDEM 1 m", 1.0, "DTM", "OGL", "NRCan")
+        z = 300.0 + np.arange(n, dtype=float)
+        return ElevationSample(z, np.array(["hrdem-1m"] * n), np.ones(n), {"hrdem-1m": info})
+
+    monkeypatch.setattr(elevation_sources, "sample_elevation", fake_sample)
+    status, prof = env.client.post("/api/profile", {"route_id": body["route_id"]})
+    assert status == 200, prof
+    assert prof["s"][-1] == pytest.approx(body["length_m"], abs=1.0) and prof["z"][0] == 300.0
+
+    # Build it with "Guardrails: Only where mapped", then with the default (automatic).
+    for opts, auto in (({"guardrails": True, "auto_guardrails": False}, False), ({}, True)):
+        status, res = env.client.post(
+            "/api/build",
+            {"route_id": body["route_id"], "name": "Turn By Turn", "install": False,
+             "options": opts},
+        )  # fmt: skip
+        assert status == 200, res
+        assert env.client.wait_job(res["job_id"])["state"] == "done"
+        route, _, options = env.build.calls[-1]
+        assert route.edges == forks_route.edges
+        assert options.guardrails is True and options.auto_guardrails is auto
+
+
+def test_route_path_errors(env, overpass, forks_route):
+    path = forks_route.node_path()
+    # Roads not loaded (e.g. the app restarted): load them again.
+    status, body = env.client.post("/api/route-path", {"path": path})
+    assert status == 409 and "move the map over it" in body["error"]
+    assert env.client.post("/api/roads", {"tiles": [ROUTE_TILE]})[0] == 200
+    cases = [
+        ({"path": path[:1]}, 400, "at least two"),
+        ({"path": [path[0], path[0]]}, 400, "too short"),
+        ({"path": "1,2"}, 400, "at least two"),
+        ({"path": [path[0], True]}, 400, "node ids"),
+        ({"path": [path[0], "x"]}, 400, "node ids"),
+        ({"path": path, "start_t": "0"}, 400, "start_t"),
+        ({"path": path, "end_t": 1.5}, 400, "end_t"),
+        ({"path": [path[0], path[2]]}, 400, "doesn't follow the roads"),
+        ({"path": [path[0], path[1], path[0]]}, 400, "turns straight back"),
+        ({"path": path, "loop": True}, 400, "drive back to the start"),
+        ({"path": [path[0], path[1]], "start_t": 0.7, "end_t": 0.2}, 400, "too short"),
+        ({"path": [path[0], 99]}, 409, "isn't loaded"),
+    ]
+    for req, code, text in cases:
+        status, body = env.client.post("/api/route-path", req)
+        assert status == code and text in body["error"], (req, body)
+
+
+def test_route_path_messages():
+    from driftmaps.app.server import path_error_message
+
+    err = RouteError("one-way: it goes the wrong way along way 5 (nodes 1 to 2)")
+    err.road = "Main Street"
+    want = "That route goes the wrong way along Main Street, a one-way road."
+    assert path_error_message(err) == want
+    err.road = None
+    assert "wrong way along a one-way road" in path_error_message(err)
+    assert "different road" in path_error_message(RouteError("no loop: x"))
+
+
+def test_route_uses_cached_tiles(env, overpass):
+    """When the map tiles already hold the route's corridor, /api/route needs no download."""
+    from driftmaps.app.server import CORRIDOR_BUFFER_M
+    from driftmaps.app.tiles import tile_key, tiles_for_box
+
+    pad = CORRIDOR_BUFFER_M / 111_320.0
+    pad_lon = pad / np.cos(np.radians(PIN_A[0]))
+    box = tiles_for_box(
+        min(PIN_A[0], PIN_B[0]) - pad,
+        min(PIN_A[1], PIN_B[1]) - pad_lon,
+        max(PIN_A[0], PIN_B[0]) + pad,
+        max(PIN_A[1], PIN_B[1]) + pad_lon,
+    )
+    make_route(env.client)
+    assert env.route_calls[-1].get("osm") is None  # tiles not loaded: the normal download
+    for i in range(0, len(box), 16):
+        keys = [tile_key(t) for t in box[i : i + 16]]
+        assert env.client.post("/api/roads", {"tiles": keys})[0] == 200
+    env.srv.app._by_pins.clear()
+    make_route(env.client)
+    osm = env.route_calls[-1].get("osm")
+    assert osm is not None and osm.cache_key == "tiles-z14" and osm.ways
+
+
+def test_tracks_built_at_from_marker(env, forks_route):
+    import os
+
+    from driftmaps.ac.scene import marker_built_at, stamp_marker
+    from driftmaps.app.server import _iso
+
+    # The marker's build time wins over file times (a zip gives every file the same date).
+    old = write_track(env.out / "dm_old", "Old")
+    stamp_marker(old, when=1_700_000_000)
+    new = write_track(env.out / "dm_new", "New")
+    zip_time = time.mktime((2026, 1, 1, 0, 0, 0, 0, 0, -1))
+    for p in (new / MARKER_FILE, new / "ui" / "ui_track.json"):
+        os.utime(p, (zip_time, zip_time))
+    status, tracks = env.client.get("/api/tracks")
+    assert status == 200
+    by_id = {t["track_id"]: t["built_at"] for t in tracks}
+    assert by_id["dm_old"] == _iso(1_700_000_000)
+    assert by_id["dm_new"] != _iso(zip_time)  # not the zip date: the folder's own time
+
+    # A build through the app stamps the marker, also in the installed copy.
+    route_id = make_route(env.client)["route_id"]
+    status, res = env.client.post("/api/build", {"route_id": route_id, "name": "Stamped"})
+    assert status == 200
+    assert env.client.wait_job(res["job_id"])["state"] == "done"
+    for base in (env.out, env.tracks):
+        when = marker_built_at(base / "dm_stamped")
+        assert when is not None and abs(when - time.time()) < 60
+    tracks = env.client.get("/api/tracks")[1]
+    assert tracks[0]["track_id"] == "dm_stamped"  # newest first

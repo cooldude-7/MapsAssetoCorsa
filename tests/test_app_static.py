@@ -34,6 +34,8 @@ API_PATHS = (
     "/api/status",
     "/api/settings",
     "/api/route",
+    "/api/roads",
+    "/api/route-path",
     "/api/profile",
     "/api/build",
     "/api/jobs/",
@@ -139,7 +141,8 @@ def test_script_follows_the_api_contract_and_map_sources():
     assert "https://photon.komoot.io/api/" in js
     for field in (
         "route_id", "track_id", "install", "scenery_density", "reverse", "loop", "ac_root",
-        "alternatives", "snapped", "far_pin",
+        "alternatives", "snapped", "far_pin", "tiles", "path", "start_t", "end_t",
+        "auto_guardrails", "build",
     ):  # fmt: skip
         assert re.search(rf"\b{field}\b", js), f"app.js never sends/reads {field}"
 
@@ -304,3 +307,208 @@ def test_pure_helpers_under_node(tmp_path: Path):
     assert on["point"] == pytest.approx([0.005, 0], abs=1e-9)
     assert (out["insAB"], out["insBC"]) == (1, 2)
     assert (out["insLoopEnd"], out["insLoopMid"]) == (3, 1)
+
+
+# A small road network (in /api/roads' shape) round (0, 0); 0.001 degrees is about 111 m.
+#
+#   10 ------------- 7            Loop Rd: 7 - 10 - 1 (back to Main St's west end)
+#   |                |            North Rd: 3 - 6 - 7
+#   |                6     9      One Way: 9 -> 4 only (oneway 1)
+#   |                |     |      a driveway (unnamed service road) off node 2
+#   1 ----- 2 ------ 3 --- 4 --- 5   Main St
+#           |
+#           8 (driveway)
+ROADS = {
+    "tiles": {"14/8192/8191": "ok"},
+    "nodes": {
+        "1": [-0.002, 0], "2": [-0.001, 0], "3": [0, 0], "4": [0.001, 0], "5": [0.002, 0],
+        "6": [0, 0.001], "7": [0, 0.002], "8": [-0.001, -0.0005], "9": [0.001, 0.001],
+        "10": [-0.002, 0.002],
+    },
+    "ways": [
+        {"id": 1, "name": "Main St", "ref": "", "highway": "residential", "oneway": 0,
+         "nodes": [1, 2, 3, 4, 5]},
+        {"id": 2, "name": "North Rd", "ref": "", "highway": "residential", "oneway": 0,
+         "nodes": [3, 6, 7]},
+        {"id": 3, "name": "", "ref": "", "highway": "service", "oneway": 0, "nodes": [2, 8]},
+        {"id": 4, "name": "One Way", "ref": "", "highway": "residential", "oneway": 1,
+         "nodes": [9, 4]},
+        {"id": 5, "name": "Loop Rd", "ref": "", "highway": "tertiary", "oneway": 0,
+         "nodes": [7, 10, 1]},
+    ],
+    "error": None,
+}  # fmt: skip
+
+ROADS_PROBE = r"""
+const g = createRoadGraph();
+const added = addRoads(g, ROADS);
+const again = addRoads(g, ROADS); // the same ways twice: added once
+const all = () => true;
+const br = (path) =>
+  branchesAt(g, path, all).map((b) => [b.name, Math.round(b.angle), b.allowed, b.run]);
+const east = branchesAt(g, ["1", "2", "3"], all);
+const at4 = branchesAt(g, ["2", "3", "4"], all);
+const keys = keyBranches(east);
+const ahead = findAhead(g, ["1", "2", "3"], { a: "6", b: "7" }, all);
+const ahead2 = findAhead(g, ["1", "2", "3"], { a: "5", b: "4" }, all);
+const notAhead = findAhead(g, ["1", "2", "3"], { a: "2", b: "8" }, all);
+// A grid of 120 x 120 nodes (about 28 000 segments): snapping stays fast.
+const big = createRoadGraph();
+const nodes = {};
+const ways = [];
+const N = 120;
+for (let i = 0; i < N; i++) {
+  for (let j = 0; j < N; j++) nodes[`${i}_${j}`] = [-79.9 + i * 0.0005, 43.3 + j * 0.0005];
+}
+const ids = (f) => [...Array(N).keys()].map(f);
+for (let i = 0; i < N; i++) {
+  ways.push({ id: `r${i}`, name: `R${i}`, highway: "residential", nodes: ids((j) => `${i}_${j}`) });
+  ways.push({ id: `c${i}`, name: `C${i}`, highway: "residential", nodes: ids((j) => `${j}_${i}`) });
+}
+let t0 = Date.now();
+addRoads(big, { nodes, ways });
+const loadMs = Date.now() - t0;
+t0 = Date.now();
+let hits = 0;
+for (let k = 0; k < 5000; k++) {
+  const p = [-79.9 + Math.random() * 0.06, 43.3 + Math.random() * 0.06];
+  if (nearestSegment(big, p, 25)) hits++;
+}
+const snapMs = Date.now() - t0;
+const out = {
+  added, again, segments: g.segments,
+  // Driving east from 1: the driveway at 2 is passed, the run stops at the junction at 3.
+  run12: runFrom(g, "1", "2", all),
+  runAround: runAround(g, "2", "3"),
+  through2: !!throughEdge(g, "1", "2"), through3: !!throughEdge(g, "2", "3"),
+  driveway: !!throughEdge(g, "8", "2"),
+  east: br(["1", "2", "3"]),
+  at4: br(["2", "3", "4"]),
+  keys: [keys.left, keys.straight, keys.right].map((b) => b && b.name),
+  labels: branchKeyLabels(at4), labelsEast: branchKeyLabels(east),
+  byKey: ["ArrowLeft", "ArrowUp", "ArrowRight", "1", "2", "3"].map((k) => {
+    const b = branchForKey(east, k);
+    return b && b.name;
+  }),
+  ahead: ahead && [ahead.nodes, ahead.cut, ahead.forward, ahead.branch.name],
+  ahead2: ahead2 && [ahead2.nodes, ahead2.cut, ahead2.forward],
+  notAhead,
+  // Back to start: round the loop to A's road (1 -> 2) again.
+  loop: closeLoopPath(g, ["1", "2", "3"], all),
+  loopFromRing: closeLoopPath(g, ["1", "2", "3", "6", "7"], all),
+  noLoop: closeLoopPath(g, ["1", "2", "3", "4"], all),
+  wrongWay: closeLoopPath(g, ["2", "1", "10", "7"], all),
+  nearest: (() => {
+    const s = nearestSegment(g, [-0.0015, 0.00005], 30);
+    return s && [s.a, s.b, s.w, Math.round(s.t * 100) / 100, Math.round(s.dist)];
+  })(),
+  far: nearestSegment(g, [-0.0015, 0.001], 30),
+  line: pathLine(g, ["1", "2", "3"], 0.5, 0.5),
+  lineLen: Math.round(lineLengthM(pathLine(g, ["1", "2", "3"], 0.5, 0.5))),
+  head: lineHead([[0, 0], [0.001, 0], [0.002, 0]], 150)
+    .map((p) => p.map((x) => Math.round(x * 1e6) / 1e6)),
+  labelsLeg: [
+    legLabel({ kind: "start", name: "Snake Road" }),
+    legLabel({ kind: "turn", name: "Mountain Brow Road", angle: -88 }),
+    legLabel({ kind: "turn", name: "Snake Road", angle: 3 }, "Snake Road"),
+    legLabel({ kind: "turn", name: "Snake Road", angle: 3 }, "Old York Road"),
+    legLabel({ kind: "turn", name: "", angle: 40 }),
+    legLabel({ kind: "turn", name: "Kerns Road", angle: 150 }),
+    legLabel({ kind: "close", name: "Snake Road" }),
+  ],
+  build: [
+    buildLabel({ version: "3", commit: "abcdef1234567", date: "2026-10-15T21:58:39Z" }),
+    buildLabel({ version: "Update 4", date: "2026-10-16" }),
+    buildLabel({ version: "dev" }), buildLabel(null), buildLabel({}),
+  ],
+  tile: tileKeyAt(-79.885, 43.31),
+  tileBox: tileBounds("14/4556/6000"),
+  tilesView: tilesForBounds(-79.89, 43.305, -79.88, 43.315, 1),
+  spread: spreadAngles([0, 10, 180], 40).map(Math.round),
+  spreadWrap: spreadAngles([355, 5], 40).map(Math.round),
+  spreadFine: spreadAngles([0, 90, 180, 270], 40),
+  compass: [0, 44, 90, 200, 315].map(compassWord),
+  keyFor: [10, 80, 170, 280, 350].map(keyForBearing),
+  optKey: [
+    optionForKey([45, 225], "ArrowUp"), optionForKey([45, 225], "ArrowDown"),
+    optionForKey([45, 225], "ArrowLeft"), optionForKey([90, 270], "ArrowUp"),
+    optionForKey([null, 225], "ArrowUp"), optionForKey([0, 180], "Enter"),
+  ],
+  big: { segments: big.segments, loadMs, snapMs, hits },
+};
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+@needs_node
+def test_turn_by_turn_helpers_under_node(tmp_path: Path):
+    script = tmp_path / "roads_probe.js"
+    script.write_text(
+        read("app.js") + f"\n;const ROADS = {json.dumps(ROADS)};\n" + ROADS_PROBE,
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [NODE, str(script)], capture_output=True, text=True, encoding="utf-8", timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+
+    assert out["added"] == 10 and out["again"] == 0 and out["segments"] == 10
+    assert out["run12"] == ["2", "3"]
+    # The stretch round 2-3: the whole ring, as 3 is its only junction (7 and 1 are plain road).
+    assert out["runAround"] == ["3", "6", "7", "10", "1", "2", "3"]
+    assert (out["through2"], out["through3"], out["driveway"]) == (True, False, False)
+    # Heading east at 3: North Rd on the left (round the ring back to 3), Main St straight on
+    # (no U-turn back to 2).
+    ring = ["6", "7", "10", "1", "2", "3"]
+    assert out["east"] == [["North Rd", -90, True, ring], ["Main St", 0, True, ["4"]]]
+    # At 4 One Way comes in from the north: you may not drive up it.
+    assert out["at4"] == [["One Way", -90, False, ["9"]], ["Main St", 0, True, ["5"]]]
+    assert out["keys"] == ["North Rd", "Main St", None]
+    assert out["labels"] == ["", "↑"] and out["labelsEast"] == ["←", "↑"]
+    assert out["byKey"] == ["North Rd", "Main St", None, "North Rd", "Main St", None]
+    # Clicking further along: up North Rd; along Main St through the junction at 4.
+    assert out["ahead"] == [ring, 1, True, "North Rd"]
+    assert out["ahead2"] == [["4", "5"], 1, False]
+    assert out["notAhead"] is None
+    assert out["loop"] == ["1", "2", "3", "6", "7", "10", "1"]
+    assert out["loopFromRing"] == ["1", "2", "3", "6", "7", "10", "1"]
+    assert out["noLoop"] is None
+    assert out["wrongWay"] is None  # back on A's road but driving it the other way
+    assert out["nearest"] == ["1", "2", "1", 0.5, 6]
+    assert out["far"] is None
+    assert out["line"] == [[-0.0015, 0], [-0.001, 0], [-0.0005, 0]]
+    assert out["lineLen"] == 111
+    assert out["head"] == [[0, 0], [0.001, 0], [0.001349, 0]]
+    assert out["labelsLeg"] == [
+        "Start on Snake Road",
+        "Left onto Mountain Brow Road",
+        "Continue on Snake Road",
+        "Straight on Snake Road",
+        "Slight right onto an unnamed road",
+        "Sharp right onto Kerns Road",
+        "Back to A on Snake Road",
+    ]
+    assert out["build"] == [
+        "Update 3 · 2026-10-15 · abcdef1",
+        "Update 4 · 2026-10-16",
+        "dev build",
+        "dev build",
+        "dev build",
+    ]
+    assert out["tile"] == "14/4556/6000"
+    w, s_, e, n = out["tileBox"]
+    assert w < -79.885 < e and s_ < 43.31 < n
+    # The box spans tiles 4556/6000-6001; one tile round them: 3 x 4, nearest the middle first.
+    assert out["tilesView"][0] == "14/4556/6000" and len(set(out["tilesView"])) == 12
+    assert out["spread"] == [345, 25, 180]
+    assert out["spreadWrap"] == [340, 20]
+    assert out["spreadFine"] == [0, 90, 180, 270]
+    assert out["compass"] == ["north", "northeast", "east", "south", "northwest"]
+    assert out["keyFor"] == ["ArrowUp", "ArrowRight", "ArrowDown", "ArrowLeft", "ArrowUp"]
+    assert out["optKey"] == [0, 1, 1, -1, -1, -1]
+    big = out["big"]
+    assert big["segments"] == 2 * 120 * 119
+    assert big["hits"] > 1000
+    # Generous bounds (CI machines are slow); in practice both take a few tens of ms.
+    assert big["loadMs"] < 3000 and big["snapMs"] < 3000, big

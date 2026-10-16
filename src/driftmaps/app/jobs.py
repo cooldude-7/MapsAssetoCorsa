@@ -280,6 +280,7 @@ class BuildRequest:
     trees: bool = True
     buildings: bool = True
     guardrails: bool = True
+    auto_guardrails: bool = True  # also where Ontario road rules call for one (needs guardrails)
     scenery_density: float = 1.0
 
 
@@ -333,6 +334,7 @@ class BuildRunner:
             trees=req.trees,
             buildings=req.buildings,
             guardrails=req.guardrails,
+            auto_guardrails=req.auto_guardrails,
             scenery_density=req.scenery_density,
             progress=progress,
         )

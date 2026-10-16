@@ -976,15 +976,18 @@ def route_from_path(
     end_t: float = 1.0,
     *,
     loop: bool = False,
+    respect_oneway: bool = True,
     options: RouterOptions | None = None,
 ) -> Route:
     """The Route along `path` (OSM node ids in driving order; each consecutive pair must be
     joined by a segment of one way), from `start_t` along the first segment to `end_t` along
     the last. No pathfinding.
 
-    With `loop`, the path must end at its first node; the route then closes where it started
-    (mid-segment starts drive the first segment again up to `start_t`, as `route_from_pins`
-    loops do). Going straight back along the segment just driven (a U-turn) is refused.
+    With `loop`, the path must end at its first node (or at its second, through the first);
+    the route then closes where it started (mid-segment starts drive the first segment again
+    up to `start_t`, as `route_from_pins` loops do). Going straight back along the segment
+    just driven (a U-turn) is refused, and with `respect_oneway` (the default) so is driving
+    the wrong way along a one-way road.
     """
     options = options or RouterOptions()
     path = [int(n) for n in path]
@@ -995,6 +998,8 @@ def route_from_path(
             raise RouteError("start_t and end_t must be between 0 and 1")
     start_t, end_t = float(start_t), float(end_t)
     if loop:
+        if len(path) >= 5 and path[-2:] == path[:2]:
+            path.pop()  # it came round and drove on over the start segment: close it at A
         if path[-1] != path[0] or len(path) < 4:
             raise RouteError("a loop must come back to its first node")
         if start_t > 0.0:
@@ -1022,9 +1027,15 @@ def route_from_path(
     lon0, lat0 = (a + (b - a) * start_t).tolist()
     graph = build_graph(sub, LocalProjection(lat0, lon0), respect_oneway=False)
 
+    def wrong_way(e: int) -> bool:
+        tags = graph.way_tags[int(graph.seg_way[graph.edge_seg[e]])]
+        return respect_oneway and is_oneway(tags) * int(graph.edge_dir[e]) < 0
+
     by_pair: dict[tuple[int, int], int] = {}
-    for e in range(graph.n_edges):  # ascending: the lowest edge (way id) wins duplicates
-        by_pair.setdefault((int(graph.edge_u[e]), int(graph.edge_v[e])), e)
+    for e in range(graph.n_edges):  # ascending: the lowest edge (way id) wins duplicates,
+        pair = (int(graph.edge_u[e]), int(graph.edge_v[e]))  # a legal one before a wrong way
+        if pair not in by_pair or (wrong_way(by_pair[pair]) and not wrong_way(e)):
+            by_pair[pair] = e
     idx = [graph.node_index(n) for n in path]
     edges: list[int] = []
     for i in range(len(idx) - 1):
@@ -1033,6 +1044,14 @@ def route_from_path(
             raise RouteError(
                 f"nodes {path[i]} and {path[i + 1]} are not next to each other on a road"
             )
+        if wrong_way(e):
+            tags = graph.way_tags[int(graph.seg_way[graph.edge_seg[e]])]
+            err = RouteError(
+                f"one-way: it goes the wrong way along way {int(graph.seg_way[graph.edge_seg[e]])}"
+                f" (nodes {path[i]} to {path[i + 1]})"
+            )
+            err.road = tags.get("name") or tags.get("ref") or None  # type: ignore[attr-defined]
+            raise err
         edges.append(e)
     if loop:
         inner = edges[:-1] if edges[0] == edges[-1] else edges

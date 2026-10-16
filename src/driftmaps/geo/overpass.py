@@ -6,8 +6,9 @@ Design (docs/research/geo.md §1.2, PLAN §5.1):
   geo.md §1.2). `out body geom` returns each way's node ids (topology) and coordinates.
 - Paved `highway=track` ways are included by default; service roads that are parking aisles,
   driveways or drive-throughs are left out so routes can't cut through car parks.
-- Mirrors are raced: up to `RACE_MIRRORS` at once in threads, the first good answer wins (the
-  others are ignored), with exponential backoff between rounds. Overpass answers 429 when rate
+- Mirrors are raced (hedged requests): the first is asked, the next one too as soon as it fails
+  or after `RACE_STAGGER_S` without an answer, and so on (threads); the first good answer wins
+  and late ones are ignored. Exponential backoff between rounds. Overpass answers 429 when rate
   limited and 504 when overloaded (VERIFIED, geo.md §1.1); its fair-use policy asks for a 30 s
   pause after a 429 and an identifying User-Agent. On 2026-10-15 overpass-api.de reset
   connections from the dev sandbox while maps.mail.ru answered, so the mirror list matters.
@@ -85,7 +86,9 @@ EXCLUDED_SERVICE_RE = "^(parking_aisle|driveway|drive-through|emergency_access)$
 # Overpass retry policy: HTTP codes worth retrying, and the pause after a 429 (fair-use policy).
 RETRY_HTTP_CODES = (429, 500, 502, 503, 504)
 RATE_LIMIT_PAUSE_S = 30.0
-RACE_MIRRORS = 3  # mirrors asked at once; the first good answer wins
+RACE_MIRRORS = 3  # mirrors raced per pass; the first good answer wins
+# ASSUMED: a healthy mirror answers a small query in a few seconds; only then is the next asked.
+RACE_STAGGER_S = 3.0
 
 
 class OverpassError(RuntimeError):
@@ -242,7 +245,10 @@ Opener = Callable[[urllib.request.Request, float], bytes]
 
 def _urlopen(request: urllib.request.Request, timeout: float) -> bytes:
     with urllib.request.urlopen(request, timeout=timeout) as resp:
-        return resp.read()
+        body = resp.read()
+        if (resp.headers.get("Content-Encoding") or "").strip().lower() == "gzip":
+            body = gzip.decompress(body)  # asked for with Accept-Encoding (JSON shrinks ~10x)
+        return body
 
 
 def _mirrors(mirrors: Sequence[str] | None) -> list[str]:
@@ -262,16 +268,22 @@ def _request(url: str, data: bytes) -> urllib.request.Request:
             "User-Agent": USER_AGENT,
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
+            "Accept-Encoding": "gzip",
         },
         method="POST",
     )
 
 
 def _race(
-    urls: Sequence[str], data: bytes, opener: Opener, timeout_s: float
+    urls: Sequence[str], data: bytes, opener: Opener, timeout_s: float, stagger_s: float = 0.0
 ) -> tuple[bytes | None, list[str], list[int | None]]:
-    """Ask every url at once (one thread each); return the first good body, or None and the
-    errors (with HTTP codes) once they have all failed. Late answers are ignored."""
+    """Ask the urls (one thread each) and return the first good body, or None and the errors
+    (with HTTP codes) once they have all failed. Late answers are ignored.
+
+    With `stagger_s` > 0 they are asked one after the other: the next one when the last
+    failed, or when no answer came within `stagger_s` (a hedged request; a healthy first
+    mirror answers alone). With 0 they are all asked at once.
+    """
     results: queue.Queue = queue.Queue()
 
     def ask(url: str) -> None:
@@ -284,26 +296,45 @@ def _race(
         except Exception as exc:  # noqa: BLE001 - every failure is reported, none may hang us
             results.put((None, f"{url}: {exc}", None))
 
-    if len(urls) == 1:
-        ask(urls[0])
-    else:
-        for url in urls:
-            threading.Thread(target=ask, args=(url,), daemon=True, name="overpass").start()
     errors: list[str] = []
     codes: list[int | None] = []
+    if len(urls) == 1:
+        ask(urls[0])
+        body, err, code = results.get()
+        return (body, errors, codes) if body is not None else (None, [err], [code])
+
+    started = pending = 0
+
+    def launch() -> None:
+        nonlocal started, pending
+        threading.Thread(target=ask, args=(urls[started],), daemon=True, name="overpass").start()
+        started += 1
+        pending += 1
+
+    for _ in range(len(urls) if stagger_s <= 0 else 1):
+        launch()
     deadline = time.monotonic() + 2.0 * timeout_s + 5.0  # urlopen's timeout is per read
-    for _ in urls:
+    while pending:
+        left = deadline - time.monotonic()
+        hedge = started < len(urls)
+        wait = min(left, stagger_s) if hedge else left
         try:
-            body, err, code = results.get(timeout=max(0.1, deadline - time.monotonic()))
+            body, err, code = results.get(timeout=max(0.05, wait))
         except queue.Empty:
+            if hedge and time.monotonic() < deadline:
+                launch()  # no answer yet: ask the next mirror too
+                continue
             errors.append(f"no answer in {timeout_s:.0f} s")
             break
+        pending -= 1
         if body is not None:
             return body, errors, codes
         errors.append(err)
         codes.append(code)
         if code == 400:
             break
+        if started < len(urls):
+            launch()
     return None, errors, codes
 
 
@@ -316,10 +347,12 @@ def post_query(
     opener: Opener = _urlopen,
     sleep: Callable[[float], None] = time.sleep,
     parallel: int = RACE_MIRRORS,
+    stagger_s: float = RACE_STAGGER_S,
 ) -> bytes:
     """POST `query` to the mirrors for up to `rounds` passes; return the first good body.
 
-    Each pass races the mirrors `parallel` at a time (threads; the first good answer wins).
+    Each pass races the mirrors `parallel` at a time (threads; the first good answer wins),
+    starting the next one when one fails or `stagger_s` passes without an answer.
     Between passes it waits backoff_s * 2**pass (and at least RATE_LIMIT_PAUSE_S after a 429).
     A 400 (bad query) is not retried. `opener` and `sleep` are injectable for tests.
     """
@@ -330,7 +363,7 @@ def post_query(
     for attempt in range(rounds):
         rate_limited = False
         for i in range(0, len(urls), step):
-            body, errs, codes = _race(urls[i : i + step], data, opener, timeout_s)
+            body, errs, codes = _race(urls[i : i + step], data, opener, timeout_s, stagger_s)
             if body is not None:
                 return body
             errors += errs

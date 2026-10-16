@@ -94,7 +94,10 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "/api/status did not answer" }
             $json = Get-Content $status -Raw
             Write-Host "/api/status -> $json"
-            if (($json | ConvertFrom-Json).app -ne "Assetto Corsa Map Generator") { throw "unexpected /api/status" }
+            $st = $json | ConvertFrom-Json
+            if ($st.app -ne "Assetto Corsa Map Generator") { throw "unexpected /api/status" }
+            # The header label: the frozen app must have picked up _build_info.py.
+            if ($st.build.version -ne "Update 3" -or -not $st.build.commit) { throw "no build info in /api/status" }
             curl.exe -fsS -o $page http://127.0.0.1:8765/
             if ($LASTEXITCODE -ne 0) { throw "GET / failed" }
             if (-not (Select-String -Path $page -Pattern "<html" -Quiet)) { throw "GET / is not the map page" }
