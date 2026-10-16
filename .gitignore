@@ -13,3 +13,5 @@ out/
 tools/oracles/
 # Written by CI (windows-app.yml) for the app's "Update N" label; never committed
 src/driftmaps/app/_build_info.py
+# Claude Code agent worktrees (temporary checkouts), never committed
+.claude/worktrees/
