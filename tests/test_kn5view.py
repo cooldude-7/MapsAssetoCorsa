@@ -178,14 +178,16 @@ def test_kn5_to_glb_geometry_materials_and_textures(tmp_path: Path) -> None:
 def test_glb_cache_is_keyed_on_kn5_mtime(tmp_path: Path) -> None:
     kn5_path = write_kn5(_tiny_kn5(), tmp_path / "dm_test.kn5")
     glb_path, _ = kn5glb.cached_glb(kn5_path, log=lambda *_: None)
-    os.utime(glb_path, ns=(1, 1))  # a re-conversion would give it a fresh mtime
+    # A re-conversion would give it a fresh mtime. Whole seconds: Windows keeps 100 ns ticks.
+    mark = 1_000_000_000
+    os.utime(glb_path, ns=(mark, mark))
 
     kn5glb.cached_glb(kn5_path, log=lambda *_: None)
-    assert glb_path.stat().st_mtime_ns == 1  # cache hit
+    assert glb_path.stat().st_mtime_ns == mark  # cache hit
 
     st = kn5_path.stat()
     os.utime(kn5_path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
     _, meta = kn5glb.cached_glb(kn5_path, log=lambda *_: None)
-    assert glb_path.stat().st_mtime_ns != 1  # KN5 changed: converted again
+    assert glb_path.stat().st_mtime_ns != mark  # KN5 changed: converted again
     assert meta["key"]["mtime_ns"] == kn5_path.stat().st_mtime_ns
     assert json.loads(glb_path.with_suffix(".json").read_text())["key"] == meta["key"]
