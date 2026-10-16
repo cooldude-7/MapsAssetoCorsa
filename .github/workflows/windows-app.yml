@@ -70,7 +70,7 @@ jobs:
       - name: Build the app (PyInstaller)
         run: uv run --locked pyinstaller --noconfirm --clean packaging/acmg.spec
 
-      - name: Self-test the app (modules, map page, rasterio/GDAL/PROJ, Pillow)
+      - name: Self-test the app (modules, map page, rasterio/GDAL/PROJ, Pillow, pyosmium)
         run: .\dist\AssettoCorsaMapGenerator\AssettoCorsaMapGenerator.exe --self-test
 
       # Informational: can the frozen app reach OpenStreetMap and the elevation tiles?

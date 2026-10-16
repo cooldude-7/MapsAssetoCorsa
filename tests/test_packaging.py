@@ -287,6 +287,8 @@ def test_spec_references_exist() -> None:
     assert 'collect_submodules(\n    "rasterio"' in text or 'collect_submodules("rasterio"' in text
     assert 'collect_data_files(\n    "rasterio"' in text or 'collect_data_files("rasterio"' in text
     assert 'collect_delvewheel_libs_directory("rasterio"' in text
+    assert 'collect_submodules(\n    "osmium"' in text or 'collect_submodules("osmium"' in text
+    assert 'collect_delvewheel_libs_directory("osmium"' in text
     assert 'copy_metadata("driftmaps")' in text
 
 
@@ -446,7 +448,8 @@ def test_self_test_passes_here(launcher: ModuleType, capsys) -> None:
     assert launcher.main(["--self-test"]) == 0
     out = capsys.readouterr().out
     assert "Self-test passed." in out
-    assert "[FAIL]" not in out and out.count("[ ok ]") == 5
+    assert "[FAIL]" not in out and out.count("[ ok ]") == 6
+    assert "pyosmium" in out
 
 
 def test_self_test_reports_failures(

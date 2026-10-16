@@ -15,11 +15,13 @@
 #   (rasterio/gdal_data, rasterio/proj_data, found next to rasterio's own files); on Windows the
 #   GDAL DLLs live in site-packages/rasterio.libs (a delvewheel folder);
 # - certifi (imported from rasterio's C code): the CA bundle GDAL uses for HTTPS downloads;
+# - pyosmium (the offline road data): compiled submodules and, on Windows, osmium.libs DLLs;
 # - driftmaps' metadata, so /api/status reports the real version.
 # numpy, scipy, shapely and Pillow come with hooks (PyInstaller, pyinstaller-hooks-contrib).
 #
 # Check a build with `AssettoCorsaMapGenerator --self-test` (opens a GeoTIFF with rasterio,
-# reprojects with PROJ, draws text with FreeType, reads the map page; see packaging/launcher.py).
+# reprojects with PROJ, draws text with FreeType, reads the map page, builds a tiny offline road
+# database with pyosmium; see packaging/launcher.py).
 
 import sys
 import tomllib
@@ -46,6 +48,7 @@ ICON = HERE / "icon.ico"
 SKIP_MODULES = {"driftmaps.cli", "driftmaps.__main__", "driftmaps.spike"}
 # rasterio's command line (`rio`) and its matplotlib plotting helpers aren't needed either.
 SKIP_RASTERIO = ("rasterio.rio", "rasterio.plot")
+SKIP_OSMIUM = ("osmium.replication", "osmium.tools")
 EXCLUDES = [
     "tkinter",
     "_tkinter",
@@ -155,6 +158,11 @@ hiddenimports += collect_submodules(
 # rasterio's compiled _env module imports certifi to hand GDAL's curl a CA bundle; without it
 # the elevation downloads (/vsicurl/ over HTTPS) can't verify certificates on a player's PC.
 hiddenimports += ["certifi"]
+# pyosmium (reads the offline road data's .osm.pbf): its compiled modules import each other from
+# C. Its replication/tools helpers (they pull in requests) are never used.
+hiddenimports += collect_submodules(
+    "osmium", filter=lambda name: not name.startswith(SKIP_OSMIUM)
+)
 
 datas = [(str(STATIC), "driftmaps/app/static")]
 datas += [(str(ROOT / "csp" / "new-modes"), "csp/new-modes")]
@@ -164,8 +172,10 @@ datas += collect_data_files(
 )
 datas += copy_metadata("driftmaps")
 binaries = []
-# Windows wheels keep GDAL & co. in site-packages/rasterio.libs (no-op elsewhere).
+# Windows wheels keep GDAL & co. in site-packages/rasterio.libs, and pyosmium's zlib/bz2/expat/
+# lz4/MSVC runtime in site-packages/osmium.libs (delvewheel folders; no-op elsewhere).
 datas, binaries = collect_delvewheel_libs_directory("rasterio", datas=datas, binaries=binaries)
+datas, binaries = collect_delvewheel_libs_directory("osmium", datas=datas, binaries=binaries)
 
 a = Analysis(  # noqa: F821 - PyInstaller spec globals
     [str(LAUNCHER)],

@@ -238,6 +238,39 @@ def _check_rasterio() -> str:
     return f"rasterio {rasterio.__version__}, GDAL {rasterio.__gdal_version__}, CA bundle ok"
 
 
+_SELFTEST_OSM = """<?xml version='1.0' encoding='UTF-8'?>
+<osm version="0.6" generator="self-test">
+  <node id="1" version="1" lat="43.8041000" lon="-79.9923100"/>
+  <node id="2" version="1" lat="43.8046000" lon="-79.9915000"/>
+  <way id="10" version="1"><nd ref="1"/><nd ref="2"/><tag k="highway" v="tertiary"/></way>
+</osm>
+"""
+_SELFTEST_POLY = "t\n1\n -80.5 43.5\n -79.5 43.5\n -79.5 44.1\n -80.5 44.1\nEND\nEND\n"
+
+
+def _check_osmium() -> str:
+    """pyosmium reads an OSM file and the offline road database answers a tile from it."""
+    from pathlib import Path
+
+    import osmium.version
+
+    from driftmaps.app.tiles import tile_xy
+    from driftmaps.geo.offline import OfflineDB, build_db
+
+    with tempfile.TemporaryDirectory(prefix="acmg-selftest-") as tmp:
+        src = Path(tmp) / "t.osm"
+        src.write_text(_SELFTEST_OSM, encoding="utf-8")
+        stats = build_db(src, Path(tmp) / "t.sqlite", region="selftest", poly=_SELFTEST_POLY)
+        db = OfflineDB(stats.path)
+        try:
+            ways = db.tile_ways(*tile_xy(43.8043, -79.9919))
+        finally:
+            db.close()
+    if not ways or ways[0]["nodes"] != [1, 2]:
+        raise RuntimeError("the offline road database didn't read back the test road")
+    return f"pyosmium {osmium.version.pyosmium_release}, offline road database"
+
+
 def _check_https_python() -> str:
     import urllib.request
 
@@ -269,6 +302,7 @@ def self_test(network: bool = False) -> int:
         ("numpy/scipy/shapely", _check_science),
         ("Pillow", _check_pillow),
         ("rasterio/GDAL/PROJ", _check_rasterio),
+        ("pyosmium/offline roads", _check_osmium),
     ]
     if network:
         checks.append(("HTTPS (Python)", _check_https_python))

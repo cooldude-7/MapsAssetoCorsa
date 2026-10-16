@@ -487,8 +487,12 @@ def _header_timestamp(path: Path) -> str | None:
     import osmium
 
     try:
-        header = osmium.io.Reader(str(path), osmium.osm.NOTHING).header()
-        ts = header.get("osmosis_replication_timestamp") or header.get("timestamp")
+        reader = osmium.io.Reader(str(path), osmium.osm.NOTHING)
+        try:
+            header = reader.header()
+            ts = header.get("osmosis_replication_timestamp") or header.get("timestamp")
+        finally:
+            reader.close()
     except Exception:  # noqa: BLE001 - only metadata
         return None
     return str(ts) if ts else None
