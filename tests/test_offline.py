@@ -147,6 +147,23 @@ def test_build_without_poly_uses_the_data_bbox_and_cancel_cleans_up(region, tmp_
         offline.build_db(region["osm"], tmp_path / "x.sqlite", region="../evil")
 
 
+def test_build_falls_back_to_the_memory_index(region, tmp_path, monkeypatch, caplog):
+    real = osmium.index.create_map
+    asked = []
+
+    def create_map(kind):
+        asked.append(kind.split(",")[0])
+        if kind.startswith("sparse_file_array"):
+            raise RuntimeError("no file index here")
+        return real(kind)
+
+    monkeypatch.setattr(osmium.index, "create_map", create_map)
+    stats = offline.build_db(region["osm"], tmp_path / "m.sqlite", region="m", poly=POLY)
+    assert asked == ["sparse_file_array", "flex_mem"]
+    assert stats.counts == region["stats"].counts and "flex_mem" in caplog.text
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["m.sqlite"]  # no temp files left
+
+
 def test_parse_poly_reads_outer_rings_and_holes():
     text = "r\n1\n 0 0\n 10 0\n 10 10\n 0 10\n 0 0\nEND\n!2\n 4 4\n 6 4\n 6 6\n 4 6\nEND\nEND\n"
     geom = offline.parse_poly(text)

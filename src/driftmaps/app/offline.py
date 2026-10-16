@@ -316,7 +316,7 @@ class OfflineManager:
                 raise RuntimeError("busy")
             self._cancel = threading.Event()
             self._job = {"region": region, "state": "downloading", "progress": 0.0,
-                         "message": "Starting the download", "download_mb": None}  # fmt: skip
+                         "message": "", "download_mb": None}  # fmt: skip
             self._last = None
             self._thread = threading.Thread(
                 target=self._run_job, args=(region,), name="offline-roads", daemon=True
@@ -363,7 +363,11 @@ class OfflineManager:
         if self.busy():
             raise RuntimeError("busy")
         base = region_db.db_path(region, self.dir)
-        names = [base, base.with_name(base.name + ".building")]
+        names = [
+            base,
+            base.with_name(base.name + ".building"),
+            base.with_name(base.name + ".nodes"),
+        ]
         names += [self.dir / f"{region}{s}" for s in
                   (".poly", ".osm.pbf", ".osm.pbf.part", ".osm.pbf.part.json")]  # fmt: skip
         with region_db.exclusive():
@@ -442,8 +446,7 @@ class OfflineManager:
                         frac = done / total if total else 0.0
                         rate = done / max(time.monotonic() - t0, 1e-3) / 1e6
                         of = f" of {mb} MB" if mb else " MB"
-                        text = f"Downloading {done / 1e6:.0f}{of} ({rate:.1f} MB/s)"
-                        report("downloading", frac, text)
+                        report("downloading", frac, f"{done / 1e6:.0f}{of} · {rate:.1f} MB/s")
 
                     download_file(src.pbf_url, pbf, progress=step, cancel=cancel,
                                   opener=self.opener)  # fmt: skip
@@ -468,7 +471,7 @@ class OfflineManager:
             return
         if not want or len(want[0]) != 32:
             return
-        report("downloading", 1.0, "Checking the download")
+        report("downloading", 1.0, "checking the file")
         if _md5(pbf, cancel) != want[0].lower():
             pbf.unlink(missing_ok=True)
             raise DownloadError("the downloaded file is damaged (MD5 mismatch); download again")

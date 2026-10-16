@@ -52,6 +52,7 @@ OSM data is (c) OpenStreetMap contributors, ODbL 1.0 (`overpass.OSM_ATTRIBUTION`
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import math
@@ -571,6 +572,13 @@ PASS1_END, NODES_END, WAYS_END = 0.03, 0.06, 0.88
 NODE_SECONDS_PER_MB = 0.015  # nodes took ~0.01 s/MB; only shapes the progress bar
 
 
+def _remove(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:  # still open somewhere (Windows): left for the next build
+        log.warning("could not remove %s: %s", path, exc)
+
+
 def _header_timestamp(path: Path) -> str | None:
     import osmium
 
@@ -609,23 +617,25 @@ def build_db(
     the OS page cache rather than the process's memory), else `flex_mem` (the same in RAM, and
     twice that for a moment while it grows) if the file index isn't available or fails.
     """
+    if not _REGION_RE.match(region):
+        raise ValueError(f"bad region name {region!r}")
     if location_index is None:
         nodes_file = Path(out).with_name(Path(out).name + ".nodes")
+        _remove(nodes_file)  # a stale one from a crash
         try:
             return build_db(
                 source, out, region=region, poly=poly, source_name=source_name,
                 progress=progress, cancel=cancel,
                 location_index=f"sparse_file_array,{nodes_file}",
             )  # fmt: skip
-        except BuildCancelled:
+        except (BuildCancelled, KeyboardInterrupt):
             raise
-        except (RuntimeError, OSError, ValueError) as exc:
-            if isinstance(exc, ValueError) and "region" in str(exc):
-                raise
+        except (RuntimeError, OSError) as exc:
             log.warning("file node index failed (%s); building again with flex_mem", exc)
             location_index = "flex_mem"
         finally:
-            nodes_file.unlink(missing_ok=True)
+            gc.collect()  # a traceback may still hold the index's file mapping (Windows)
+            _remove(nodes_file)
     import osmium
 
     t0 = time.monotonic()
@@ -729,8 +739,10 @@ def build_db(
                 writer.add(kind, obj.id, rel_id, role, closed, rel_text, None, pts, n)
         del stream  # frees the node location index before indexing
         check()
-        say(WAYS_END, "Indexing")
-        writer.write_tiles(lambda f: (check(), say(WAYS_END + (0.99 - WAYS_END) * f, "Indexing")))
+        say(WAYS_END, "Indexing roads")
+        writer.write_tiles(
+            lambda f: (check(), say(WAYS_END + (0.99 - WAYS_END) * f, "Indexing roads"))
+        )
         con.execute("CREATE INDEX features_rel ON features(rel_id) WHERE rel_id IS NOT NULL")
         if poly is None:
             if not math.isfinite(writer.bounds[0]):

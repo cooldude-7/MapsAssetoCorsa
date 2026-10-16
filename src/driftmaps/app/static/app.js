@@ -3655,8 +3655,8 @@ function offlineDate(text) {
 /** The step line under the bar, e.g. "Downloading 45%…" or "Processing roads 60%…". */
 function offlineStepText(st) {
   const pct = Math.floor(Math.max(0, Math.min(1, Number(st.progress) || 0)) * 100);
-  if (st.state === "downloading") return `Downloading ${pct}%… ${st.message && st.message.startsWith("Downloading") ? st.message.replace(/^Downloading\s*/, "(") + ")" : ""}`.trim();
-  if (st.state === "processing") return `${st.message && !/^Processing roads/.test(st.message) ? st.message : "Processing roads"} ${pct}%…`;
+  if (st.state === "downloading") return `Downloading ${pct}%…${st.message ? ` ${st.message}` : ""}`;
+  if (st.state === "processing") return `${st.message || "Processing roads"} ${pct}%…`;
   return st.message || "";
 }
 
