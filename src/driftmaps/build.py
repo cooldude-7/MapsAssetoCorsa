@@ -189,6 +189,7 @@ from driftmaps.geo.mapillary import (
 from driftmaps.geo.overpass import (
     OSM_ATTRIBUTION,
     NetworkData,
+    OsmNode,
     OverpassError,
     default_cache_dir,
     fetch_network,
@@ -196,6 +197,7 @@ from driftmaps.geo.overpass import (
 )
 from driftmaps.geo.project import LocalProjection
 from driftmaps.geo.router import Continuation, Route, route_continuations
+from driftmaps.geo.sidewalks import SIDEWALK_SOURCES, fetch_sidewalks
 from driftmaps.geo.street_features import StreetFeatures, fetch_street_features
 from driftmaps.geometry.barriers import (
     ScenePiece,
@@ -231,6 +233,7 @@ from driftmaps.geometry.furniture import (
     plan_furniture,
     street_names,
 )
+from driftmaps.geometry.lanes import PaintLine, RoadLanes, paint_lines, road_lanes, way_lanes
 from driftmaps.geometry.network import (
     MATERIALS as NETWORK_MATERIALS,
 )
@@ -256,6 +259,14 @@ from driftmaps.geometry.road import (
 )
 from driftmaps.geometry.roundabouts import pavers_texture
 from driftmaps.geometry.street_items import POLE_UTILITY, StreetItem
+from driftmaps.geometry.streetscape import (
+    RouteSection,
+    SidewalkIndex,
+    UrbanContext,
+    section_width,
+    sidewalk_width,
+    walk_sides,
+)
 from driftmaps.geometry.terrain import (
     Terrain,
     TerrainExtra,
@@ -345,7 +356,10 @@ DIRT_SURFACE = Surface(
     vibration_gain=0.25,
     vibration_length=0.4,
 )
-SURFACES: tuple[Surface, ...] = (*DEFAULT_SURFACES, DIRT_SURFACE)
+# KERB: concrete curbs and gutters (the urban section, medians, roundabout islands). ASSUMED
+# values near vanilla ROAD: concrete grips a little less than asphalt; drivable and valid.
+KERB_SURFACE = Surface(key="KERB", friction=0.93, wav="kerb.wav", is_valid_track=True)
+SURFACES: tuple[Surface, ...] = (*DEFAULT_SURFACES, DIRT_SURFACE, KERB_SURFACE)
 
 # Elevation source name -> LICENSE-DATA.txt notice key (others use the source's own text).
 _LICENCE_KEYS = {
@@ -425,6 +439,9 @@ class BuildOptions:
     # cover the route. Burlington's terms are revocable and must travel with the track
     # (LICENSE-DATA.txt carries their URL); drop "burlington" to build without it.
     municipal_buildings: tuple[str, ...] = ("burlington", "milton", "oakville")
+    # Municipal sidewalk lines (geo.sidewalks): Oakville's open layer; Burlington's only when
+    # "burlington" is in `municipal_buildings` (the same revocable terms switch).
+    municipal_sidewalks: bool = True
     # Street furniture (geometry.furniture): signs, poles and wires, lights, signals, hydrants,
     # mailboxes and the route's stop bars. Mapillary detections need a client token
     # (None: $DRIFTMAPS_MAPILLARY_TOKEN; without one, OSM and the rules only).
@@ -465,6 +482,9 @@ class BuildResult:
     geometry: TrackGeometry | None = field(default=None, repr=False)
     debug_images: list[Path] = field(default_factory=list)
     scenery: _Scenery | None = field(default=None, repr=False)  # trees, buildings, rails, bridges
+    # The warnings the player must see (the app lists them with the result), e.g. a road
+    # network that could not be had; all of them are in `warnings` too.
+    alerts: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         s = self.stats
@@ -703,6 +723,12 @@ class TrackGeometry:
     osm_polyline: np.ndarray  # (M, 3) the OSM node polyline (Y = 0), A..B
     # (N,) OSM way id per station (its tags: route.ways), clamped at the run-up/run-off.
     way_id: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
+    # (N,) curbed urban section (`geometry.streetscape`); the lane layout (`geometry.lanes`)
+    # and the lines painted on the route (None: the default edge and centre lines).
+    urban: np.ndarray = field(default_factory=lambda: np.zeros(0, bool))
+    lane_layout: RoadLanes | None = None
+    paint: list[PaintLine] | None = None
+    section: RouteSection | None = None  # the urban section's sidewalks (geometry.streetscape)
 
     @property
     def length_m(self) -> float:
@@ -1236,6 +1262,13 @@ def _add_split(
         counts[key] = counts.get(key, 0) + piece.vertex_count
 
 
+# The route's urban section meshes: (RoadMeshes.urban key, KN5 name prefix, material).
+_URBAN_MESHES = (
+    ("curb", "1KERB_c", "concrete"),
+    ("boulevard", "1GRASS_blvd_c", "grass"),
+    ("sidewalk", "1ROAD_walk_c", "concrete"),
+    ("apron", "1ROAD_apron_c", "concrete"),
+)
 _NETWORK_PREFIXES = tuple(sorted({prefix for prefix, *_ in NETWORK_MATERIALS.values()}))
 
 
@@ -1263,6 +1296,7 @@ def _assemble_kn5(
             ("paint_white", "paint_white"),
             ("paint_yellow", "paint_yellow"),
             ("wall_hidden", "wall_hidden"),
+            ("concrete", "concrete"),
         )
     }
     counts: dict[str, int] = {}
@@ -1270,6 +1304,9 @@ def _assemble_kn5(
         _add_split(scene, mesh, f"1ROAD_c{k:03d}", mats["road"], counts, "road")
     for k, mesh in enumerate(roads.gravel):
         _add_split(scene, mesh, f"1GRAVEL_c{k:03d}", mats["gravel"], counts, "gravel")
+    for key, prefix, mat in _URBAN_MESHES:  # the urban section (geometry.streetscape)
+        for k, mesh in enumerate(roads.urban.get(key, ())):
+            _add_split(scene, mesh, f"{prefix}{k:03d}", mats[mat], counts, "urban")
     for k, (w, y) in enumerate(zip(roads.paint_white, roads.paint_yellow, strict=True)):
         _add_split(
             scene, w, f"paint_white_c{k:03d}", mats["paint_white"], counts, "paint", **DECAL_FLAGS
@@ -1421,9 +1458,46 @@ def _route_lonlat(geo: TrackGeometry, step: int = 5) -> np.ndarray:
 # --------------------------------------------------------------------------------------------
 
 
+NETWORK_MISSING_WARNING = (
+    "No side roads, junctions, roundabouts or cul-de-sacs: the road data around the route "
+    "could not be downloaded ({reason}). Check the internet connection (or download the "
+    "region's roads in the app) and build again."
+)
+_ALERT_PREFIXES = (NETWORK_MISSING_WARNING[:40],)
+TILE_NETWORK_PAD_M = 40.0  # tiles are taken this much beyond the network radius
+
+
+def _network_from_tiles(route: Route, options: BuildOptions) -> tuple[NetworkData | None, str]:
+    """The roads around the route from the app's z14 road tiles (`app.tiles`): the cached
+    ones, the rest downloaded by the tile store (its own small Overpass queries, mirrors
+    raced). Tagged nodes are unknown then: rules decide turning circles and stops.
+    Returns (the network or None, what went wrong)."""
+    from driftmaps.app.tiles import TileStore
+
+    line = route.polyline(step_m=5.0).lonlat
+    radius = options.network_options.radius_m + TILE_NETWORK_PAD_M
+    store = TileStore(Path(options.cache_dir or default_cache_dir()))
+    try:
+        osm, error = store.along(line, radius, offline=options.offline)
+    except (*_DATA_ERRORS, ValueError) as e:
+        return None, _short(e)
+    if not osm.ways:
+        return None, error or "no roads in the map tiles"
+    proj = LocalProjection(float(line[0, 1]), float(line[0, 0]))
+    path = shapely.LineString(proj.to_xy(line)) if len(line) >= 2 else shapely.Point(0, 0)
+    lines = [shapely.LineString(proj.to_xy(w.lonlat)) for w in osm.ways]
+    near = shapely.dwithin(path, lines, radius)
+    ways = tuple(w for w, k in zip(osm.ways, near.tolist(), strict=True) if k)
+    if error:  # some tiles missing: the network is partial, but better than none
+        warnings.warn(f"part of the road network is missing ({error})", stacklevel=3)
+    return NetworkData(ways, (), osm.osm_base, nodes_known=False), ""
+
+
 def _fetch_network(route: Route, options: BuildOptions) -> NetworkData | None:
     """The OSM highways and tagged highway nodes around the route: `options.osm_network`, else
-    the region database / cache / Overpass, else the route's own cached routing corridor."""
+    the region database / cache / Overpass, else the app's z14 road tiles (cached or fetched
+    tile by tile), else the route's own cached routing corridor. Never silently None: a
+    missing network is a warning (`NETWORK_MISSING_WARNING`) the app shows."""
     if options.osm_network is not None:
         return options.osm_network
     try:
@@ -1435,12 +1509,119 @@ def _fetch_network(route: Route, options: BuildOptions) -> NetworkData | None:
         )
     except _DATA_ERRORS as e:
         reason = _short(e)
-    if route.cache_key:
+    net, why = _network_from_tiles(route, options)
+    if net is not None:
+        warnings.warn(
+            f"road network from the map tiles (Overpass: {reason}); stop signs and "
+            "cul-de-sacs follow the rules",
+            stacklevel=2,
+        )
+        return net
+    if route.cache_key and not route.cache_key.startswith("tiles-"):
         cached = load_cached(Path(options.cache_dir or default_cache_dir()), route.cache_key)
         if cached is not None:
             return NetworkData(cached.ways, (), cached.osm_base, nodes_known=False)
-    warnings.warn(f"road network unavailable ({reason}); no side roads", stacklevel=2)
+    warnings.warn(NETWORK_MISSING_WARNING.format(reason=f"{reason}; {why}"), stacklevel=2)
     return None
+
+
+def _urban_context(
+    geo: TrackGeometry, osm: NetworkData | None, sidewalks: Sequence[np.ndarray] = ()
+) -> UrbanContext:
+    """Urban or rural for the route and its side roads (`geometry.streetscape`)."""
+    streets = [(_xz(geo.projection, w.lonlat), w.tags) for w in (osm.ways if osm else ())]
+    return UrbanContext(streets, sidewalks)
+
+
+def _route_lanes(geo: TrackGeometry, ctx: UrbanContext) -> None:
+    """The route's urban flags, lane layout and painted lines (`geometry.lanes`; North
+    American roads only, elsewhere the default lines stay)."""
+    m, route = geo.model, geo.route
+    if len(geo.way_id) != len(m):
+        geo.urban = np.zeros(len(m), bool)
+        return
+    tags = [route.ways.get(int(w), {}) for w in geo.way_id.tolist()]
+    geo.urban = ctx.urban(m.centre[:, [0, 2]], tags, m.half_width, m.s)
+    if geo.region != "na":
+        return
+    dirs: dict[int, int] = {}
+    for e in route.edges:
+        dirs.setdefault(int(e.way), int(e.dir))
+    cache: dict[tuple[int, bool], object] = {}
+    ways = []
+    for w, t, ow in zip(geo.way_id.tolist(), tags, np.asarray(geo.oneway).tolist(), strict=True):
+        key = (int(w), ow < 0)
+        if key not in cache:
+            wl = way_lanes(t, dirs.get(int(w), 1) > 0)
+            if ow < 0:  # driving against a one-way: its lanes run towards us
+                wl = dataclasses.replace(wl, forward=0, backward=wl.forward, turn_forward=(),
+                                         turn_backward=wl.turn_forward)  # fmt: skip
+            cache[key] = wl
+        ways.append(cache[key])
+    geo.lane_layout = road_lanes(m.half_width, ways, right_hand=geo.driving_side == "right")
+    n = len(m)
+    geo.paint = paint_lines(
+        m.s, geo.lane_layout, urban=geo.urban, highway=[t.get("highway", "") for t in tags],
+        centre_ok=m.centre_line, edge_ok=np.ones(n, bool), oneway=np.asarray(geo.oneway),
+    )  # fmt: skip
+
+
+def _sidewalk_lines(
+    geo: TrackGeometry, options: BuildOptions
+) -> tuple[list[np.ndarray], list[str]]:
+    """Municipal sidewalk lines (AC XZ) within the network radius of the route, and their
+    credit lines (`geo.sidewalks`; failing soft)."""
+    if not options.municipal_sidewalks or geo.region != "na":
+        return [], []
+    names = ["oakville"] + (["burlington"] if "burlington" in options.municipal_buildings else [])
+    ll = _route_lonlat(geo, step=20)
+    pad = (options.network_options.radius_m + 60.0) / 111_320.0
+    boxes = []
+    for k in range(0, len(ll), 40):  # one box per ~800 m of road
+        p = ll[k : k + 41]
+        lat_pad = pad
+        lon_pad = pad / max(np.cos(np.radians(float(p[:, 1].mean()))), 0.2)
+        boxes.append(
+            (float(p[:, 0].min() - lon_pad), float(p[:, 1].min() - lat_pad),
+             float(p[:, 0].max() + lon_pad), float(p[:, 1].max() + lat_pad))
+        )  # fmt: skip
+    lines: list[np.ndarray] = []
+    credits: list[str] = []
+    for name in names:
+        src = SIDEWALK_SOURCES[name]
+        try:
+            got = fetch_sidewalks(src, boxes, cache_dir=options.cache_dir, offline=options.offline)
+        except (SourceError, *_DATA_ERRORS) as e:
+            warnings.warn(f"{src.title} unavailable ({_short(e)}); OSM and rules decide the "
+                          "sidewalks", stacklevel=2)  # fmt: skip
+            continue
+        if got:
+            lines += [_xz(geo.projection, g) for g in got]
+            credits.append(src.attribution)
+    return lines, credits
+
+
+def _route_section(geo: TrackGeometry, walks: SidewalkIndex | None) -> None:
+    """The route's urban section (curb, boulevard, sidewalks; `geometry.streetscape`): where
+    it is urban, its shoulders become the section."""
+    m, route = geo.model, geo.route
+    if geo.region != "na" or len(geo.urban) != len(m) or not geo.urban.any():
+        return
+    urban = geo.urban & ~m.bridge  # no section on bridge decks (their rails need the edge)
+    if not urban.any():
+        return
+    tags = [route.ways.get(int(w), {}) for w in geo.way_id.tolist()]
+    dirs: dict[int, int] = {}
+    for e in route.edges:
+        dirs.setdefault(int(e.way), int(e.dir))
+    along = np.array([dirs.get(int(w), 1) > 0 for w in geo.way_id.tolist()])
+    municipal = None
+    if walks:
+        municipal = walks.sides(m.centre[:, [0, 2]], m.left[:, [0, 2]], m.half_width)
+    left, right = walk_sides(tags, along, urban, municipal, m.s)
+    walk_w = np.array([sidewalk_width(t.get("highway", "")) for t in tags])
+    geo.section = RouteSection(urban, left, right, walk_w)
+    m.shoulder = np.where(urban, section_width(walk_w), m.shoulder)
 
 
 def _xz(projection: LocalProjection, lonlat: np.ndarray) -> np.ndarray:
@@ -1453,6 +1634,8 @@ def _network(
     osm: NetworkData,
     ends: tuple[Continuation | None, Continuation | None],
     options: BuildOptions,
+    urban: UrbanContext | None = None,
+    walks: SidewalkIndex | None = None,
 ) -> RoadNetwork:
     """Side roads, junctions and roundabouts around the route (`geometry.network`)."""
     proj = geo.projection
@@ -1492,6 +1675,7 @@ def _network(
         max_vertical_curvature=options.max_vertical_curvature,
         shoulder_m=options.shoulder_m,
         verge_m=options.verge_m,
+        route_stop_bars=not options.furniture,  # else furniture paints the route's markings
     )
     return build_network(
         geo.model,
@@ -1505,6 +1689,11 @@ def _network(
         driving_side=geo.driving_side,
         options=nopt,
         nodes_known=osm.nodes_known,
+        route_way_id=geo.way_id if len(geo.way_id) == len(geo.model) else None,
+        route_way_tags=route.ways,
+        urban=urban,
+        route_urban=geo.section.urban if geo.section is not None else None,
+        walks=walks,
     )
 
 
@@ -1515,6 +1704,8 @@ def _driveways(
     options: BuildOptions,
     sc: _Scenery,
     roads: RoadMeshes,
+    paint: list[PaintLine] | None = None,
+    section: RouteSection | None = None,
 ) -> RoadMeshes:
     """OSM and inferred driveways (they need the placed buildings) with their mailboxes; the
     route meshes are rebuilt when driveway mouths cut its edge lines or shoulders."""
@@ -1525,7 +1716,9 @@ def _driveways(
     net.stats.update(res.stats)
     sc.pieces += res.pieces
     if res.masks_changed:
-        return build_road_meshes(m, chunk_m=options.chunk_m, keep=net.masks)
+        return build_road_meshes(
+            m, chunk_m=options.chunk_m, keep=net.masks, lines=paint, section=section
+        )
     return roads
 
 
@@ -1842,25 +2035,45 @@ def _short(e: Exception) -> str:
     return text[0][:160] if text else type(e).__name__
 
 
+_NOT_FETCHED = object()
+
+
+def _street_features(geo: TrackGeometry, options: BuildOptions) -> StreetFeatures | None:
+    """OSM signs, poles, lights and control nodes along the route (failing soft)."""
+    if options.street_features is not None:
+        return options.street_features
+    try:
+        return fetch_street_features(
+            _route_lonlat(geo), cache_dir=options.cache_dir, offline=options.offline
+        )
+    except _DATA_ERRORS as e:
+        warnings.warn(f"OSM signs and poles unavailable ({_short(e)})", stacklevel=2)
+        return None
+
+
+def _control_nodes(feats: StreetFeatures) -> tuple[OsmNode, ...]:
+    """The street features' junction control nodes as the network's tagged nodes."""
+    keep = ("stop", "give_way", "traffic_signals")
+    return tuple(
+        OsmNode(n.id, (n.lon, n.lat), dict(n.tags))
+        for n in feats.nodes
+        if n.tags.get("highway") in keep
+    )
+
+
 def _furniture(
     geo: TrackGeometry,
     ground: Callable[[np.ndarray], np.ndarray],
     options: BuildOptions,
     sc: _Scenery,
     street_items: Sequence[StreetItem],
+    feats: object = _NOT_FETCHED,
 ) -> None:
     """Street furniture (`geometry.furniture`): fetch OSM nodes and Mapillary detections
     (each failing soft), plan every item with the other stages' `street_items`, and build the
     meshes and the route's markings."""
     ll = _route_lonlat(geo)
-    if options.street_features is not None:
-        osm: StreetFeatures | None = options.street_features
-    else:
-        try:
-            osm = fetch_street_features(ll, cache_dir=options.cache_dir, offline=options.offline)
-        except _DATA_ERRORS as e:
-            warnings.warn(f"OSM signs and poles unavailable ({_short(e)})", stacklevel=2)
-            osm = None
+    osm = _street_features(geo, options) if feats is _NOT_FETCHED else feats
     sc.street_features = osm
     mly: list[MapFeature] = []
     coverage = options.mapillary_coverage
@@ -1889,7 +2102,7 @@ def _furniture(
     plan = plan_furniture(
         m, geo.projection, geo.route, ground, s_range=(geo.s_a, geo.s_b), way_id=geo.way_id,
         items=street_items, osm=osm, mapillary=mly, coverage=coverage, surface=surface,
-        options=options.furniture_options,
+        options=options.furniture_options, lanes=geo.lane_layout, urban=geo.urban,
     )  # fmt: skip
     sc.furniture = plan
     names = street_names(plan.items)
@@ -2298,15 +2511,33 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
                 route, osm_net.ways, run_up_length_m(options), options.run_off_m
             )
         geo = prepare_geometry(route, options, ends)
+        walks, walk_credits = _sidewalk_lines(geo, options)
+        urban_ctx = _urban_context(geo, osm_net, walks)
+        _route_lanes(geo, urban_ctx)
+        walk_index = SidewalkIndex(walks) if walks else None
+        _route_section(geo, walk_index)
+        feats: StreetFeatures | None | object = _NOT_FETCHED
+        if osm_net is not None and options.network and not osm_net.nodes:
+            # The tile fallback knows no tagged nodes: take the junction controls from the
+            # street features (fetched once, for the furniture too), when they can be had.
+            feats = _street_features(geo, options)
+            if feats is not None:
+                osm_net = dataclasses.replace(osm_net, nodes=_control_nodes(feats))
         street_items: list[StreetItem] = []
         net: RoadNetwork | None = None
         if osm_net is not None and options.network:
             progress("Building side roads, junctions and roundabouts", 0.3)
-            net = _network(geo, osm_net, ends, options)
+            net = _network(geo, osm_net, ends, options, urban_ctx, walk_index)
             geo.model = net.model  # heights moved onto roundabout planes
         m = geo.model
         progress("Building the road and terrain", 0.35)
-        roads = build_road_meshes(m, chunk_m=options.chunk_m, keep=net.masks if net else None)
+        roads = build_road_meshes(
+            m,
+            chunk_m=options.chunk_m,
+            keep=net.masks if net else None,
+            lines=geo.paint,
+            section=geo.section,
+        )
         terrain = build_terrain(
             m,
             roads.left_outer,
@@ -2333,6 +2564,7 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
         # Scenery (scenery.md §7): bridges first (they may lower the terrain under a deck).
         progress("Adding bridges, walls and guardrails", 0.45)
         sc = _Scenery()
+        sc.attributions += walk_credits
         terrain = _bridges(geo, terrain, options, road_height, sc)
         ground = _ground_fn(terrain, road_height)
         sc.ground = ground
@@ -2352,11 +2584,12 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
             progress("Placing buildings", 0.55)
             _buildings(geo, ground, corridor, canopy, options, track_id, sc)
         if net is not None:  # driveways need the placed houses
-            roads = _driveways(net, m, ground, options, sc, roads)
+            roads = _driveways(net, m, ground, options, sc, roads, geo.paint, geo.section)
             street_items += net.street_items(ground)
+            sc.pieces += net.urban_pieces  # sidewalks and curbs, with the driveways' curb cuts
         if options.furniture:
             progress("Adding signs, poles and lights", 0.62)
-            _furniture(geo, ground, options, sc, street_items)
+            _furniture(geo, ground, options, sc, street_items, feats)
         if options.trees:
             progress("Planting trees", 0.7)
             _trees(geo, canopy, options, track_id, sc)
@@ -2523,7 +2756,8 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
     if route.repeated_nodes():
         notes.append("the route passes the same junction twice (it crosses itself)")
     progress("Track built", 1.0)
-    return BuildResult(track_dir, track_id, stats, notes, geo, images, sc)
+    alerts = [n for n in notes if n.startswith(_ALERT_PREFIXES)]
+    return BuildResult(track_dir, track_id, stats, notes, geo, images, sc, alerts)
 
 
 # --------------------------------------------------------------------------------------------

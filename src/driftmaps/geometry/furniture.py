@@ -137,7 +137,8 @@ class FurnitureOptions:
 
 @dataclass
 class Marking:
-    """A road marking on the route: `kind` "stop_bar", "crosswalk", "zebra" or "arrow:<dir>",
+    """A road marking on the route: `kind` "stop_bar", "crosswalk" (two lines), "zebra"
+    (bars), "ladder" (bars between two lines) or "arrow:<dir>",
     at station `s`, between lateral offsets `l0` < `l1` (+ = left), from `source`."""
 
     kind: str
@@ -346,6 +347,50 @@ def _junctions(route, frame: _Frame, projection: LocalProjection) -> list[_Junct
     return out
 
 
+def _clusters(juncs: list[_Junction], route) -> dict[int, tuple[float, float]]:
+    """node -> (first, last station) of the junction it belongs to: route nodes closer than
+    `CLUSTER_M` where the side roads share a name or ref (the two carriageways of a divided
+    road crossing the route) count as one junction."""
+    from driftmaps.geometry.divided import carriageway_key
+
+    def keys(j: _Junction) -> frozenset[str]:
+        out: frozenset[str] = frozenset()
+        for w, _ in j.legs:
+            out |= carriageway_key(route.ways.get(w) or {})
+        return out
+
+    out: dict[int, tuple[float, float]] = {}
+    group: list[_Junction] = []
+
+    def close() -> None:
+        for g in group:
+            out[g.node] = (group[0].s, group[-1].s)
+
+    for j in juncs:
+        if group and j.s - group[-1].s < CLUSTER_M and keys(j) & keys(group[-1]):
+            group.append(j)
+            continue
+        close()
+        group = [j]
+    close()
+    return out
+
+
+def arrow_kind(turn: str) -> str | None:
+    """ "arrow:<left|straight|right joined by _>" for one lane's `turn:lanes` value, or None."""
+    parts = set()
+    for t in turn.split(";"):
+        t = t.strip()
+        if t in ("left", "slight_left", "sharp_left"):
+            parts.add("left")
+        elif t in ("right", "slight_right", "sharp_right"):
+            parts.add("right")
+        elif t == "through":
+            parts.add("straight")
+    order = [p for p in ("left", "straight", "right") if p in parts]
+    return "arrow:" + "_".join(order) if order else None
+
+
 def _highway(route, way: int) -> str:
     return str((route.ways.get(way) or {}).get("highway", ""))
 
@@ -369,7 +414,10 @@ def _road_half(tags: Mapping[str, str] | None) -> float:
 
 
 class _Planner:
-    def __init__(self, model, projection, route, s_range, ground, way_id, options, coverage):
+    def __init__(self, model, projection, route, s_range, ground, way_id, options, coverage,
+                 lanes=None, urban=None):  # fmt: skip
+        self.lanes = lanes  # geometry.lanes.RoadLanes of the route (None: halves of the road)
+        self.urban = None if urban is None or len(urban) != len(model.s) else np.asarray(urban)
         self.m = model
         self.proj = projection
         self.route = route
@@ -415,6 +463,46 @@ class _Planner:
         it = _item(kind, self.frame.point(s, lat), facing, self.ground, source, text)
         self.items.append(it)
         return it
+
+    def span(self, s: float, forward: bool) -> tuple[float, float] | None:
+        """Lateral span (l0, l1) of the route's lanes for one direction at s, kept clear of
+        the edges (0.2 m) and the centre line (0.25 m); None where no lane runs that way
+        (a one-way carriageway: that traffic is on the other carriageway)."""
+        if self.lanes is None:
+            h = self.frame.half(s)
+            return (-h + 0.2, -0.2) if forward else (0.2, h - 0.2)
+        i = self.m.index_at(s)
+        sp = self.lanes.span(i, forward)
+        if sp is None:
+            return None
+        lo, hi = sp
+        hw = float(self.m.half_width[i])
+        lo = lo + (0.2 if lo <= -hw + 1e-6 else 0.25)
+        hi = hi - (0.2 if hi >= hw - 1e-6 else 0.25)
+        return (lo, hi) if hi > lo else None
+
+    def urban_at(self, s: float) -> bool:
+        return bool(self.urban[self.m.index_at(s)]) if self.urban is not None else False
+
+    def arrows(self, s_bar: float, forward: bool) -> None:
+        """Turn arrows from `turn:lanes` in each approach lane, their tips `ARROW_SETBACK_M`
+        before the stop line (OTM Book 11; only where some lane has a turn designation)."""
+        if self.lanes is None:
+            return
+        d = 1.0 if forward else -1.0
+        up = s_bar - d * 15.0  # the lanes as they arrive (a turn bay ends at the junction)
+        if not self.frame.s0 <= up <= self.frame.s1:
+            return
+        i = self.m.index_at(up)
+        turns = self.lanes.turn_fwd[i] if forward else self.lanes.turn_bwd[i]
+        centres = self.lanes.lane_centres(i, forward)
+        if not turns or len(turns) != len(centres) or not any(turns):
+            return
+        base = s_bar - d * (ARROW_SETBACK_M + ARROW_LEN_M)
+        for t, c in zip(turns, centres, strict=True):
+            kind = arrow_kind(t)
+            if kind:
+                self.markings.append(Marking(kind, base, c - 0.5, c + 0.5, "osm", forward))
 
     def _speed_at(self, s: float) -> int | None:
         if len(self.way_id) != len(self.m.s):
@@ -479,7 +567,14 @@ class _Planner:
         half = self.frame.half(s)
         name = value[len("marking--discrete--") :].split("--g")[0]
         mine = lat < 0  # right of the centreline: the route's own direction
-        l0, l1 = (-half + 0.2, -0.2) if mine else (0.2, half - 0.2)
+        if self.lanes is not None:  # which direction's lanes the photo's marking is in
+            i = self.m.index_at(s)
+            c = float(self.lanes.centre[i])
+            mine = lat < c if self.lanes.right_hand else lat > c
+        sp = self.span(s, mine)
+        if sp is None:
+            return
+        l0, l1 = sp
         if name == "stop-line":
             self.markings.append(Marking("stop_bar", s, l0, l1, "mapillary"))
         elif name in ("crosswalk-zebra",):
@@ -550,6 +645,7 @@ class _Planner:
 
     def junction_controls(self, feats, mly) -> None:
         juncs = _junctions(self.route, self.frame, self.proj)
+        reach = _clusters(juncs, self.route)
         osm_ctl = (
             _osm_node_controls(feats, self.proj, self.frame, self.route)
             if feats is not None
@@ -583,19 +679,34 @@ class _Planner:
                     mapped = mapped or "stop"
                 elif SIGN_YIELD in kinds:
                     mapped = mapped or "yield"
-                ctl = approach_stops(hw, others, mapped=mapped)
+                ctl = approach_stops(hw, others, mapped=mapped, urban=self.urban_at(j.s),
+                                     crossing=sides)  # fmt: skip
                 self.plan.controls.append({"node": j.node, "s": round(j.s, 1), "forward": forward,
                                            "approach": hw, "others": others,
                                            "mapped": mapped, "control": ctl})  # fmt: skip
-                if ctl is None:
-                    continue
                 cross_half = max(
                     (_road_half(self.route.ways.get(w)) for w in [j.out_way if forward else
                      j.in_way] + [w for w, _ in j.legs]),
                     default=3.5,
                 )  # fmt: skip
+                # A divided crossing road is one junction: its first carriageway is where the
+                # approach stops (`_clusters`).
+                s_first, s_last = reach.get(j.node, (j.s, j.s))
+                s_j = s_first if forward else s_last
                 gap = cross_half + 1.5  # OTM Book 11: stop line 1-3 m short of the crossing road
-                s_bar = j.s - gap if forward else j.s + gap
+                if ctl == "signal":  # the crosswalk first, then the stop line behind it
+                    cw = cross_half + CROSSWALK_EDGE_M + ZEBRA_LEN_M / 2
+                    gap = cw + ZEBRA_LEN_M / 2 + STOP_LINE_SETBACK_M
+                    h = self.frame.half(s_j)
+                    for s_cw in (s_first - cw, s_last + cw):  # both legs of the route
+                        if self.frame.s0 <= s_cw <= self.frame.s1:
+                            self.markings.append(Marking("ladder", s_cw, -h, h, "rule"))
+                s_bar = s_j - gap if forward else s_j + gap
+                if self.span(s_bar, forward) is None:
+                    continue  # no lane this way here: the other carriageway's approach
+                self.arrows(s_bar, forward)
+                if ctl is None:
+                    continue
                 side = -1 if forward else 1
                 if ctl in ("stop", "yield"):
                     want = [SIGN_STOP if ctl == "stop" else SIGN_YIELD]
@@ -616,8 +727,7 @@ class _Planner:
                             claimed.update(found)
                     claimed.update(i for i in mine if self.items[i].kind in want)
                 if ctl in ("stop", "signal"):
-                    h = self.frame.half(s_bar)
-                    l0, l1 = (-h + 0.2, -0.2) if forward else (0.2, h - 0.2)
+                    l0, l1 = self.span(s_bar, forward)
                     self.markings.append(Marking("stop_bar", s_bar, l0, l1, "rule"))
                 if ctl == "signal":
                     self._signal(s_bar, forward)
@@ -632,11 +742,12 @@ class _Planner:
             if any(abs(s - j.s) < 40.0 for j in juncs):
                 continue
             side = -1 if fwd else 1
+            sp = self.span(s, fwd)
+            if sp is None:
+                continue
             self.side_sign(SIGN_STOP if ctl == "stop" else SIGN_YIELD, s, side, not fwd, "osm")
             if ctl == "stop":
-                h = self.frame.half(s)
-                l0, l1 = (-h + 0.2, -0.2) if fwd else (0.2, h - 0.2)
-                self.markings.append(Marking("stop_bar", s, l0, l1, "osm"))
+                self.markings.append(Marking("stop_bar", s, sp[0], sp[1], "osm"))
 
     def _signal(self, s_bar: float, forward: bool) -> None:
         """A signal pole with a mast arm on the near right corner, and its luminaire."""
@@ -937,16 +1048,20 @@ def plan_furniture(
     coverage: np.ndarray | None = None,
     surface: DrivableSurface | None = None,
     options: FurnitureOptions | None = None,
+    lanes=None,
+    urban: np.ndarray | None = None,
 ) -> FurniturePlan:
     """Every street item for the track (see the module notes), de-duplicated, with the pole
     wires and the route's markings. `coverage` is Mapillary's photo positions (N, 2) lon/lat
     (None: no photos, rules everywhere); `way_id` the OSM way per station (speed limits);
     `surface` the drivable surface items keep off (`geometry.clearance`; default: the route's
-    asphalt and shoulders)."""
+    asphalt and shoulders). `lanes` (`geometry.lanes.RoadLanes`) places the markings in the
+    route's lanes (stop lines across the approach lanes only, turn arrows per lane); `urban`
+    (N,) lets town junctions of arterials be signalized (`street_items.approach_stops`)."""
     o = options or FurnitureOptions()
     s_range = s_range or (float(model.s[0]), float(model.s[-1]))
     way_id = np.asarray(way_id if way_id is not None else np.zeros(0), np.int64)
-    pl = _Planner(model, projection, route, s_range, ground, way_id, o, coverage)
+    pl = _Planner(model, projection, route, s_range, ground, way_id, o, coverage, lanes, urban)
     pl.plan.covered_fraction = float(pl.covered.mean()) if len(pl.covered) else 0.0
     pl.add_mapillary(list(mapillary))
     pl.add_osm(osm)
@@ -1030,14 +1145,21 @@ def _attach_lights(items: list[StreetItem]) -> list[StreetItem]:
     return out
 
 
+def _mark_group(kind: str) -> str:
+    base = kind.split(":")[0]
+    return "crossing" if base in ("zebra", "crosswalk", "ladder") else base
+
+
 def _dedupe_markings(marks: list[Marking]) -> list[Marking]:
     order = sorted(range(len(marks)), key=lambda i: (_source_rank(marks[i].source), i))
     kept: list[Marking] = []
     for i in order:
         mk = marks[i]
-        base = mk.kind.split(":")[0]
-        if any(k.kind.split(":")[0] == base and abs(k.s - mk.s) < 15.0
-               and (k.l0 + k.l1) * (mk.l0 + mk.l1) >= 0 for k in kept):  # fmt: skip
+        base = _mark_group(mk.kind)
+        if any(_mark_group(k.kind) == base and abs(k.s - mk.s) < 15.0
+               and (k.l0 + k.l1) * (mk.l0 + mk.l1) >= 0
+               and (base != "arrow" or abs((k.l0 + k.l1) - (mk.l0 + mk.l1)) < 2.0)
+               for k in kept):  # fmt: skip
             continue
         kept.append(mk)
     return sorted(kept, key=lambda k: k.s)
@@ -1588,6 +1710,14 @@ def street_names(items: Sequence[StreetItem]) -> dict[str, int]:
 # --------------------------------------------------------------------------------------------
 
 STOP_BAR_M = 0.45  # OTM Book 11: stop lines 0.30-0.60 m wide (ASSUMED 0.45)
+# Signalized junctions (docs/research/intersections.md): the crosswalk's near edge this far
+# beyond the crossing road's edge (its curb-return tangent), the stop line this far behind
+# the crosswalk (OTM Book 11: at least 1.0 m), and turn arrows this far behind the stop line.
+CROSSWALK_EDGE_M = 1.0
+STOP_LINE_SETBACK_M = 1.0
+ARROW_SETBACK_M = 6.0
+ARROW_LEN_M = 4.2
+CLUSTER_M = 40.0  # route nodes this close with the same crossing road are one junction
 CROSSWALK_LINE_M = 0.2  # two lines 0.1-0.2 m wide ...
 CROSSWALK_GAP_M = 3.0  # ... about 2.5-3.0 m apart (ASSUMED)
 ZEBRA_BAR_M, ZEBRA_GAP_M, ZEBRA_LEN_M = 0.5, 0.6, 3.0  # ladder blocks (ASSUMED)
@@ -1620,6 +1750,11 @@ def marking_meshes(
         # Shaft 0.15 x 3.0 m, head 0.6 wide x 1.2 m (OTM Book 11 arrows ~5 m; ASSUMED).
         rect(min(s, s + d * 3.0), max(s, s + d * 3.0), c - 0.08, c + 0.08)
         tip = s + d * 4.2
+        heads = mk.kind[len("arrow:") :].split("_")
+        if len(heads) > 1:  # a shared lane: one shaft, a head per movement
+            for hd in heads:
+                arrow(Marking(f"arrow:{hd}", mk.s, mk.l0, mk.l1, mk.source, mk.forward))
+            return
         if mk.kind == "arrow:straight":
             base_s = s + d * 3.0
             pa = model.at(base_s)
@@ -1650,7 +1785,10 @@ def marking_meshes(
             for off in (-CROSSWALK_GAP_M / 2, CROSSWALK_GAP_M / 2):
                 rect(mk.s + off - CROSSWALK_LINE_M / 2, mk.s + off + CROSSWALK_LINE_M / 2, mk.l0,
                      mk.l1)  # fmt: skip
-        elif mk.kind == "zebra":
+        elif mk.kind in ("zebra", "ladder"):
+            if mk.kind == "ladder":  # zebra bars between two crosswalk lines
+                for off in (-ZEBRA_LEN_M / 2, ZEBRA_LEN_M / 2 - CROSSWALK_LINE_M):
+                    rect(mk.s + off, mk.s + off + CROSSWALK_LINE_M, mk.l0, mk.l1)
             width = mk.l1 - mk.l0
             n = max(1, int((width + ZEBRA_GAP_M) // (ZEBRA_BAR_M + ZEBRA_GAP_M)))
             used = n * ZEBRA_BAR_M + (n - 1) * ZEBRA_GAP_M

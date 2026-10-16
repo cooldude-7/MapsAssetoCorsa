@@ -519,8 +519,10 @@ def _central_island_meshes(rb: Roundabout, height: HeightField) -> list[tuple[st
 
 
 def island_meshes(
-    island: shapely.Geometry, height: HeightField, cell: float
+    island: shapely.Geometry, height: HeightField, cell: float, top: str | None = None
 ) -> list[tuple[str, MeshData]]:
+    """A raised island behind a sloped barrier curb: "curb" meshes and its top ("island_grass"
+    or "island_concrete" by its size, or `top`)."""
     out: list[tuple[str, MeshData]] = []
     for poly in _polygons(island, 1.0):
         # Curb face sloped over CURB_FACE_RUN_M (a vertical step makes AC's single tyre
@@ -540,7 +542,9 @@ def island_meshes(
         m = mesh_polygon(band, height, cell_m=cell, uv_tile_m=2.0, lift=SPLITTER_CURB_M)
         if m is not None:
             out.append(("curb", m))
-        key = "island_grass" if poly.area > 60.0 and inner.area > 10.0 else "island_concrete"
+        key = top or (
+            "island_grass" if poly.area > 60.0 and inner.area > 10.0 else "island_concrete"
+        )
         m = mesh_polygon(
             inner,
             height,

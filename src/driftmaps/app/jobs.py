@@ -385,4 +385,6 @@ class BuildRunner:
             "trees": int(_num((scenery.get("trees") or {}).get("total"))),
             "buildings": int(_num((scenery.get("buildings") or {}).get("buildings"))),
             "loop": bool(getattr(req.route, "closed", False)),
+            # What the player must know about the track (e.g. no side roads were built).
+            "warnings": [str(w) for w in (getattr(result, "alerts", None) or [])],
         }
