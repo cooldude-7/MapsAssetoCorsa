@@ -124,6 +124,8 @@ def test_signals_on_every_approach_with_a_head_per_lane():
     assert all(len(p.side) == 1 for p in arms)
     assert all(float(p.side[0] @ -p.axis) < 0.5 for p in arms)
     assert all(abs(float(p.side[0] @ p.axis)) < 0.1 for p in arms)  # a crossing approach
+    # ... and shows that approach's colour: green when it is the route's (it travels along X).
+    assert all(p.side_go == [abs(float(p.side[0][0])) > 0.5] for p in arms)
     assert stats["arrow_heads"] == 2 and stats["ped_heads"] == 8 and stats["push_buttons"] == 8
     items = [it for it in plan.items if it.kind == SIGNAL_TRAFFIC]
     assert len(items) == len(sig.poles)

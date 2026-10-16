@@ -202,6 +202,7 @@ class SignalPole:
     axis: np.ndarray | None = None
     heads: list[tuple[float, str]] = field(default_factory=list)
     side: list[np.ndarray] = field(default_factory=list)
+    side_go: list[bool] = field(default_factory=list)  # per side head: its approach's green
     ped: list[np.ndarray] = field(default_factory=list)
     buttons: list[np.ndarray] = field(default_factory=list)
     name: str = ""
@@ -310,7 +311,9 @@ def plan_junction(
     for pole, (corner, t) in zip(poles, far_left, strict=True):
         dist = [float(np.hypot(*(q.xz - corner))) for q in poles]
         k = int(np.argmin(dist))
-        (poles[k] if dist[k] <= 6.0 and poles[k] is not pole else pole).side.append(-t)
+        host = poles[k] if dist[k] <= 6.0 and poles[k] is not pole else pole
+        host.side.append(-t)
+        host.side_go.append(pole.go)  # the approach's own colour, not the host pole's
     # Pedestrian signals and push buttons at both ends of a crosswalk across every leg.
     for k, leg in enumerate(legs):
         d = _unit(leg.direction)
@@ -573,7 +576,8 @@ def draw_pole(
     for k, f in enumerate(pole.side):
         s3 = np.array([f[0], 0.0, f[1]])
         c = np.array([base[0], gy + SIDE_HEAD_M + HEAD_H / 2, base[2]]) + s3 * 0.35
-        _vehicle_head(cell, c + _UP * (1.3 * k), f, "through", pole.go)
+        go = pole.side_go[k] if k < len(pole.side_go) else pole.go
+        _vehicle_head(cell, c + _UP * (1.3 * k), f, "through", go)
     for f in pole.ped:
         p3 = np.array([f[0], 0.0, f[1]])
         _ped_head(cell, np.array([base[0], gy + PED_HEAD_M + 0.23, base[2]]) + p3 * 0.32, f)
