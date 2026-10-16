@@ -151,11 +151,12 @@ def test_budget_lod_batches_and_distance():
 
 
 def _subdivision(n_rows=2) -> list:
-    """Rows of 11 detached houses (12 x 9 m, 20 m apart) at z = 20 and z = 110."""
+    """Rows of 13 detached houses (12 x 9 m, 15 m apart) at z = 20 and z = 90: 26 within
+    100 m of the lot at z = 50-70 between them."""
     return [
-        _fp(f"osm:h{r}{i:02d}", _rect(-106 + 20 * i, 20 + 90 * r, 12, 9), tags={})
+        _fp(f"osm:h{r}{i:02d}", _rect(-96 + 15 * i, 20 + 70 * r, 12, 9), tags={})
         for r in range(n_rows)
-        for i in range(11)
+        for i in range(13)
     ]
 
 
@@ -177,14 +178,19 @@ def test_barns_only_in_the_country():
     # An OSM-tagged barn stays a barn wherever it stands.
     tagged = _fp("osm:barn", _rect(-15, 50, 30, 20), tags={"building": "barn"})
     assert _place([tagged, *_subdivision()])["osm:barn"].category == "barn"
-    # Between the bands (8 neighbours) the land cover decides: farmland -> barn, town -> not.
-    few = _subdivision(1)[:8]
-    assert _place([big, *few], landcover=_cover(15))["ms:q:big"].category == "barn"  # cropland
-    assert _place([big, *few], landcover=_cover(17))["ms:q:big"].category != "barn"  # urban
-    assert _place([big, *few])["ms:q:big"].category != "barn"  # unknown: not a barn
-    # Alone on urban land cover (a school in a park) it is in town; alone on cropland a barn.
-    assert _place([big], landcover=_cover(17))["ms:q:big"].category != "barn"
-    assert _place([big], landcover=_cover(15))["ms:q:big"].category == "barn"
+    # A hamlet (12 houses within 100 m): in the country among fields and woods, else a town.
+    hamlet = _subdivision(1)[:12]
+    assert _place([big, *hamlet], landcover=_cover(15))["ms:q:big"].category == "barn"
+    assert _place([big, *hamlet], landcover=_cover(6))["ms:q:big"].category == "barn"
+    assert _place([big, *hamlet], landcover=_cover(17))["ms:q:big"].category != "barn"
+    assert _place([big, *hamlet])["ms:q:big"].category != "barn"  # no land cover: a town
+    # A farm: a house or two among barns and sheds (which do not count), even where NRCan maps
+    # the farmstead as urban.
+    farm = [_fp(f"ms:q:b{i}", _rect(-60 + 30 * i, 100, 25, 20), "microsoft", tags={})
+            for i in range(5)] + [_fp(f"ms:q:s{i}", _rect(-60 + 8 * i, 20, 4, 4), "microsoft",
+                                      tags={}) for i in range(12)]  # fmt: skip
+    got = _place([big, *farm, *_subdivision(1)[:3]], landcover=_cover(17))
+    assert got["ms:q:big"].category == "barn" and got["ms:q:b0"].category == "barn"
 
 
 def test_town_houses_are_brick_rows_with_a_door_per_unit():
@@ -198,7 +204,7 @@ def test_town_houses_are_brick_rows_with_a_door_per_unit():
     fronts = [d for d in b.doors if d.style.startswith("door_")]
     assert len(fronts) == 5 and all(d.edge == b.front_edge for d in b.doors)
     houses = [h for h in got.values() if h.category == "house"]
-    assert len(houses) == 22 and all(h.wall_style in dict(_TOWN_HOUSE_WALLS) for h in houses)
+    assert len(houses) == 26 and all(h.wall_style in dict(_TOWN_HOUSE_WALLS) for h in houses)
     assert all(h.roof_style.startswith("shingle") for h in houses)
     styles = {h.wall_style for h in houses}
     assert not styles & {"board_white", "barn_red", "barn_grey", "steel_white", "shed_wood"}

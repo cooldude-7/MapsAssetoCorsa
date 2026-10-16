@@ -17,16 +17,17 @@ builders' buildings.md (2026-10-16: sources, conflation, heights, typical Ontari
 2. Ground: the built terrain (`ground(xz)`, not the raw DTM: cut/fill changed it) under the
    ring and a 3 m interior lattice. The walls start `sink_m` (0.5 m) below its LOWEST point;
    heights are measured from its median.
-3. Context and category. A footprint is in a **town** (`_town_context`) when at least 12
-   other footprints stand within 100 m (a subdivision has 40-80), in the **country** with at
-   most 6 unless the NRCan land cover around it is urban, and between the two in the country
-   only on cropland or pasture. Category: house, townhouse, garage, shed, barn or
-   commercial, from the type (OSM `building`, the municipal type) or, untyped, the size
-   (buildings.md §5: sheds < 25 m2, garages < 70 m2, barns >= 450 m2 unless flat). Barns
-   only stand in the country (the user's Oakville check, 2026-10-16: town houses and rows
-   drawn as barns): in a town a long, house-deep footprint (>= 18 m by 7-16 m, >= 180 m2)
-   is a townhouse row, a big one a house, or commercial when its roof is flat; only an
-   OSM-tagged barn stays a barn.
+3. Context and category. A footprint is in a **dense town** (`_town_context`) with at least
+   20 other house-sized footprints (60-450 m2) within 100 m (a subdivision has 40-80), in a
+   **town** with at least 10 unless the NRCan land cover is known and under 30 % urban (a
+   hamlet among fields), else in the **country** (a farm's barns and sheds do not count).
+   Category: house, townhouse, garage, shed, barn or commercial, from the type (OSM
+   `building`, the municipal type) or, untyped, the size (buildings.md §5: sheds < 25 m2,
+   garages < 70 m2, barns >= 450 m2 unless flat). Barns only stand in the country (the
+   user's Oakville check, 2026-10-16: town houses and rows drawn as barns): in a town a big
+   footprint is a house, or commercial when its roof is flat, and in a dense town a long,
+   house-deep one (>= 18 m by 7-16 m, >= 180 m2) a townhouse row; only an OSM-tagged barn
+   stays a barn.
 4. Heights, the first that applies (buildings.md §4):
    - **measured**: municipal eave + peak (Burlington EAVEHGT / PEAKHGT, Milton): the roof
      exactly; a municipal or NRCan lidar peak (`heightmax`, median +0.24 m against Burlington)
@@ -392,13 +393,13 @@ class BuildingOptions:
     min_area_m2: float = 10.0
     max_area_m2: float = 20_000.0
     max_buildings: int = 6000  # hard cap (nearest first); the byte budget usually binds first
-    # Context (`_town_context`): a footprint with at least `town_neighbours` others within
-    # `context_radius_m` stands in a town (subdivision, downtown); with at most
-    # `rural_neighbours` it is rural unless the land cover around it is built-up; between,
-    # rural only on agricultural land cover. Barns only stand in the country.
+    # Context (`_town_context`): house-sized footprints within `context_radius_m`; a town from
+    # `town_neighbours` (with some urban land cover), a dense town from `dense_neighbours`.
+    # Barns only stand in the country, townhouse rows only in a dense town.
     context_radius_m: float = 100.0
-    town_neighbours: int = 12
-    rural_neighbours: int = 6
+    house_area_m2: tuple[float, float] = (60.0, 450.0)
+    town_neighbours: int = 10
+    dense_neighbours: int = 20
     # Townhouse rows (in towns; untyped, residential or terrace footprints): the minimum
     # rectangle at least this long and this deep, and this big.
     row_min_length_m: float = 18.0
@@ -704,14 +705,15 @@ def choose_height(
 
 def _category(
     fp: Footprint, area: float, town: bool = False, length_m: float = 0.0, depth_m: float = 0.0,
-    o: BuildingOptions | None = None,
+    o: BuildingOptions | None = None, dense: bool = False,
 ) -> str:  # fmt: skip
     """house / townhouse / garage / shed / barn / commercial (module docstring, step 3).
 
     In the country a big untyped footprint is a barn here and may become commercial once its
-    roof is known to be flat. In a town (`town`) nothing untyped is a barn: a long, house-deep
-    footprint (`length_m` x `depth_m`, the minimum rectangle) is a townhouse row, a big one a
-    house (it becomes commercial when its roof is flat), and only OSM-tagged barns stay barns.
+    roof is known to be flat. In a town (`town`) nothing untyped is a barn: in a dense town
+    (`dense`) a long, house-deep footprint (`length_m` x `depth_m`, the minimum rectangle) is
+    a townhouse row, a big one a house (it becomes commercial when its roof is flat), and only
+    OSM-tagged barns stay barns.
     """
     o = o or BuildingOptions()
     kind = fp.kind
@@ -725,7 +727,7 @@ def _category(
         return "shed" if area < 30.0 else "garage"
     lo, hi = o.row_depth_m
     row = (
-        town
+        dense
         and kind in ("yes", "residential", "terrace", "house", "townhouse")
         and area >= o.row_min_area_m2
         and length_m >= o.row_min_length_m
@@ -749,36 +751,46 @@ def _town_context(
     polys: Sequence[shapely.Polygon], cand: Sequence[int], landcover: LandcoverFn | None,
     o: BuildingOptions,
 ) -> np.ndarray:  # fmt: skip
-    """Per candidate (indices into `polys`, every footprint found): True in a town.
+    """Per candidate (indices into `polys`, every footprint found): 0 in the country, 1 in a
+    town, 2 in a dense town (a subdivision or downtown: townhouse rows only stand there).
 
-    Built-up: at least `town_neighbours` other footprints within `context_radius_m` (a
-    subdivision has 40-80 houses in 100 m; a farm a house, a garage and a few barns). With
-    at most `rural_neighbours` the building is rural, unless most of the land cover around
-    it (its centre and 8 points 75 m out) is urban (a lone school in a town park); between the
-    two, rural only where the land cover is mostly cropland or pasture. Without land cover
-    the middle band counts as a town.
+    Counted: the house-sized footprints (`house_area_m2`) within `context_radius_m`, other
+    than the building itself (a subdivision has 40-80 houses in 100 m; a farm a house or two
+    among barns and sheds, which do not count, and NRCan maps a big farmstead's yards as
+    urban, so the land cover alone cannot tell). With at least `dense_neighbours` a building
+    is in a dense town; with at least `town_neighbours` in a town, unless the land cover
+    around it (its centre and 8 points 75 m out) is known and less than 30 % urban (class
+    17: a hamlet among fields and woods); otherwise in the country.
     """
     if not len(cand):
-        return np.zeros(0, bool)
+        return np.zeros(0, np.int8)
     cents = np.array([[c.x, c.y] for c in (p.centroid for p in polys)])
-    n = cKDTree(cents).query_ball_point(cents[cand], o.context_radius_m, return_length=True) - 1
-    town = n >= o.town_neighbours
-    rural = n <= o.rural_neighbours
-    if landcover is None:
-        return town | ~rural
-    ang = np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False)
-    ring = np.vstack([[0.0, 0.0], 75.0 * np.stack([np.cos(ang), np.sin(ang)], axis=1)])
-    pts = (cents[cand][:, None, :] + ring[None, :, :]).reshape(-1, 2)
-    try:
-        lc = np.asarray(landcover(pts)).reshape(len(cand), len(ring))
-    except (OSError, RuntimeError, ValueError) as exc:  # SourceUnavailable: RuntimeError
-        log.warning("land cover unavailable for the building context: %s", exc)
-        return town | ~rural
-    known = (lc > 0).sum(axis=1)
-    urban = (lc == _LC_URBAN).sum(axis=1) > 0.5 * known
-    farm = np.isin(lc, _LC_FARM).sum(axis=1) >= 0.5 * np.maximum(known, 1)
-    farm &= known > 0
-    return town | (rural & urban & (known > 0)) | (~town & ~rural & ~farm)
+    area = np.array([p.area for p in polys])
+    lo, hi = o.house_area_m2
+    homes = (area >= lo) & (area <= hi)
+    if homes.any():
+        n = cKDTree(cents[homes]).query_ball_point(
+            cents[cand], o.context_radius_m, return_length=True
+        ) - homes[np.asarray(cand, np.int64)].astype(int)
+    else:
+        n = np.zeros(len(cand), np.int64)
+    urban = np.zeros(len(cand))
+    known = np.zeros(len(cand), bool)
+    if landcover is not None:
+        ang = np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False)
+        ring = np.vstack([[0.0, 0.0], 75.0 * np.stack([np.cos(ang), np.sin(ang)], axis=1)])
+        pts = (cents[cand][:, None, :] + ring[None, :, :]).reshape(-1, 2)
+        try:
+            lc = np.asarray(landcover(pts)).reshape(len(cand), len(ring))
+        except (OSError, RuntimeError, ValueError) as exc:  # SourceUnavailable: RuntimeError
+            log.warning("land cover unavailable for the building context: %s", exc)
+            lc = np.zeros((len(cand), len(ring)))
+        k = (lc > 0).sum(axis=1)
+        known = k > 0
+        urban = (lc == _LC_URBAN).sum(axis=1) / np.maximum(k, 1)
+    dense = n >= o.dense_neighbours
+    town = dense | ((n >= o.town_neighbours) & (~known | (urban >= 0.3)))
+    return town.astype(np.int8) + dense.astype(np.int8)
 
 
 def _measured(fp: Footprint) -> tuple[float | None, float | None, str]:
@@ -1211,9 +1223,10 @@ def place_buildings(
             continue
         pre.append((d_edge, fp, poly, len(every) - 1))
     # Context first: in town buildings stand at the sidewalk, inside the wall corridor.
-    towns_pre = _town_context(every, [c[3] for c in pre], landcover, o)
-    cand: list[tuple[float, Footprint, shapely.Polygon, bool]] = []
-    for (d_edge, fp, poly, _), town in zip(pre, towns_pre, strict=True):
+    ctx_pre = _town_context(every, [c[3] for c in pre], landcover, o)
+    cand: list[tuple[float, Footprint, shapely.Polygon, int]] = []
+    for (d_edge, fp, poly, _), ctx in zip(pre, ctx_pre, strict=True):
+        town = ctx >= 1
         if town:
             if d_edge < o.town_clearance_m or (
                 paved_out is not None and poly.intersects(paved_out)
@@ -1226,10 +1239,10 @@ def place_buildings(
         elif keep_out is not None and poly.intersects(keep_out):
             rep["corridor"] += 1
             continue
-        cand.append((d_edge, fp, poly, bool(town)))
+        cand.append((d_edge, fp, poly, int(ctx)))
     cand.sort(key=lambda t: (t[0], t[1].id))
     rep["candidates"] = len(cand)
-    rep["town"] = sum(1 for c in cand if c[3])
+    rep["town"] = sum(1 for c in cand if c[3] >= 1)
     if len(cand) > o.max_buildings:
         log.info("building cap: keeping the %d nearest of %d", o.max_buildings, len(cand))
         cand = cand[: o.max_buildings]
@@ -1281,14 +1294,15 @@ def place_buildings(
     road_tree = shapely.STRtree(road_lines)
 
     out: list[Building] = []
-    for k, (d_edge, fp, poly, town) in enumerate(cand):
+    for k, (d_edge, fp, poly, ctx) in enumerate(cand):
+        town, dense = ctx >= 1, ctx == 2
         g = g_all[g_owner_all == k]
         g = g[np.isfinite(g)]
         if g.size == 0:
             continue
         ground_y, base_y = float(np.median(g)), float(g.min()) - o.sink_m
         centre, L, S, hl, hw = _min_rect(poly)
-        cat = _category(fp, poly.area, town, 2.0 * hl, 2.0 * hw, o)
+        cat = _category(fp, poly.area, town, 2.0 * hl, 2.0 * hw, o, dense)
         small = poly.area < o.small_area_m2 and fp.kind in _SMALL_CAPPED_KINDS
         src_l, _, med, p90 = choose_height(
             lidar[k], max_lidar_m=o.small_max_lidar_m if small else None, options=o
