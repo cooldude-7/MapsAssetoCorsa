@@ -279,6 +279,7 @@ class BuildRequest:
     install: bool = True
     trees: bool = True
     buildings: bool = True
+    burlington_buildings: bool = True  # City of Burlington layer (revocable terms, see build)
     guardrails: bool = True
     auto_guardrails: bool = True  # also where Ontario road rules call for one (needs guardrails)
     scenery_density: float = 1.0
@@ -333,6 +334,11 @@ class BuildRunner:
             debug_png=False,
             trees=req.trees,
             buildings=req.buildings,
+            municipal_buildings=tuple(
+                n
+                for n in build_mod.BuildOptions().municipal_buildings
+                if req.burlington_buildings or n != "burlington"
+            ),
             guardrails=req.guardrails,
             auto_guardrails=req.auto_guardrails,
             scenery_density=req.scenery_density,

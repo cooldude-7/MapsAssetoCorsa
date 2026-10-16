@@ -151,12 +151,21 @@ from driftmaps.geo.barriers import (
     load_user_file,
     match_barriers,
 )
+from driftmaps.geo.building_sources import (
+    MUNICIPAL_SOURCES,
+    SourceError,
+    fetch_municipal,
+    fetch_nrcan,
+)
 from driftmaps.geo.buildings import (
     OSM_BUILDINGS_ATTRIBUTION,
     BuildingFootprints,
     Footprint,
-    fetch_buildings,
+    conflate,
     fetch_ms_buildings,
+    fetch_osm_buildings,
+    route_boxes,
+    within_route,
 )
 from driftmaps.geo.overpass import OSM_ATTRIBUTION, OverpassError
 from driftmaps.geo.project import LocalProjection
@@ -358,7 +367,12 @@ class BuildOptions:
     # The route is route.json driven the other way (--reverse): guardrails.json spans, measured
     # in route.json's direction, are mirrored (left <-> right, s -> length - s).
     route_reversed: bool = False
-    microsoft_buildings: bool = True  # add Microsoft footprints where OSM has none
+    microsoft_buildings: bool = True  # Microsoft ML footprints where no other source has one
+    nrcan_buildings: bool = True  # NRCan lidar footprints and heights (geo.building_sources)
+    # Municipal footprint layers (geo.building_sources.MUNICIPAL_SOURCES) to use where they
+    # cover the route. Burlington's terms are revocable and must travel with the track
+    # (LICENSE-DATA.txt carries their URL); drop "burlington" to build without it.
+    municipal_buildings: tuple[str, ...] = ("burlington", "milton", "oakville")
     offline: bool = False  # scenery downloads (Overpass, Microsoft) come from the cache only
     bridge: BridgeOptions = field(default_factory=BridgeOptions)
     vegetation: VegetationOptions = field(default_factory=VegetationOptions)
@@ -412,9 +426,17 @@ class BuildResult:
                 f"{tr['meshes']} meshes"
             )
             bd = sc["buildings"]
+            found = bd.get("footprints_found") or {
+                "osm": bd["footprints_osm"],
+                "microsoft": bd["footprints_microsoft"],
+            }
+            cats = ", ".join(f"{k} {v}" for k, v in sorted((bd.get("categories") or {}).items()))
             lines.append(
-                f"houses   {bd['buildings']} buildings ({bd['footprints_osm']} OSM + "
-                f"{bd['footprints_microsoft']} Microsoft footprints found), heights "
+                f"houses   {bd['buildings']} buildings"
+                + (f" ({cats})" if cats else "")
+                + ", footprints found: "
+                + (", ".join(f"{k} {v}" for k, v in sorted(found.items())) or "none")
+                + "; heights "
                 + (", ".join(f"{k} {v}" for k, v in sorted(bd["height_source"].items())) or "-")
             )
             rails = ", ".join(f"{k} {v:.0f} m" for k, v in sorted(sc["barriers_m"].items()))
@@ -1170,7 +1192,8 @@ def _assemble_kn5(
 TREE_WALL_MARGIN_M = 0.5
 DECK_TOLERANCE_M = 0.05  # terrain grazing a deck by less than this is not reported
 APPROACH_RAIL_M = 20.0  # opt-in rails on both sides this far before and after each bridge
-BUILDINGS_AROUND_M = 150.0  # footprints this close to the road (= BuildingOptions.max_distance_m)
+BUILDINGS_AROUND_M = 300.0  # buildings drawn this close to the road (BuildingOptions)
+BUILDINGS_FETCH_M = 400.0  # footprints fetched this far: the far trees keep off them too
 _DATA_ERRORS = (OverpassError, SourceUnavailable, OSError, urllib.error.URLError, EOFError)
 
 
@@ -1365,6 +1388,85 @@ def _barriers(
     sc.pieces += barrier_pieces(m, sc.spans, ground, options.bridge.barrier, bridges=decks)
 
 
+def _building_tiers(fps: Sequence[Footprint]) -> list[list[Footprint]]:
+    """Footprints grouped by geometry priority (municipal, OSM, NRCan lidar, Microsoft)."""
+    tiers: list[list[Footprint]] = [[], [], [], []]
+    for f in fps:
+        if f.source == "osm":
+            tiers[1].append(f)
+        elif f.source == "nrcan" or f.lidar:
+            tiers[2].append(f)
+        elif f.source == "microsoft":
+            tiers[3].append(f)
+        else:
+            tiers[0].append(f)
+    return tiers
+
+
+def _fetch_building_sources(
+    geo: TrackGeometry, options: BuildOptions
+) -> tuple[list[list[Footprint]], str | None] | None:
+    """Every enabled footprint source near the route (BUILDINGS_FETCH_M), as conflation
+    tiers, and the OSM timestamp. A failing source is a warning; None when all failed."""
+    ll = _route_lonlat(geo)
+    pad = BUILDINGS_FETCH_M
+    boxes = [(w, s, e, n) for s, w, n, e in route_boxes(ll, pad + 5.0)]
+    tiers: list[list[Footprint]] = [[], [], [], []]
+    failed: list[str] = []
+    osm_base = None
+    for name in options.municipal_buildings:
+        src = MUNICIPAL_SOURCES.get(name)
+        if src is None:
+            warnings.warn(f"unknown municipal building source {name!r}", stacklevel=3)
+            continue
+        try:
+            tiers[0] += fetch_municipal(
+                src, boxes, cache_dir=options.cache_dir, offline=options.offline
+            )
+        except (SourceError, *_DATA_ERRORS) as e:
+            warnings.warn(f"{src.title} unavailable ({_short(e)})", stacklevel=3)
+    try:
+        osm, osm_base = fetch_osm_buildings(
+            ll, cache_dir=options.cache_dir, around_m=pad, offline=options.offline
+        )
+        tiers[1] = within_route(osm, ll, pad)
+    except _DATA_ERRORS as e:
+        failed.append(f"OSM: {_short(e)}")
+    if options.nrcan_buildings:
+        try:
+            tiers[2] = within_route(
+                fetch_nrcan(boxes, cache_dir=options.cache_dir, offline=options.offline), ll, pad
+            )
+        except (SourceError, *_DATA_ERRORS) as e:
+            failed.append(f"NRCan: {_short(e)}")
+    if options.microsoft_buildings:
+        pad_lat = pad / M_PER_DEG
+        pad_lon = pad_lat / max(np.cos(np.radians(float(ll[:, 1].mean()))), 0.1)
+        bbox = (
+            float(ll[:, 0].min() - pad_lon),
+            float(ll[:, 1].min() - pad_lat),
+            float(ll[:, 0].max() + pad_lon),
+            float(ll[:, 1].max() + pad_lat),
+        )
+        try:
+            ms = fetch_ms_buildings(bbox, cache_dir=options.cache_dir, offline=options.offline)
+            tiers[3] = within_route(ms, ll, pad)
+        except (*_DATA_ERRORS, ValueError) as e:
+            failed.append(f"Microsoft: {_short(e)}")
+    if failed:
+        got = any(tiers)
+        warnings.warn(
+            "building footprints unavailable ("
+            + "; ".join(failed)
+            + ")"
+            + ("; using the other sources" if got else "; none built"),
+            stacklevel=3,
+        )
+        if not got:
+            return None
+    return tiers, osm_base
+
+
 def _buildings(
     geo: TrackGeometry,
     ground: Callable[[np.ndarray], np.ndarray],
@@ -1374,30 +1476,40 @@ def _buildings(
     track_id: str,
     sc: _Scenery,
 ) -> None:
+    osm_base = None
     if options.building_footprints is not None:
-        fps = list(options.building_footprints)
-        osm_n = sum(f.source == "osm" for f in fps)
-        res = BuildingFootprints(fps, osm_count=osm_n, ms_count=len(fps) - osm_n)
+        tiers = _building_tiers(options.building_footprints)
     else:
-        try:
-            res = fetch_buildings(
-                _route_lonlat(geo),
-                cache_dir=options.cache_dir,
-                microsoft=options.microsoft_buildings,
-                offline=options.offline,
-            )
-        except _DATA_ERRORS as e:
-            res = _microsoft_only(geo, options, e)
-            if res is None:
-                return
-        for note in res.notes:
-            warnings.warn(note, stacklevel=2)
+        got = _fetch_building_sources(geo, options)
+        if got is None:
+            return
+        tiers, osm_base = got
+    try:
+        fps, report = conflate(tiers, geo.projection, canopy)
+    except _DATA_ERRORS as e:
+        warnings.warn(f"lidar unavailable to check building footprints ({_short(e)})",
+                      stacklevel=2)  # fmt: skip
+        fps, report = conflate(tiers, geo.projection, None)
+    found = {}
+    for tier in tiers:
+        for f in tier:
+            found[f.source] = found.get(f.source, 0) + 1
+    res = BuildingFootprints(
+        fps,
+        osm_count=report.kept.get("osm", 0),
+        ms_count=report.kept.get("microsoft", 0),
+        osm_base=osm_base,
+        found=found,
+        report=report,
+        osm=list(tiers[1]),
+    )
     sc.footprints = res
+    roads = _building_roads(geo, options)
 
     def place(c: CanopyFn | None) -> list[Building]:
         return place_buildings(
             res.footprints, geo.projection, geo.model, ground,
-            corridor=corridor, canopy=c, seed=track_id,
+            corridor=corridor, canopy=c, seed=track_id, roads=roads,
         )  # fmt: skip
 
     try:
@@ -1406,47 +1518,32 @@ def _buildings(
         warnings.warn(f"lidar unavailable for building heights ({_short(e)})", stacklevel=2)
         sc.buildings = place(None)
     if sc.buildings:
-        sc.attributions += [a for a in res.attributions if a not in sc.attributions]
+        lines = res.attributions_for({b.id for b in sc.buildings})
+        sc.attributions += [a for a in lines if a not in sc.attributions]
+
+
+def _building_roads(geo: TrackGeometry, options: BuildOptions) -> list[np.ndarray]:
+    """Public roads near the route (OSM ways joining it, from the cached roadside query) as
+    XZ polylines, so houses on a side road face it. Empty when unavailable."""
+    features = options.roadside_features
+    if features is None:
+        try:
+            features = fetch_roadside(_route_lonlat(geo), cache_dir=options.cache_dir,
+                                      offline=True)  # fmt: skip
+        except _DATA_ERRORS:
+            return []
+    out = []
+    for f in features.access:
+        if f.tags.get("highway") == "service" or len(f.lonlat) < 2:
+            continue
+        e, n = geo.projection.to_enu(f.lonlat[:, 0], f.lonlat[:, 1])
+        out.append(np.stack([e, -n], axis=1))
+    return out
 
 
 def _short(e: Exception) -> str:
     text = str(e).strip().splitlines()
     return text[0][:160] if text else type(e).__name__
-
-
-def _microsoft_only(
-    geo: TrackGeometry, options: BuildOptions, error: Exception
-) -> BuildingFootprints | None:
-    """Overpass failed: fall back to the Microsoft footprints alone (place_buildings keeps
-    those near the road), or give up with a warning."""
-    if not options.microsoft_buildings:
-        warnings.warn(
-            f"building footprints unavailable ({_short(error)}); none built", stacklevel=3
-        )
-        return None
-    ll = _route_lonlat(geo)
-    pad_lat = BUILDINGS_AROUND_M / M_PER_DEG
-    pad_lon = pad_lat / max(np.cos(np.radians(float(ll[:, 1].mean()))), 0.1)
-    bbox = (
-        float(ll[:, 0].min() - pad_lon),
-        float(ll[:, 1].min() - pad_lat),
-        float(ll[:, 0].max() + pad_lon),
-        float(ll[:, 1].max() + pad_lat),
-    )
-    try:
-        ms = fetch_ms_buildings(bbox, cache_dir=options.cache_dir, offline=options.offline)
-    except _DATA_ERRORS as e2:
-        warnings.warn(
-            f"building footprints unavailable (OSM: {_short(error)}; Microsoft: {_short(e2)}); "
-            "none built",
-            stacklevel=3,
-        )
-        return None
-    warnings.warn(
-        f"OSM buildings unavailable ({_short(error)}); using Microsoft footprints only",
-        stacklevel=3,
-    )
-    return BuildingFootprints(list(ms), osm_count=0, ms_count=len(ms))
 
 
 def _trees(
@@ -1512,6 +1609,21 @@ def _tree_exclusion(geo: TrackGeometry, sc: _Scenery) -> shapely.Geometry | None
     return shapely.union_all(shapely.buffer(np.array(polys), TREE_BUILDING_BUFFER_M))
 
 
+def _conflation_stats(fps: BuildingFootprints | None) -> dict:
+    rep = fps.report if fps is not None else None
+    if rep is None:
+        return {}
+    return {
+        "kept": dict(rep.kept),
+        "same_building": rep.matched,
+        "overlapping": rep.overlapping,
+        "lidar_cut": rep.cut,
+        "unconfirmed": rep.unconfirmed,
+        "too_small": rep.small,
+        "demolished": list(rep.demolished),
+    }
+
+
 def _scenery_stats(sc: _Scenery, geo: TrackGeometry, extra: Mapping[str, object]) -> dict:
     m = geo.model
     tree_stats: TreeStats = extra["trees"]  # type: ignore[assignment]
@@ -1547,6 +1659,12 @@ def _scenery_stats(sc: _Scenery, geo: TrackGeometry, extra: Mapping[str, object]
             "roofs": dict(bld_stats.by_roof),
             "footprints_osm": sc.footprints.osm_count if sc.footprints else 0,
             "footprints_microsoft": sc.footprints.ms_count if sc.footprints else 0,
+            "footprints_found": dict(sc.footprints.found) if sc.footprints else {},
+            "conflation": _conflation_stats(sc.footprints),
+            "categories": dict(bld_stats.by_category),
+            "sources": dict(bld_stats.by_source),
+            "doors": bld_stats.doors,
+            "mesh_bytes": bld_stats.mesh_bytes,
         },
         "barriers_m": barriers,
         "osm_barriers": sc.osm_barriers,
@@ -1599,6 +1717,31 @@ def _licence(geo: TrackGeometry, sc: _Scenery | None = None) -> tuple[list[str],
     return keys, _merge_notices(extra)
 
 
+_BUILDING_CREDITS = {
+    "osm": "OpenStreetMap",
+    "nrcan": "NRCan lidar",
+    "burlington": "City of Burlington",
+    "milton": "Town of Milton",
+    "oakville": "Town of Oakville",
+    "microsoft": "Microsoft footprints",
+}
+
+
+def _building_credit(sc: _Scenery) -> str:
+    """The sources of the drawn buildings, as "OpenStreetMap, NRCan lidar and ..."."""
+    used: set[str] = set()
+    fps = {f.id: f for f in sc.footprints.footprints} if sc.footprints is not None else {}
+    for b in sc.buildings:
+        f = fps.get(b.id)
+        for sid in (b.id, *(f.also if f is not None else ())):
+            head = sid.split(":", 1)[0]
+            used.add("microsoft" if head == "ms" else head)
+    names = [v for k, v in _BUILDING_CREDITS.items() if k in used]
+    if len(names) <= 1:
+        return names[0] if names else "OpenStreetMap"
+    return ", ".join(names[:-1]) + " and " + names[-1]
+
+
 def _osm_ref(footprint_id: str) -> tuple[str, int] | None:
     """("way" | "relation", id) of an OSM footprint id ("osm:w1", "osm:r2.0")."""
     head, _, rest = footprint_id.partition(":")
@@ -1616,7 +1759,13 @@ def _scenery_features(sc: _Scenery) -> list[dict]:
     and barrier ways the build used (ODbL: the OSM data in the track is listed with it)."""
     features = []
     drawn = {b.id for b in sc.buildings}
-    fps = sc.footprints.footprints if sc.footprints is not None else []
+    kept = sc.footprints.footprints if sc.footprints is not None else []
+    for f in kept:  # an OSM way merged into a drawn building (its tags were used)
+        if f.id in drawn:
+            drawn.update(f.also)
+    fps = kept
+    if sc.footprints is not None and sc.footprints.osm is not None:
+        fps = sc.footprints.osm
     for fp in fps:
         ref = _osm_ref(fp.id)
         if ref is None or not (fp.id in drawn or sc.footprints_masked):
@@ -1784,8 +1933,7 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
     if sc.trees is not None and len(sc.trees):
         scenery_text += " Trees placed from NRCan lidar."
     if sc.buildings:
-        scenery_text += " Buildings from OpenStreetMap"
-        scenery_text += " and Microsoft footprints." if sc.footprints.ms_count else "."
+        scenery_text += " Buildings from " + _building_credit(sc) + "."
     run = loop_direction(m.centre) if geo.closed else "A2B"
     what = (
         f"a {geo.length_m / 1000:.1f} km loop on real roads"

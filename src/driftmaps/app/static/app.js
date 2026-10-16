@@ -3731,7 +3731,7 @@ function openOfflineSetup() {
  * Build
  * ---------------------------------------------------------------------------------------- */
 
-const OPTION_IDS = ["opt-trees", "opt-buildings", "opt-install"];
+const OPTION_IDS = ["opt-trees", "opt-buildings", "opt-burlington", "opt-install"];
 const GUARDRAIL_MODES = ["auto", "mapped", "off"];
 const GUARDRAIL_HINTS = {
   auto: "Rails where Ontario's road rules call for them (steep drops, high embankments, deep water, bridge ends), plus any mapped in OpenStreetMap.",
@@ -3769,6 +3769,7 @@ function buildOptions() {
   return {
     trees: $("opt-trees").checked,
     buildings: $("opt-buildings").checked,
+    burlington_buildings: $("opt-burlington").checked,
     guardrails: $("opt-guardrails").value !== "off",
     auto_guardrails: $("opt-guardrails").value === "auto",
     scenery_density: Number($("opt-density").value),
