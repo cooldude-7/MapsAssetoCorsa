@@ -1265,7 +1265,10 @@ def _door_spans(
         door = _pick((("door_white", 40), ("door_dark", 45), ("door_red", 15)),
                      _u01(seed, b.id, "dcol"))  # fmt: skip
         dw = DOORS[door].width_m
-        garages = unit >= gd.width_m + dw + 1.4 and _u01(seed, b.id, "rowgarage") < 0.8
+        # Most GTA freehold rows have a garage per unit, even 4.5 m wide ones (the front door
+        # then sits beside it only when there is room); a fifth are rear-lane rows.
+        garages = unit >= gd.width_m + 1.0 and _u01(seed, b.id, "rowgarage") < 0.8
+        room = unit >= gd.width_m + dw + 1.4
         for k in range(n):
             x0 = k * unit
             flip = k % 2 == 1
@@ -1275,7 +1278,7 @@ def _door_spans(
                 out.append((gd.name, g, gd.width_m, gd.height_m))
             else:
                 d = x0 + 0.5 * unit
-            if unit >= dw + 0.8:
+            if unit >= dw + 0.8 and (room or not garages):
                 out.append((door, d, dw, DOORS[door].height_m))
     elif cat == "garage":
         for name in ("garage2_white", "garage1_white"):

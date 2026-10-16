@@ -1335,7 +1335,7 @@ def _signals(
         keep.append(it)
     for pole in plan.poles:
         if surface is not None:
-            pole.xz = _off_surface(pole.xz, pole.origin, surface)
+            pole.xz = _off_surface(pole.xz, pole.origin, surface, pole.axis, pole.right_arm)
     # A corner pole moved out to the real pavement's edge may no longer reach the inner lanes:
     # a far-side median pole takes them (divided roads), never a longer arm.
     by_ref = {q.ref: q for q in plan.poles}
@@ -1345,7 +1345,7 @@ def _signals(
             q.heads = sorted(set(q.heads) | set(m.heads))
             continue
         if surface is not None:
-            m.xz = _off_surface(m.xz, m.origin, surface)
+            m.xz = _off_surface(m.xz, m.origin, surface, m.axis, True)
         if m.arm_heads(m.xz):
             plan.poles.append(m)
     for pole in plan.poles:
@@ -1356,25 +1356,44 @@ def _signals(
     pl.items = keep
 
 
-def _off_surface(xz: np.ndarray, centre: np.ndarray, surface: DrivableSurface) -> np.ndarray:
+def _off_surface(
+    xz: np.ndarray,
+    centre: np.ndarray,
+    surface: DrivableSurface,
+    axis: np.ndarray | None = None,
+    median: bool = False,
+) -> np.ndarray:
     """The nearest point to `xz` (within 20 m, not nearer the junction `centre`) that stands
     SIGNAL_POLE_EDGE_M off the drivable surface: the corner the plan meant, where a big
     junction's real pavement reaches farther than the roads' tags say. `xz` itself when it
-    already stands clear or nothing does."""
+    already stands clear or nothing does. With the approach's `axis`, the pole stays on the
+    far side and on its own side of the lanes (a corner pole moves out or along, never over
+    the lanes; a `median` pole along its median), and sideways moves count double: its arm
+    must still reach the lanes."""
     p = np.asarray(xz, np.float64)
     if float(surface.distance(p[None, :])[0]) >= SIGNAL_POLE_EDGE_M:
         return p
-    ang = np.linspace(0.0, 2.0 * np.pi, 24, endpoint=False)
+    ang = np.linspace(0.0, 2.0 * np.pi, 48, endpoint=False)
     rad = np.arange(0.5, 20.01, 0.5)
     ring = np.stack([np.cos(ang), np.sin(ang)], axis=1)
     cand = (p[None, None, :] + rad[:, None, None] * ring[None, :, :]).reshape(-1, 2)
     c = np.asarray(centre, np.float64)
     keep = np.hypot(*(cand - c).T) >= float(np.hypot(*(p - c))) - 1.0
-    cand = cand[keep]
-    ok = cand[surface.distance(cand) >= SIGNAL_POLE_EDGE_M]
-    if not len(ok):
+    cost = np.hypot(*(cand - p).T)
+    if axis is not None:
+        t = np.asarray(axis, np.float64) / max(float(np.hypot(*axis)), 1e-9)
+        r = np.array([-t[1], t[0]])
+        d_lon, d_lat = (cand - p) @ t, (cand - p) @ r
+        side = np.abs(d_lat) <= 2.0 if median else d_lat >= -1.5
+        own = keep & (d_lon >= -1.0) & side
+        if own.any():
+            keep = own
+            cost = np.abs(d_lon) + 2.0 * np.abs(d_lat)
+    cand, cost = cand[keep], cost[keep]
+    good = surface.distance(cand) >= SIGNAL_POLE_EDGE_M
+    if not good.any():
         return p
-    return ok[int(np.argmin(np.hypot(*(ok - p).T)))]
+    return cand[good][int(np.argmin(cost[good]))]
 
 
 def _on_surface(items: Sequence[StreetItem], surf: DrivableSurface) -> dict[str, int]:
