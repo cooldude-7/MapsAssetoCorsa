@@ -5,8 +5,8 @@ from __future__ import annotations
 import math
 
 import numpy as np
-import shapely
 import pytest
+import shapely
 
 from driftmaps.ac.building_textures import (
     ATLAS_U_M,
