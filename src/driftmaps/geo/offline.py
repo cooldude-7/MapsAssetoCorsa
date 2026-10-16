@@ -12,7 +12,10 @@ what the app asks Overpass for is kept:
 - barriers: `barrier=` `barriers.BARRIER_KINDS` ways;
 - roadside features for the warrant guardrails: deep-water candidates (`natural=water`,
   `waterway=riverbank|river|canal`, `landuse=reservoir` ways and relations) and rock
-  (`natural=cliff|bare_rock|scree`).
+  (`natural=cliff|bare_rock|scree`);
+- street furniture (FORMAT 3): the nodes `street_features.is_street_node` keeps (stop, give
+  way, signals, crossings, street lamps, power poles and towers, hydrants, `traffic_sign=*`),
+  one row per node with its single point, and `power=line|minor_line` ways.
 
 Two passes with bounded memory: pass 1 reads only relations (which ways are members of a kept
 multipolygon); pass 2 streams nodes and ways through libosmium's node-location index (a sparse
@@ -23,7 +26,8 @@ Measured on Ontario (1075 MB .pbf of 2026-10-15, 4-core sandbox, 2026-10-16): 34
 database (1.07M roads, 3.13M buildings, 0.99M water ways/members), ~0.5 GB of process memory
 besides the file-backed index; a z14 tile query takes 0.4-5 ms (12 ms in downtown Toronto).
 
-SQLite file (stdlib sqlite3), FORMAT 2:
+SQLite file (stdlib sqlite3), FORMAT 3 (a FORMAT 2 file, without street furniture, still answers
+every other query; `street_payload` then returns None and the app offers an update):
 - `meta(key, value)`: format, region, osm_base (the extract's data timestamp), source, built,
   poly (the extract's boundary as WKT, lon/lat) and counts.
 - `features(fid, kind, osm_id, rel_id, role, closed, tags, nodes, coords)`: one row per kept way
@@ -38,7 +42,8 @@ SQLite file (stdlib sqlite3), FORMAT 2:
   segments' bounding boxes touch, the rule `driftmaps.app.tiles` uses, so a tile's roads are
   one index range.
 
-Queries (`corridor`, `tile_ways`, `barrier_ways`, `buildings_payload`, `roadside_payload`) give
+Queries (`corridor`, `tile_ways`, `barrier_ways`, `buildings_payload`, `roadside_payload`,
+`street_payload`) give
 what the Overpass path gives: `OsmData`, or an Overpass-JSON-shaped payload for the existing
 parsers. Each returns None unless a ready database covers the whole area the query asks about
 (its buffered line or boxes lie inside the extract's boundary polygon); the caller then asks
@@ -79,6 +84,7 @@ from driftmaps.geo.overpass import (
     Way,
 )
 from driftmaps.geo.project import LocalProjection
+from driftmaps.geo.street_features import is_power_line, is_street_node
 
 __all__ = [
     "ENV_OFFLINE_DIR",
@@ -99,23 +105,29 @@ __all__ = [
     "parse_poly",
     "release",
     "roadside_payload",
+    "street_payload",
     "tile_ways",
 ]
 
 log = logging.getLogger(__name__)
 
-FORMAT = 2
+FORMAT = 3  # 3: street furniture nodes and power lines
+READABLE_FORMATS = (2, 3)  # a FORMAT 2 file still serves roads, buildings and roadside data
+STREET_FORMAT = 3  # the first format with street furniture
 ENV_OFFLINE_DIR = "DRIFTMAPS_OFFLINE_DIR"
 DB_SUFFIX = ".sqlite"
 TILE_Z = 14
 _N = 2**TILE_Z
 KIND_ROAD, KIND_BUILDING, KIND_BARRIER, KIND_WATER, KIND_ROCK = 1, 2, 3, 4, 5
+KIND_STREET, KIND_POWER = 6, 7  # FORMAT 3: furniture nodes (one point each), power lines
 KIND_NAMES = {
     KIND_ROAD: "roads",
     KIND_BUILDING: "buildings",
     KIND_BARRIER: "barriers",
     KIND_WATER: "water",
     KIND_ROCK: "rock",
+    KIND_STREET: "street_furniture",
+    KIND_POWER: "power_lines",
 }
 _ROAD_HIGHWAYS = frozenset(ACCESS_HIGHWAYS)
 _BARRIERS = frozenset(BARRIER_KINDS)
@@ -179,6 +191,8 @@ def _way_kinds(tags: Mapping[str, str]) -> list[int]:
         kinds.append(KIND_WATER)
     if tags.get("natural") in _ROCKS:
         kinds.append(KIND_ROCK)
+    if is_power_line(tags):
+        kinds.append(KIND_POWER)
     return kinds
 
 
@@ -685,12 +699,13 @@ def build_db(
         check()
         say(PASS1_END, "Processing roads")
 
-        # Pass 2: nodes (into libosmium's location index) and ways. Tagged highway nodes come
-        # through as a heartbeat (progress and cancel) while the nodes are read. A way's points
+        # Pass 2: nodes (into libosmium's location index) and ways. Nodes tagged with the
+        # street furniture keys come through to Python (kept if `is_street_node`), which is
+        # also the heartbeat (progress and cancel) while the nodes are read. A way's points
         # come from libosmium as WKB (C++); Python only reads node ids for roads.
         ticker = _Ticker(progress, size_mb, max_way_id)
         writer = _Writer(con)
-        heartbeat = osmium.filter.KeyFilter("highway")
+        heartbeat = osmium.filter.KeyFilter("highway", "power", "emergency", "traffic_sign")
         heartbeat.enable_for(osmium.osm.NODE)
         stream = (
             osmium.FileProcessor(str(source), osmium.osm.NODE | osmium.osm.WAY)
@@ -706,6 +721,14 @@ def build_db(
                 if seen % 1024 == 0:
                     check()
                     ticker.nodes()
+                loc = obj.location
+                if not loc.valid():
+                    continue
+                tags = {t.k: t.v for t in obj.tags}
+                if is_street_node(tags):
+                    pt = np.array([loc.lon, loc.lat], "<f8").tobytes()
+                    text = _tags_text(_trim_tags(tags, KIND_STREET), KIND_STREET)
+                    writer.add(KIND_STREET, obj.id, None, None, False, text, None, pt, 1)
                 continue
             if seen % 4096 == 0:
                 check()
@@ -911,8 +934,10 @@ class OfflineDB:
         self._lock = threading.Lock()
         try:
             meta = dict(self._con.execute("SELECT key, value FROM meta").fetchall())
-            if meta.get("format") != str(FORMAT):
-                raise ValueError(f"unsupported offline database format {meta.get('format')!r}")
+            fmt = meta.get("format")
+            if fmt not in {str(f) for f in READABLE_FORMATS}:
+                raise ValueError(f"unsupported offline database format {fmt!r}")
+            self.format = int(fmt)
             self.region = meta["region"]
             self.osm_base = meta.get("osm_base") or None
             self.source = meta.get("source", "")
@@ -1024,8 +1049,11 @@ class OfflineDB:
         xy = proj.to_xy(line_ll)
         target = shapely.LineString(xy) if len(xy) >= 2 else shapely.Point(xy[0])
         coords = proj.to_xy(np.concatenate([r.lonlat for r in rows]))
-        idx = np.repeat(np.arange(len(rows)), [len(r.lonlat) for r in rows])
-        lines = shapely.linestrings(coords, indices=idx)
+        counts = np.array([len(r.lonlat) for r in rows])
+        if counts.max() == 1:  # furniture nodes
+            lines = shapely.points(coords)
+        else:
+            lines = shapely.linestrings(coords, indices=np.repeat(np.arange(len(rows)), counts))
         keep = shapely.dwithin(lines, target, dist_m)
         return [r for r, k in zip(rows, keep.tolist(), strict=True) if k]
 
@@ -1169,6 +1197,32 @@ class OfflineDB:
             elements.append({"type": "way", "id": r.osm_id, "nodes": nodes, "tags": r.tags,
                              "geometry": _geom_json(r.lonlat)})  # fmt: skip
         elements += self._relations([r for r in members if r.rel_id in near_rels], clip)
+        return {"elements": elements, "osm3s": {"timestamp_osm_base": self.osm_base}}
+
+    @property
+    def has_street_furniture(self) -> bool:
+        return self.format >= STREET_FORMAT
+
+    def street_payload(self, route_latlon: np.ndarray, around_m: float) -> dict | None:
+        """Overpass-JSON-shaped answer to `street_features.build_street_query`: furniture
+        nodes and power lines within `around_m` of the (lat, lon) line. None for a FORMAT 2
+        file (no furniture stored) or when the line is not covered."""
+        if not self.has_street_furniture:
+            return None
+        line = np.asarray(route_latlon, np.float64).reshape(-1, 2)[:, ::-1]
+        if not self.covers_line(line, around_m):
+            return None
+        tiles = _tiles_along(line, around_m)
+        elements: list[dict] = []
+        nodes = self._near(self._rows(self._fids(KIND_STREET, tiles)), line, around_m)
+        for r in sorted({r.osm_id: r for r in nodes}.values(), key=lambda r: r.osm_id):
+            lon, lat = r.lonlat[0].tolist()
+            elements.append({"type": "node", "id": r.osm_id, "lat": lat, "lon": lon,
+                             "tags": r.tags})  # fmt: skip
+        lines = self._near(self._rows(self._fids(KIND_POWER, tiles)), line, around_m)
+        for r in sorted({r.osm_id: r for r in lines}.values(), key=lambda r: r.osm_id):
+            elements.append({"type": "way", "id": r.osm_id, "tags": r.tags,
+                             "geometry": _geom_json(r.lonlat)})  # fmt: skip
         return {"elements": elements, "osm3s": {"timestamp_osm_base": self.osm_base}}
 
 
@@ -1317,3 +1371,8 @@ def roadside_payload(
     clip: tuple[float, float, float, float],
 ) -> dict | None:
     return _first(lambda db: db.roadside_payload(route_latlon, around_m, access_m, clip))
+
+
+def street_payload(route_latlon: np.ndarray, around_m: float) -> dict | None:
+    """`street_features.fetch_street_features` from a region database (FORMAT 3+), or None."""
+    return _first(lambda db: db.street_payload(route_latlon, around_m))

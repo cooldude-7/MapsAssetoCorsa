@@ -266,6 +266,9 @@ class OfflineManager:
                 updated=_date(db.osm_base) or _date(db.built),
                 built=db.built,
                 counts=db.counts,
+                # Made by an older version: roads work, but an update adds what it lacks.
+                outdated=db.format < region_db.FORMAT,
+                update_adds="signs, poles and street lights" if not db.has_street_furniture else "",
             )
         with self._lock:
             job = dict(self._job) if self._job else None

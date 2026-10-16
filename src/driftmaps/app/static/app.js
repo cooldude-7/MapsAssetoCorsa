@@ -3677,8 +3677,12 @@ function renderOffline(st) {
   $("offline-ready").hidden = st.state !== "ready";
   const updated = offlineDate(st.updated);
   $("offline-ready-text").textContent = `${name} roads ready${updated ? ` - updated ${updated}` : ""}`;
+  $("btn-offline-update").textContent = st.outdated ? "Update (adds signs)" : "Update";
+  const adds = st.state === "ready" && st.outdated && st.update_adds
+    ? ` Update to add ${st.update_adds} to your tracks.`
+    : "";
   $("offline-text").textContent = ready
-    ? `Roads in ${name} load instantly from this PC${st.size_mb ? ` (${Math.round(st.size_mb)} MB)` : ""}. Elsewhere they still come from OpenStreetMap's servers.`
+    ? `Roads in ${name} load instantly from this PC${st.size_mb ? ` (${Math.round(st.size_mb)} MB)` : ""}. Elsewhere they still come from OpenStreetMap's servers.${adds}`
     : running
       ? "You can keep using the app meanwhile. Closing the app stops the download; it continues where it stopped next time."
       : `Roads come from OpenStreetMap's servers, which can take half a minute per area. Download ${name}'s roads once and they load instantly.${st.message && st.state === "none" ? ` ${st.message}` : ""}`;
