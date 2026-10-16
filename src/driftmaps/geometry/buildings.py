@@ -107,6 +107,7 @@ from driftmaps.ac.building_textures import (
     ATLAS_U_M,
     DOORS,
     STOREY_M,
+    WINDOW_ZONE_M,
     WINDOWED,
     band_v,
     building_atlas_texture,
@@ -1428,8 +1429,12 @@ def _noded_ring(b: Building, storey_lines: np.ndarray, margin: float) -> np.ndar
 # above the storey floor (below every painted sill, building_textures._paint_windows).
 _PLAIN_STRIP_M = (0.05, 0.8)
 _FOUNDATION_MIN_M = 0.3  # extra drop below the sink before a separate foundation row is cut
-_GABLE_COURSE_M = 1.0  # gable rows at most this tall (the 0.75 m plain strip stretched <= 1.33x)
-_GABLE_MAX_ROWS = 6  # a barn's 9 m gable: 6 rows of 1.5 m
+# A gable end up to this wide on a windowed (or plain steel / stained board) band is mapped on
+# the band's window-free last 12 m at full storey height instead: brick and siding keep their
+# proportions (stretched at most rise / 3 m), where the 0.75 m plain strip stretched over a 3 m
+# gable turned brick into wood grain (the "barn" look of the user's Oakville check).
+_GABLE_BLANK_M = ATLAS_U_M - WINDOW_ZONE_M
+_GABLE_FULL_STYLES = WINDOWED | {"steel_white", "shed_wood"}
 
 
 def _wall_rows(b: Building, storey_m: float, sink_m: float = 0.5) -> np.ndarray:
@@ -1440,9 +1445,8 @@ def _wall_rows(b: Building, storey_m: float, sink_m: float = 0.5) -> np.ndarray:
     cuts a window); the first storey reaches down to `base_y`, unless the ground under the
     building drops more than `sink_m` + 0.3 m below its median, where a plain foundation row
     (bottom 10 % of the band) is cut instead; then one row from the eave to the ridge (gable
-    ends) on the plain strip under the sills, in courses of at most `_GABLE_COURSE_M` so the
-    strip is stretched by at most 1.33x (a single stretched row turned brick into wood grain:
-    the "barn" look of the user's Oakville check).
+    ends) on the plain strip under the sills, stretched (few vertices; `_walls` maps narrow
+    gables on the window-free end of the band instead).
     """
     h = b.eave_y - b.ground_y
     n = max(1, round(h / storey_m))
@@ -1454,10 +1458,7 @@ def _wall_rows(b: Building, storey_m: float, sink_m: float = 0.5) -> np.ndarray:
         rows[0] = (b.base_y, floors[1], 1.0, 0.0)
     if b.ridge_y > b.eave_y + 1e-6:
         p_lo, p_hi = _PLAIN_STRIP_M
-        rise = b.ridge_y - b.eave_y
-        k = min(_GABLE_MAX_ROWS, max(1, math.ceil(rise / _GABLE_COURSE_M - 1e-6)))
-        ys = b.eave_y + np.arange(k + 1) * (rise / k)
-        rows += [(ys[i], ys[i + 1], 1.0 - p_lo / STOREY_M, 1.0 - p_hi / STOREY_M) for i in range(k)]
+        rows.append((b.eave_y, b.ridge_y, 1.0 - p_lo / STOREY_M, 1.0 - p_hi / STOREY_M))
     return np.asarray(rows, np.float64)
 
 
@@ -1472,6 +1473,22 @@ def _dedupe_loop(poly: list[tuple[float, float]], tol: float = 1e-9) -> list[tup
     return out
 
 
+def _ring_edges(b: Building, ring: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """For each vertex of the noded `ring`: the original ring edge it lies on and its distance
+    from that edge's start."""
+    edge = np.empty(len(ring), np.int64)
+    dist = np.empty(len(ring))
+    j = -1
+    n0 = len(b.ring)
+    for k, p in enumerate(ring):
+        nxt = b.ring[(j + 1) % n0]
+        if j < n0 - 1 and abs(p[0] - nxt[0]) + abs(p[1] - nxt[1]) < 1e-9:
+            j += 1
+        edge[k] = max(j, 0)
+        dist[k] = float(np.linalg.norm(p - b.ring[edge[k]]))
+    return edge, dist
+
+
 def _ring_u(b: Building, ring: np.ndarray) -> np.ndarray:
     """Atlas u (metres) at each vertex of the noded `ring`, for the wall that starts there:
     continuous along the ring from `u_offset`, or, with `wall_u0`, each original edge's own
@@ -1479,16 +1496,8 @@ def _ring_u(b: Building, ring: np.ndarray) -> np.ndarray:
     seg = np.linalg.norm(np.roll(ring, -1, axis=0) - ring, axis=1)
     if b.wall_u0 is None or len(b.wall_u0) != len(b.ring):
         return np.concatenate([[0.0], np.cumsum(seg)[:-1]]) + b.u_offset
-    out = np.empty(len(ring))
-    j = -1
-    n0 = len(b.ring)
-    for k, p in enumerate(ring):
-        nxt = b.ring[(j + 1) % n0]
-        if j < n0 - 1 and abs(p[0] - nxt[0]) + abs(p[1] - nxt[1]) < 1e-9:
-            j += 1
-        jj = max(j, 0)
-        out[k] = b.wall_u0[jj] + float(np.linalg.norm(p - b.ring[jj]))
-    return out
+    edge, dist = _ring_edges(b, ring)
+    return np.asarray(b.wall_u0, np.float64)[edge] + dist
 
 
 def _walls(b: Building, ring: np.ndarray, rows: np.ndarray, size: int) -> MeshData:
@@ -1497,6 +1506,12 @@ def _walls(b: Building, ring: np.ndarray, rows: np.ndarray, size: int) -> MeshDa
     n = len(ring)
     seg = np.linalg.norm(np.roll(ring, -1, axis=0) - ring, axis=1)
     s0 = _ring_u(b, ring)
+    # Gable ends on the band's window-free end (`_GABLE_BLANK_M`), at full storey height.
+    edge, dist = _ring_edges(b, ring)
+    e_len = np.linalg.norm(np.roll(b.ring, -1, axis=0) - b.ring, axis=1)[edge]
+    full = b.wall_style in _GABLE_FULL_STYLES
+    g0 = WINDOW_ZONE_M + 0.5 * (_GABLE_BLANK_M - e_len) + dist  # u (metres) of each vertex
+    g_hi = max(0.0, 1.0 - (b.ridge_y - b.eave_y) / STOREY_M)
     pos, nrm, uvs, idx = [], [], [], []
     count = 0
     for i in range(n):
@@ -1518,6 +1533,9 @@ def _walls(b: Building, ring: np.ndarray, rows: np.ndarray, size: int) -> MeshDa
             xyz[:, 2] = a[1] + uv_[:, 0] * d[1]
             xyz[:, 1] = uv_[:, 1]
             u = (s0[i] + uv_[:, 0]) / ATLAS_U_M
+            if full and lo >= b.eave_y - 1e-6 and e_len[i] <= _GABLE_BLANK_M:
+                u = (g0[i] + uv_[:, 0]) / ATLAS_U_M
+                f_lo, f_hi = 1.0, g_hi
             t = np.clip((uv_[:, 1] - lo) / (hi - lo), 0.0, 1.0)
             v = v_top + (f_lo + t * (f_hi - f_lo)) * (v_bot - v_top)
             pos.append(xyz)

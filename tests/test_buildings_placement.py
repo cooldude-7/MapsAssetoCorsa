@@ -250,8 +250,7 @@ def test_street_front_buildings_are_always_placed():
     assert "osm:f00" not in {b.id for b in got} and "osm:f01" in {b.id for b in got}
 
 
-def test_commercial_roofs_stay_flat_and_gables_are_coursed():
-    from driftmaps.geometry.buildings import _wall_rows
+def test_commercial_roofs_stay_flat_and_gables_keep_brick_proportions():
 
     retail = {"building": "retail"}
     tower = _one(_fp("burlington:9", _rect(-10, 30, 20, 15), "burlington", tags=retail,
@@ -263,10 +262,16 @@ def test_commercial_roofs_stay_flat_and_gables_are_coursed():
     plaza = _one(_fp("burlington:7", _rect(-10, 30, 20, 15), "burlington", tags=retail,
                      peak_m=7.5, eave_m=4.0))  # fmt: skip
     assert plaza.roof.shape != ROOF_FLAT  # a low building with a real pitched roof
-    house = _one(_fp("burlington:10", _rect(-6, 30, 12, 9), "burlington", peak_m=8.0, eave_m=5.0))
-    rows = _wall_rows(house, 3.0)
-    gable = rows[rows[:, 0] >= house.eave_y - 1e-9]
-    assert len(gable) == 3 and np.all(gable[:, 1] - gable[:, 0] <= 1.0 + 1e-9)
-    assert gable[0, 0] == pytest.approx(house.eave_y) and gable[-1, 1] == pytest.approx(
-        house.ridge_y
-    )
+    # A 3 m gable end of a brick house is mapped 1:1 on the band's window-free end (u in the
+    # last 12 m), not on the 0.75 m strip stretched 4x into wood grain.
+    house = _one(_fp("burlington:10", _rect(-7, 30, 14, 8), "burlington", peak_m=8.0, eave_m=5.0))
+    house.wall_style = "brick_grey"
+    m = extrude_building(house, doors=False)
+    v0, v1 = band_v("brick_grey")
+    gable = (m.positions[:, 1] > house.eave_y + 0.5) & (np.abs(m.normals[:, 1]) < 1e-6)  # walls
+    assert gable.any()
+    ys, uv = m.positions[gable, 1], m.uvs[gable]
+    assert np.all((uv[:, 0] * ATLAS_U_M) % ATLAS_U_M >= WINDOW_ZONE_M - 1e-6)
+    v_per_m = (v1 - v0) / 3.0  # one storey of band per 3 m
+    top = np.argmax(ys)
+    assert uv[top, 1] == pytest.approx(v1 - (ys[top] - house.eave_y) * v_per_m, abs=1e-4)
