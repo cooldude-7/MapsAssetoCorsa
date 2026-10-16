@@ -31,6 +31,7 @@ from driftmaps.geo.overpass import OverpassError, Way, parse_overpass, query_cac
 from driftmaps.geo.project import LocalProjection
 from driftmaps.geometry.barriers import (
     TEXTURES,
+    BarrierOptions,
     barrier_path,
     barrier_pieces,
     concrete_texture,
@@ -342,7 +343,7 @@ def test_w_beam_faces_the_road_and_stands_at_the_shoulder_edge(side):
     assert np.all(fn[peak] @ road_dir > 0.99)
     # Nothing of the barrier is on the road side of the shoulder edge (4.5 m).
     assert np.abs(steel.positions[:, 2]).min() >= 4.5 - 1e-6
-    assert steel.positions[:, 1].max() == pytest.approx(0.75, abs=1e-6)
+    assert steel.positions[:, 1].max() == pytest.approx(BarrierOptions().rail_top_m, abs=1e-6)
     # Back faces exist (seen from the field side).
     assert np.any(fn @ road_dir < -0.99)
 
@@ -370,7 +371,9 @@ def test_collision_strip_present_continuous_and_hidden():
     t = np.linspace(0.0, math.pi, 700)
     m = model_from(np.stack([150 * np.cos(t), 150 * np.sin(t)], axis=1))  # ~470 m arc
     span = BarrierSpan("left", 20.0, m.s[-1] - 20.0)
-    pieces = barrier_pieces(m, [span], lambda xz: np.full(len(xz), -0.4))
+    # Without the end flare (its own test in test_warrants.py) the face line is exact.
+    no_flare = BarrierOptions(flare_m=0.0)
+    pieces = barrier_pieces(m, [span], lambda xz: np.full(len(xz), -0.4), no_flare)
     coll = [p for p in pieces if p.name.startswith("1WALL_GR_")]
     vis = [p for p in pieces if p.name.startswith("guardrail_")]
     assert len(coll) == len(vis) == 3  # ~431 m in chunks of at most 150 m
@@ -408,19 +411,22 @@ def test_posts_reach_the_ground_and_free_ends_turn_down():
         return -0.6 * np.maximum(np.abs(xz[:, 1]) - 4.5, 0.0)
 
     span = BarrierSpan("right", 100.0, 140.0)
-    ((visual, _),) = span_meshes(m, span, ground, free_ends=(True, False))
+    opt = BarrierOptions(flare_m=0.0)  # the turned-down end only (flare: test_warrants.py)
+    ((visual, _),) = span_meshes(m, span, ground, opt, free_ends=(True, False))
     pos = visual["steel"].positions
-    posts = pos[np.abs(pos[:, 2] - (4.5 + 0.083 + 0.15 + 0.075)) < 0.076]
-    for x in np.linspace(100.0, 140.0, 21)[3:]:  # full-height posts
+    d_post = 4.5 + 0.083 + opt.blockout_m + 0.075  # rail, block, half a post
+    posts = pos[np.abs(pos[:, 2] - d_post) < 0.076]
+    n = round(40.0 / opt.post_spacing_m)
+    for x in np.linspace(100.0, 140.0, n + 1)[3:]:  # full-height posts
         here = posts[np.abs(posts[:, 0] - x) < 0.08]
         # embed_m below the ground at the post's centre, so well below it at every corner
-        assert here[:, 1].min() == pytest.approx(ground(np.array([[x, 4.808]]))[0] - 0.5)
+        assert here[:, 1].min() == pytest.approx(ground(np.array([[x, d_post]]))[0] - 0.5)
         assert here[:, 1].min() < ground(here[:, [0, 2]]).min() - 0.4
     rail = pos[np.abs(pos[:, 2] - 4.5) < 1e-6]  # the rail's front peaks
     start = rail[np.isclose(rail[:, 0], 100.0)]
     end = rail[np.isclose(rail[:, 0], 140.0)]
     assert start[:, 1].max() < 0.0  # turned down into the ground at the free start
-    assert end[:, 1].max() == pytest.approx(0.75 - 0.052, abs=1e-6)  # joined end: full height
+    assert end[:, 1].max() == pytest.approx(opt.rail_top_m - 0.052, abs=1e-6)  # joined: full
 
 
 def test_osm_rails_near_the_edge_snap_onto_it_walls_keep_their_offset():
@@ -437,7 +443,7 @@ def test_osm_rails_near_the_edge_snap_onto_it_walls_keep_their_offset():
     ((visual, _),) = span_meshes(m, far, fill)
     pos = visual["steel"].positions
     assert np.abs(pos[:, 2]).min() == pytest.approx(8.0)
-    assert pos[:, 1].max() == pytest.approx(-0.6 * 3.5 + 0.75)
+    assert pos[:, 1].max() == pytest.approx(-0.6 * 3.5 + BarrierOptions().rail_top_m)
     wall = BarrierSpan("left", 10.0, 50.0, "wall", offset_m=6.3)
     ((visual, _),) = span_meshes(m, wall, fill)
     assert np.abs(visual["concrete"].positions[:, 2]).min() == pytest.approx(6.3)

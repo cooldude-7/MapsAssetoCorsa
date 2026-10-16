@@ -140,6 +140,7 @@ def scenery_options(route: Route, root: Path, **kw) -> BuildOptions:
         trees=True,
         buildings=True,
         guardrails=True,
+        auto_guardrails=False,  # only the real sources here; automatic rails: test_warrants.py
         canopy_source=synthetic_canopy,
         landcover_source=mixed_forest,
         osm_barriers=[rail],

@@ -27,6 +27,17 @@ Stations are model stations (`RoadModel.s`, metres along the built centreline fr
 point, i.e. including the run-up before A); the override file is in route distance from A,
 which `parse_user_spans(..., s_origin=s_a)` converts.
 
+The override file also steers the automatic (warrant) guardrails of `geometry.warrants`
+(docs/research/guardrails.md §7.3): `{"auto": false, ...}` turns them off for the track, and a
+span with `"kind": "none"` erases them there (an unmapped driveway, or a stretch the user knows
+has no rail). `parse_user_file` returns all three; `parse_user_spans` only the real spans.
+
+**Roadside features** for the warrants (`fetch_roadside`): one more Overpass `around:` query
+along the route, same cache layout, for deep water (`natural=water`, `waterway=riverbank`,
+`landuse=reservoir` areas and multipolygons, `waterway=river|canal` lines), rock
+(`natural=cliff|bare_rock|scree`) and every road, track or driveway that could join the route
+(`highway=*`, without footways and paths). Relations come back clipped to the route's box.
+
 OSM data is (c) OpenStreetMap contributors, ODbL 1.0 (`overpass.OSM_ATTRIBUTION`).
 """
 
@@ -59,19 +70,29 @@ from driftmaps.geo.overpass import (
 from driftmaps.geo.project import LocalProjection
 
 __all__ = [
+    "ACCESS_HIGHWAYS",
     "BARRIER_KINDS",
     "DEFAULT_AROUND_M",
     "USER_SPANS_FILE",
     "BarrierSpan",
     "OsmBarrier",
+    "OsmFeature",
+    "RoadsideFeatures",
     "Side",
+    "UserGuardrails",
     "build_barrier_query",
+    "build_roadside_query",
     "fetch_barriers",
+    "fetch_roadside",
+    "load_user_file",
     "load_user_spans",
     "match_barriers",
     "merge_spans",
     "parse_barriers",
+    "parse_roadside",
+    "parse_user_file",
     "parse_user_spans",
+    "project_points",
 ]
 
 Side = Literal["left", "right"]
@@ -82,6 +103,7 @@ BARRIER_KINDS: tuple[str, ...] = ("guard_rail", "jersey_barrier", "retaining_wal
 DEFAULT_AROUND_M = 15.0  # scenery.md §7: barriers within 15 m of the route
 USER_SPANS_FILE = "guardrails.json"
 _USER_KINDS = ("guard_rail", "jersey_barrier", "wall", "retaining_wall")
+_ERASE_KIND = "none"  # guardrails.json: no automatic (warrant) rail here
 
 
 @dataclass(frozen=True)
@@ -223,6 +245,229 @@ def fetch_barriers(
 
 
 # --------------------------------------------------------------------------------------------
+# Roadside features for the automatic (warrant) guardrails
+# --------------------------------------------------------------------------------------------
+
+# Roads, tracks and driveways that can join the route (a rail is cut there); not footways,
+# paths, cycleways, steps or anything proposed/under construction.
+ACCESS_HIGHWAYS: tuple[str, ...] = (
+    "motorway", "trunk", "primary", "secondary", "tertiary", "unclassified", "residential",
+    "living_street", "service", "track", "road", "busway",
+    "motorway_link", "trunk_link", "primary_link", "secondary_link", "tertiary_link",
+)  # fmt: skip
+ROADSIDE_AROUND_M = 40.0  # water and rock this close to the route (DCZ <= ~15 m + margin)
+ACCESS_AROUND_M = 25.0  # joining ways this close to the route
+_ROCK = ("cliff", "bare_rock", "scree")
+_NOT_DEEP_WATER = ("ditch", "drain", "stream", "wastewater", "stream_pool", "rapids")
+
+
+@dataclass(frozen=True)
+class OsmFeature:
+    """One roadside OSM line: an area's boundary (`area`), a line feature, or a relation
+    member. `kind` is "water" (deep-water area edge), "river" / "canal" (centre lines, see
+    `half_width_m`), "rock" or "access" (a highway way; `nodes` are its node ids, aligned with
+    `lonlat`, empty for relation members)."""
+
+    id: int
+    kind: str
+    lonlat: np.ndarray = field(repr=False)
+    tags: Mapping[str, str] = field(default_factory=dict)
+    nodes: tuple[int, ...] = ()
+    area: bool = False
+
+    @property
+    def half_width_m(self) -> float:
+        """Half the water width of a river/canal line: `width`/2, else 8 m / 5 m (ASSUMED,
+        guardrails.md §4.2); 0 for anything else."""
+        if self.kind not in ("river", "canal"):
+            return 0.0
+        w = parse_width(self.tags.get("width"))
+        if w is not None and w > 0:
+            return 0.5 * w
+        return 8.0 if self.kind == "river" else 5.0
+
+
+@dataclass(frozen=True)
+class RoadsideFeatures:
+    """Deep water, rock and joining ways near a route (from `fetch_roadside`)."""
+
+    water: tuple[OsmFeature, ...] = ()
+    rock: tuple[OsmFeature, ...] = ()
+    access: tuple[OsmFeature, ...] = ()
+    osm_base: str | None = None
+
+
+def _bbox(route_latlon: np.ndarray, margin_m: float) -> tuple[float, float, float, float]:
+    lat, lon = route_latlon[:, 0], route_latlon[:, 1]
+    dlat = margin_m / 111_320.0
+    dlon = margin_m / (111_320.0 * max(0.1, math.cos(math.radians(float(lat.mean())))))
+    return (
+        round(float(lat.min()) - dlat, 6),
+        round(float(lon.min()) - dlon, 6),
+        round(float(lat.max()) + dlat, 6),
+        round(float(lon.max()) + dlon, 6),
+    )
+
+
+def build_roadside_query(
+    route_latlon: Sequence[tuple[float, float]] | npt.ArrayLike,
+    around_m: float = ROADSIDE_AROUND_M,
+    access_m: float = ACCESS_AROUND_M,
+    timeout_s: int = 120,
+) -> str:
+    """Overpass QL for deep water, rock and joining highway ways along the (lat, lon) line.
+    Ways come back whole; relations (lake and river multipolygons can be huge) are clipped
+    to the route's bounding box (+ `around_m` + 100 m)."""
+    pts = np.asarray(route_latlon, dtype=np.float64).reshape(-1, 2)
+    if len(pts) == 0:
+        raise ValueError("need at least one route point")
+    coords = ",".join(f"{_fmt(lat)},{_fmt(lon)}" for lat, lon in pts)
+    near = f"(around:{_fmt(around_m)},{coords})"
+    acc = f"(around:{_fmt(access_m)},{coords})"
+    s, w, n, e = _bbox(pts, around_m + 100.0)
+    highways = "^(" + "|".join(sorted(ACCESS_HIGHWAYS)) + ")$"
+    return (
+        f"[out:json][timeout:{int(timeout_s)}];\n"
+        "(\n"
+        f'  way["natural"="water"]{near};\n'
+        f'  way["waterway"~"^(riverbank|river|canal)$"]{near};\n'
+        f'  way["landuse"="reservoir"]{near};\n'
+        f'  way["natural"~"^({"|".join(_ROCK)})$"]{near};\n'
+        f'  way["highway"~"{highways}"]{acc};\n'
+        ")->.w;\n"
+        "(\n"
+        f'  relation["natural"="water"]{near};\n'
+        f'  relation["waterway"="riverbank"]{near};\n'
+        f'  relation["landuse"="reservoir"]{near};\n'
+        ")->.r;\n"
+        ".w out body geom;\n"
+        f".r out geom({_fmt(s)},{_fmt(w)},{_fmt(n)},{_fmt(e)});\n"
+    )
+
+
+def _pieces(
+    geometry: Sequence[Mapping | None], nodes: Sequence[int] | None
+) -> list[tuple[np.ndarray, tuple[int, ...]]]:
+    """Split an Overpass geometry list at missing points (clipped output) into (lonlat, node
+    ids) pieces of 2+ points; node ids only when they line up with the geometry."""
+    aligned = nodes is not None and len(nodes) == len(geometry)
+    out, pts, ids = [], [], []
+    for k, g in enumerate([*geometry, None]):
+        if g is None or "lon" not in g or "lat" not in g:
+            if len(pts) >= 2:
+                out.append((np.array(pts, np.float64), tuple(ids) if aligned else ()))
+            pts, ids = [], []
+            continue
+        pts.append((float(g["lon"]), float(g["lat"])))
+        if aligned:
+            ids.append(int(nodes[k]))
+    return out
+
+
+def _deep_water(tags: Mapping[str, str]) -> str | None:
+    """The water kind of a way/relation's tags ("water", "river", "canal") if it is deep
+    water by the guardrails.md §4.2 proxy, else None."""
+    if tags.get("intermittent") == "yes" or tags.get("seasonal") == "yes":
+        return None
+    if tags.get("natural") == "water":
+        return None if tags.get("water") in _NOT_DEEP_WATER else "water"
+    if tags.get("waterway") == "riverbank" or tags.get("landuse") == "reservoir":
+        return "water"
+    if tags.get("waterway") in ("river", "canal"):
+        return str(tags["waterway"])
+    return None
+
+
+def parse_roadside(payload: bytes | str | Mapping) -> RoadsideFeatures:
+    """Overpass JSON from `build_roadside_query` -> RoadsideFeatures (sorted by id)."""
+    if isinstance(payload, bytes | str):
+        try:
+            payload = json.loads(payload)
+        except ValueError as exc:
+            raise OverpassError(f"not an Overpass JSON response: {exc}") from exc
+    if not isinstance(payload, Mapping) or "elements" not in payload:
+        raise OverpassError("not an Overpass JSON response (no 'elements')")
+    remark = payload.get("remark")
+    if remark and "error" in str(remark).lower():
+        raise OverpassError(f"Overpass reported: {remark}")
+    water: list[OsmFeature] = []
+    rock: list[OsmFeature] = []
+    access: list[OsmFeature] = []
+    for el in payload["elements"]:
+        tags = {str(k): str(v) for k, v in (el.get("tags") or {}).items()}
+        oid = int(el.get("id", 0))
+        if el.get("type") == "way":
+            nodes = el.get("nodes") or []
+            closed = len(nodes) > 3 and nodes[0] == nodes[-1]
+            pieces = _pieces(el.get("geometry") or [], nodes)
+            water_kind = _deep_water(tags)
+            for ll, ids in pieces:
+                if tags.get("highway") in ACCESS_HIGHWAYS and tags.get("area") != "yes":
+                    access.append(OsmFeature(oid, "access", ll, tags, ids))
+                elif water_kind is not None:
+                    area = water_kind == "water"
+                    water.append(OsmFeature(oid, water_kind, ll, tags, (), area and closed))
+                elif tags.get("natural") in _ROCK:
+                    rock.append(OsmFeature(oid, "rock", ll, tags, (), closed))
+        elif el.get("type") == "relation":
+            water_kind = _deep_water(tags)
+            if water_kind != "water":
+                continue
+            for mem in el.get("members") or []:
+                if mem.get("type") != "way":
+                    continue
+                for ll, _ in _pieces(mem.get("geometry") or [], None):
+                    water.append(OsmFeature(oid, "water", ll, tags, (), True))
+
+    def key(f: OsmFeature) -> tuple:
+        return (f.id, f.kind, len(f.lonlat), tuple(f.lonlat[0]))
+
+    osm_base = (payload.get("osm3s") or {}).get("timestamp_osm_base")
+    return RoadsideFeatures(
+        tuple(sorted(water, key=key)),
+        tuple(sorted(rock, key=key)),
+        tuple(sorted(access, key=key)),
+        osm_base,
+    )
+
+
+def fetch_roadside(
+    route_lonlat: npt.ArrayLike,
+    *,
+    cache_dir: Path | str | None = None,
+    around_m: float = ROADSIDE_AROUND_M,
+    access_m: float = ACCESS_AROUND_M,
+    simplify_m: float = 5.0,
+    mirrors: Sequence[str] | None = None,
+    refresh: bool = False,
+    offline: bool = False,
+    **post_kwargs,
+) -> RoadsideFeatures:
+    """Deep water, rock and joining ways near the route line (N, 2) (lon, lat), from the
+    cache or Overpass (same cache layout and policy as `fetch_barriers`)."""
+    ll = np.asarray(route_lonlat, dtype=np.float64).reshape(-1, 2)
+    pad = max(simplify_m, 0.0)
+    query = build_roadside_query(_simplified_latlon(ll, simplify_m), around_m + pad, access_m + pad)
+    key = query_cache_key(query)
+    cache = Path(cache_dir) if cache_dir is not None else default_cache_dir()
+    path = _cache_path(cache, key)
+    if not refresh and path.is_file():
+        try:
+            return parse_roadside(gzip.decompress(path.read_bytes()))
+        except (OSError, ValueError, OverpassError):
+            pass  # corrupt cache entry: refetch
+    if offline:
+        raise OverpassError(f"no cached Overpass roadside data for this route (key {key[:12]}...)")
+    body = post_query(query, mirrors, **post_kwargs)
+    features = parse_roadside(body)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_bytes(gzip.compress(body, mtime=0))
+    tmp.replace(path)
+    return features
+
+
+# --------------------------------------------------------------------------------------------
 # Matching to the centreline
 # --------------------------------------------------------------------------------------------
 
@@ -265,6 +510,22 @@ def _project(
         past = ((a == 0) & (t_raw < -1e-6)) | ((a == n - 2) & (t_raw > length + 1e-6))
         inside = np.where(better, ~past, inside)
     return st, off, inside
+
+
+def project_points(
+    pts_xz: npt.ArrayLike, centre_xz: npt.ArrayLike, s: npt.ArrayLike
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(station, signed lateral offset (+ = driver's left), inside) of AC XZ points (M, 2) on
+    the centreline `centre_xz` (N, 2) with stations `s` (N,). `inside` is False for points
+    beyond either end of the line."""
+    centre = np.asarray(centre_xz, np.float64).reshape(-1, 2)
+    pts = np.asarray(pts_xz, np.float64).reshape(-1, 2)
+    st = np.asarray(s, np.float64).reshape(-1)
+    if len(centre) < 2 or len(centre) != len(st):
+        raise ValueError("centre_xz and s need the same length >= 2")
+    if len(pts) == 0:
+        return np.zeros(0), np.zeros(0), np.zeros(0, bool)
+    return _project(pts, centre, st, cKDTree(centre))
 
 
 def match_barriers(
@@ -366,31 +627,49 @@ def merge_spans(spans: Sequence[BarrierSpan], join_m: float = 1.0) -> list[Barri
 # --------------------------------------------------------------------------------------------
 
 
-def parse_user_spans(
+@dataclass(frozen=True)
+class UserGuardrails:
+    """Everything `guardrails.json` says: real `spans` (source "user"), `erase` spans where no
+    automatic rail may stand (kind "none", source "user"), and `auto` (False: no automatic
+    rails on this track at all)."""
+
+    spans: tuple[BarrierSpan, ...] = ()
+    erase: tuple[BarrierSpan, ...] = ()
+    auto: bool = True
+
+
+def parse_user_file(
     data: object,
     *,
     s_origin: float = 0.0,
     default_kind: str = "guard_rail",
     reverse: bool = False,
     length_m: float | None = None,
-) -> list[BarrierSpan]:
-    """User barrier spans from parsed `guardrails.json`: a list of
-    `{"side", "from_m", "to_m", "kind"?}` (or `{"reversed"?: bool, "guardrails": [...]}`), in
-    metres of route distance from A; `s_origin` (the model station of A) converts them to
-    model stations. `from_m` > `to_m` is accepted (swapped). `reverse`: the build drives the
-    route the other way from the file's (`"reversed"`, default false); then each span is
-    mirrored (left <-> right, s -> `length_m` - s, `length_m` = the A->B length, required).
-    Raises ValueError on anything malformed."""
-    items = data.get("guardrails") if isinstance(data, Mapping) else data
+) -> UserGuardrails:
+    """Parsed `guardrails.json`: a list of `{"side", "from_m", "to_m", "kind"?}` (or
+    `{"reversed"?: bool, "auto"?: bool, "guardrails": [...]}`), in metres of route distance
+    from A; `s_origin` (the model station of A) converts them to model stations. `from_m` >
+    `to_m` is accepted (swapped). `"kind": "none"` marks a stretch where no automatic rail may
+    stand. `reverse`: the build drives the route the other way from the file's (`"reversed"`,
+    default false); then each span is mirrored (left <-> right, s -> `length_m` - s, `length_m`
+    = the A->B length, required). Raises ValueError on anything malformed."""
+    if isinstance(data, Mapping):  # {"auto": false} alone is fine; other objects need spans
+        items = data.get("guardrails", [] if set(data) <= {"auto", "reversed"} else None)
+    else:
+        items = data
     if not isinstance(items, list):
         raise ValueError("guardrails.json must be a list of spans (or {'guardrails': [...]})")
     file_reversed = data.get("reversed", False) if isinstance(data, Mapping) else False
     if not isinstance(file_reversed, bool):
         raise ValueError(f"'reversed' must be true or false, got {file_reversed!r}")
+    auto = data.get("auto", True) if isinstance(data, Mapping) else True
+    if not isinstance(auto, bool):
+        raise ValueError(f"'auto' must be true or false, got {auto!r}")
     mirror = file_reversed != bool(reverse)
-    if mirror and (length_m is None or not length_m > 0):
+    if mirror and items and (length_m is None or not length_m > 0):
         raise ValueError("mirroring guardrails.json for a reversed route needs its length")
-    out = []
+    spans: list[BarrierSpan] = []
+    erase: list[BarrierSpan] = []
     for k, item in enumerate(items):
         if not isinstance(item, Mapping):
             raise ValueError(f"span {k}: expected an object, got {item!r}")
@@ -398,8 +677,10 @@ def parse_user_spans(
         kind = item.get("kind", default_kind)
         if side not in ("left", "right"):
             raise ValueError(f"span {k}: side must be 'left' or 'right', got {side!r}")
-        if kind not in _USER_KINDS:
-            raise ValueError(f"span {k}: kind must be one of {_USER_KINDS}, got {kind!r}")
+        if kind not in (*_USER_KINDS, _ERASE_KIND):
+            raise ValueError(
+                f"span {k}: kind must be one of {(*_USER_KINDS, _ERASE_KIND)}, got {kind!r}"
+            )
         try:
             a, b = float(item["from_m"]), float(item["to_m"])
         except (KeyError, TypeError, ValueError) as exc:
@@ -410,8 +691,50 @@ def parse_user_spans(
         if mirror:
             side = "right" if side == "left" else "left"
             a, b = length_m - b, length_m - a
-        out.append(BarrierSpan(side, s_origin + a, s_origin + b, kind, "user"))
-    return out
+        span = BarrierSpan(side, s_origin + a, s_origin + b, kind, "user")
+        (erase if kind == _ERASE_KIND else spans).append(span)
+    return UserGuardrails(tuple(spans), tuple(erase), auto)
+
+
+def parse_user_spans(
+    data: object,
+    *,
+    s_origin: float = 0.0,
+    default_kind: str = "guard_rail",
+    reverse: bool = False,
+    length_m: float | None = None,
+) -> list[BarrierSpan]:
+    """The real user barrier spans of parsed `guardrails.json` (see `parse_user_file`; the
+    `"kind": "none"` erase spans and the `"auto"` switch are left out). Raises ValueError on
+    anything malformed."""
+    parsed = parse_user_file(
+        data, s_origin=s_origin, default_kind=default_kind, reverse=reverse, length_m=length_m
+    )
+    return list(parsed.spans)
+
+
+def _read_user_json(path: Path) -> object:
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except ValueError as exc:
+        raise ValueError(f"{path}: not valid JSON: {exc}") from exc
+
+
+def load_user_file(
+    path: Path | str,
+    *,
+    s_origin: float = 0.0,
+    reverse: bool = False,
+    length_m: float | None = None,
+) -> UserGuardrails:
+    """`parse_user_file` of a JSON file (UTF-8, with or without a BOM); a missing file means
+    no spans and automatic rails on."""
+    path = Path(path)
+    if not path.is_file():
+        return UserGuardrails()
+    return parse_user_file(
+        _read_user_json(path), s_origin=s_origin, reverse=reverse, length_m=length_m
+    )
 
 
 def load_user_spans(
@@ -426,8 +749,6 @@ def load_user_spans(
     path = Path(path)
     if not path.is_file():
         return []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except ValueError as exc:
-        raise ValueError(f"{path}: not valid JSON: {exc}") from exc
-    return parse_user_spans(data, s_origin=s_origin, reverse=reverse, length_m=length_m)
+    return parse_user_spans(
+        _read_user_json(path), s_origin=s_origin, reverse=reverse, length_m=length_m
+    )

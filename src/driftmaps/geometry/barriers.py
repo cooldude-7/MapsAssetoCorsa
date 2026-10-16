@@ -1,15 +1,17 @@
 """Visible roadside barriers with hidden collision: W-beam guardrails, jersey barriers, walls,
 and the bridge railings (concrete parapet, steel rail) that `geometry.bridges` puts on decks.
 
-Only REAL barriers are built (docs/research/scenery.md §5, §7): `plan_barriers` combines
+`plan_barriers` combines, in this priority (a later source only fills what an earlier one
+left open on that side), never over a bridge deck that has its own railing (`bridges`: the
+railed decks; a culvert without parapets is plain road, so rails may run over it):
+- the user's `guardrails.json` spans (`geo.barriers.load_user_spans`),
 - OSM barrier ways matched to the road (`geo.barriers.match_barriers`),
-- the user's `guardrails.json` spans (`geo.barriers.load_user_spans`), and
 - OPT-IN only (`approach_m` > 0; the build's `--bridge-approach-rails`): a guard rail on both
-  sides of every bridge approach. No source says these exist, so the default is 0 (none),
-in that priority, never over a bridge deck that has its own railing (`bridges`: the railed
-decks; a culvert without parapets is plain road, so rails from a source may run over it). The
-steep drop-off heuristic `drop_off_spans` is OFF by default too: nothing calls it unless the
-build asks for it, because the user wants only real barriers.
+  sides of every bridge approach (invented, default 0),
+- `heuristic` spans: the build passes the automatic guardrails of `geometry.warrants` here
+  (where Ontario design rules say a rail is required, docs/research/guardrails.md; on by
+  default, `--no-auto-guardrails` turns them off). The older single-probe `drop_off_spans`
+  is kept for compatibility but nothing calls it.
 
 Geometry (AC frame: X east, Y up, Z south; left = up x forward):
 - A barrier runs along a **face line**: the road's shoulder edge (`RoadModel.outer`) plus
@@ -21,9 +23,11 @@ Geometry (AC frame: X east, Y up, Z south; left = up x forward):
   the reference, ordered counter-clockwise for the LEFT side (d plotted to the right): then
   `sweep` makes every face's front point outward (verified by tests). Right-side profiles are
   mirrored by reversing the point order.
-- **W-beam** (`guard_rail`): a 310 mm x 83 mm W rail (front and back faces) with its top at
-  0.75 m, on 150 mm posts every 2 m (real Ontario spacing is 1.905 m, ASSUMED close enough)
-  with 150 mm blockouts; free ends are turned down into the ground over `terminal_m`.
+- **W-beam** (`guard_rail`): Ontario Type M steel-beam guide rail (guardrails.md §5.5,
+  VERIFIED RDM 4.2.2.1): a 310 mm x 83 mm W rail (front and back faces) with its top at
+  0.785 m, on 150 mm posts every 1.905 m with 200 mm blocks. A free end flares 0.3 m away from
+  the road over its last `flare_len_m` (15 m, SBEAT-style; shorter rails flare over a third of
+  their length) and is turned down into the ground over its last `terminal_m`.
 - **Jersey** (`jersey_barrier`): the New Jersey shape (0.81 m tall, 0.61 m base, 0.15 m top).
 - **Wall** (`wall`, `retaining_wall`): a 0.3 m concrete wall, `height` tag or 1.0 m above the
   higher ground beside it.
@@ -116,8 +120,7 @@ _W_FRONT = np.array(
     ]
 )
 _W_THICKNESS_M = 0.004
-_POST_M = 0.15  # post and blockout section
-_BLOCKOUT_M = 0.15  # blockout depth between rail and post
+_POST_M = 0.15  # post section (W150)
 
 # New Jersey barrier, 32 in tall, 24 in base, 6 in top, 3 in vertical toe, break at 13 in
 # (the standard NJ shape, ASSUMED); (d, h) from the back bottom, CCW for the left side.
@@ -139,9 +142,12 @@ _NJ = np.array(
 class BarrierOptions:
     gap_m: float = 0.0  # face line this far beyond the shoulder edge (model.outer)
     near_edge_m: float = 1.0  # face lines further out than this stand on the ground
-    rail_top_m: float = 0.75  # W-beam top above the road
-    post_spacing_m: float = 2.0
+    rail_top_m: float = 0.785  # W-beam top above the road (Type M: 785 +- 25 mm)
+    post_spacing_m: float = 1.905  # Type M post spacing
+    blockout_m: float = 0.20  # routed block between rail and post (Type M20)
     terminal_m: float = 4.0  # turned-down W-beam ends (free ends only)
+    flare_m: float = 0.3  # free W-beam ends flare this far away from the road ...
+    flare_len_m: float = 15.0  # ... over this length (SBEAT, RDM 4.2.2.1)
     wall_height_m: float = 1.0
     wall_thickness_m: float = 0.3
     parapet_height_m: float = 0.85
@@ -661,7 +667,7 @@ def _w_beam(path, span, ground_fn, opt, free) -> _Built:
     posts_s = posts_s[(posts_s >= path.s[0] - 1e-6) & (posts_s <= path.s[-1] + 1e-6)]
     post_taper = _taper(posts_s, span.s0, span.s1, free, opt.terminal_m)
     post_drop = (1.0 - post_taper) * (opt.rail_top_m + 0.1)
-    d_post = W_BEAM_DEPTH_M + _BLOCKOUT_M + _POST_M / 2
+    d_post = W_BEAM_DEPTH_M + opt.blockout_m + _POST_M / 2
     parts += _posts(
         path,
         posts_s,
@@ -677,10 +683,10 @@ def _w_beam(path, span, ground_fn, opt, free) -> _Built:
         base, fwd, out = path.interp(posts_s[full])
         h0 = opt.rail_top_m - W_BEAM_HEIGHT_M + 0.03
         h1 = opt.rail_top_m - 0.04
-        d_c = W_BEAM_DEPTH_M + _BLOCKOUT_M / 2
+        d_c = W_BEAM_DEPTH_M + opt.blockout_m / 2
         for k in range(len(base)):
             c = base[k] + d_c * out[k] + 0.5 * (h0 + h1) * UP
-            parts.append(box(c, (_BLOCKOUT_M, h1 - h0, 0.12), _heading_deg(fwd[k])))
+            parts.append(box(c, (opt.blockout_m, h1 - h0, 0.12), _heading_deg(fwd[k])))
     g = path.ground(ground_fn)
     top = ref + np.maximum(0.3, opt.collision_height_m - drop)
     return _Built(
@@ -831,6 +837,14 @@ def span_meshes(
     if path is None:
         return []
     clipped = dataclasses.replace(span, s0=float(path.s[0]), s1=float(path.s[-1]))
+    if span.kind == "guard_rail" and opt.flare_m > 0.0:
+        flare = opt.flare_m * (1.0 - _taper(path.s, clipped.s0, clipped.s1, free_ends,
+                                            opt.flare_len_m))  # fmt: skip
+        if flare.any():
+            path.base[:, [0, 2]] += flare[:, None] * path.out[:, [0, 2]]
+            if ground_fn is not None:  # a flared end follows the ground down (<= 0.3 m)
+                sink = np.clip(path.base[:, 1] - path.ground(ground_fn), 0.0, 0.3)
+                path.base[:, 1] -= sink * flare / opt.flare_m
     out = []
     for i0, i1 in _chunks(path, chunk_m or opt.chunk_m):
         sub = path.slice(i0, i1)

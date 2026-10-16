@@ -224,8 +224,15 @@ def build(
     buildings: bool = typer.Option(True, help="Buildings from OSM + Microsoft footprints."),
     guardrails: bool = typer.Option(
         True,
-        help="Guardrails only where OSM or guardrails.json has them (bridges keep their "
-        "parapets; at-grade culverts have none).",
+        help="Guardrails from guardrails.json and OSM, plus the automatic ones (bridges keep "
+        "their parapets; at-grade culverts have none). --no-guardrails: no rails at all.",
+    ),
+    auto_guardrails: bool = typer.Option(
+        True,
+        "--auto-guardrails/--no-auto-guardrails",
+        help="Also put guardrails where Ontario road-design rules require one: high or steep "
+        "fills and drop-offs (lidar), deep water and bridge ends inside the clear zone, cut at "
+        "side roads and driveways. data/guardrails_auto.json says why each one is there.",
     ),
     bridge_approach_rails: bool = typer.Option(
         False,
@@ -295,6 +302,7 @@ def build(
         trees=trees,
         buildings=buildings,
         guardrails=guardrails,
+        auto_guardrails=auto_guardrails,
         bridge_approach_rails=bridge_approach_rails,
         scenery_density=scenery_density,
         guardrails_file=guardrails_file,

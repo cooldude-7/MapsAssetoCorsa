@@ -30,10 +30,16 @@ Pipeline (PLAN §5.1-§5.5, docs/research/geo.md §1-§3, ac_format.md §2, §3,
      or deck under 2 m above the ground) is just road, without parapets. The terrain under a
      deck is the real lidar ground, kept `TerrainOptions.bridge_clearance_m` below the road
      and, as a safety net, clamped under `bridges.deck_ceiling` (no terrain through a deck).
-   - **Guardrails** (`geo.barriers`, `geometry.barriers`): only real ones: OSM
-     `barrier=guard_rail|jersey_barrier|wall|retaining_wall` beside the road and the user's
-     `guardrails.json` (`guardrails_file`). Rails on bridge approaches are invented (no
-     source), so only with `bridge_approach_rails`.
+   - **Guardrails** (`geo.barriers`, `geometry.barriers`, `geometry.warrants`): the user's
+     `guardrails.json` (`guardrails_file`), then OSM
+     `barrier=guard_rail|jersey_barrier|wall|retaining_wall` beside the road, then (on by
+     default, `auto_guardrails`) Type M steel-beam rails wherever Ontario road-design rules
+     require one (docs/research/guardrails.md: high/steep fills and drop-offs measured on the
+     lidar DTM, deep water and bridge ends inside the clear zone; cut at side roads and
+     driveways). Water and driveways come from one more Overpass query. `data/
+     guardrails_auto.json` says why each automatic span exists; guardrails.json can switch
+     them off (`"auto": false`) or erase them (`"kind": "none"` spans). Rails on bridge
+     approaches without a rule are invented, so only with `bridge_approach_rails`.
    - **Buildings** (`geo.buildings`, `geometry.buildings`): OSM + Microsoft footprints, lidar
      heights, outside the wall corridor.
    - **Trees** (`geometry.vegetation`): lidar tree tops (DSM - DTM) with NRCan land cover
@@ -137,8 +143,10 @@ from driftmaps.geo.attributes import MAX_WIDTH_M, MIN_DRIVE_WIDTH_M, region_for
 from driftmaps.geo.barriers import (
     BarrierSpan,
     OsmBarrier,
+    RoadsideFeatures,
     fetch_barriers,
-    load_user_spans,
+    fetch_roadside,
+    load_user_file,
     match_barriers,
 )
 from driftmaps.geo.buildings import (
@@ -207,14 +215,22 @@ from driftmaps.geometry.vegetation import (
     tree_scene,
 )
 from driftmaps.geometry.walls import WallLines, corridor_polygon, wall_lines, wall_meshes
+from driftmaps.geometry.warrants import (
+    Hazard,
+    WarrantOptions,
+    warrant_inputs,
+    warrant_spans,
+)
 
 __all__ = [
     "BuildOptions",
     "BuildResult",
     "TrackGeometry",
     "build_track",
+    "dtm_height_fn",
     "loop_direction",
     "prepare_geometry",
+    "railed_decks",
     "render_debug_png",
 ]
 
@@ -326,7 +342,10 @@ class BuildOptions:
     # Scenery (M2). Bridges always get their structure (parapets: all but at-grade culverts).
     trees: bool = True
     buildings: bool = True
-    guardrails: bool = True  # OSM barriers and guardrails.json (only real ones)
+    guardrails: bool = True  # OSM barriers and guardrails.json (and the automatic ones)
+    # Also rails where Ontario design rules require one (geometry.warrants; needs guardrails).
+    auto_guardrails: bool = True
+    warrants: WarrantOptions = field(default_factory=WarrantOptions)
     bridge_approach_rails: bool = False  # also invent rails on bridge approaches (no source)
     scenery_density: float = 1.0  # scales the tree budget (0 = no trees, 2 = twice the cap)
     guardrails_file: Path | None = None  # user spans (route metres from A); see geo.barriers
@@ -342,6 +361,7 @@ class BuildOptions:
     canopy_source: Callable[[LocalProjection], CanopyFn] | None = None
     landcover_source: Callable[[LocalProjection], LandcoverFn] | None = None
     osm_barriers: Sequence[OsmBarrier] | None = None
+    roadside_features: RoadsideFeatures | None = None  # water, rock, driveways (warrants)
     building_footprints: Sequence[Footprint] | None = None
     # Called at each major step with a short plain-English step name and the overall progress
     # (0..1), e.g. for the local app's progress bar. None: no reports.
@@ -394,7 +414,8 @@ class BuildResult:
             rails = ", ".join(f"{k} {v:.0f} m" for k, v in sorted(sc["barriers_m"].items()))
             lines.append(
                 f"rails    {rails or 'none'} (OSM barriers found: {sc['osm_barriers']}, "
-                f"guardrails.json spans: {sc['user_spans']})"
+                f"guardrails.json spans: {sc['user_spans']}, automatic: "
+                f"{sc.get('warrant_spans', 0)} spans)"
             )
             for b in sc["bridges"]:
                 lines.append(
@@ -561,6 +582,8 @@ class TrackGeometry:
     region: str
     elevation: _Elevation
     osm_polyline: np.ndarray  # (M, 3) the OSM node polyline (Y = 0), A..B
+    # (N,) OSM way id per station (its tags: route.ways), clamped at the run-up/run-off.
+    way_id: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
 
     @property
     def length_m(self) -> float:
@@ -648,6 +671,7 @@ def prepare_geometry(route: Route, options: BuildOptions) -> TrackGeometry:
     width = _box_smooth(width, int(WIDTH_RAMP_M), closed)
     lanes = attrs.lanes[j]
     oneway = attrs.oneway[j]
+    way_id = attrs.way_id[j]
     on_route = np.ones(len(s), bool) if closed else (param > 0) & (param < raw_length)
     bridge = attrs.bridge[j] & on_route
     tunnel = attrs.tunnel[j] & on_route
@@ -711,6 +735,7 @@ def prepare_geometry(route: Route, options: BuildOptions) -> TrackGeometry:
         region=region,
         elevation=elev,
         osm_polyline=osm,
+        way_id=np.asarray(way_id, np.int64),
     )
 
 
@@ -749,6 +774,13 @@ def _terrain_height_fn(geo: TrackGeometry):
         return geo.elevation.terrain(np.asarray(lon), np.asarray(lat), far) - geo.z_ref
 
     return fn
+
+
+def dtm_height_fn(geo: TrackGeometry) -> Callable[[np.ndarray], np.ndarray]:
+    """The bare-earth DEM (the lidar DTM where there is one) under AC XZ points, as AC Y:
+    the real ground, before the build cuts and fills it to meet the road."""
+    fn = _terrain_height_fn(geo)
+    return lambda xz: fn(np.asarray(xz, np.float64).reshape(-1, 2), False)
 
 
 # --------------------------------------------------------------------------------------------
@@ -1091,6 +1123,9 @@ class _Scenery:
     osm_barrier_ways: list[OsmBarrier] = field(default_factory=list)  # matched to the road
     footprints_masked: bool = False  # every fetched footprint kept trees off (tree mask)
     user_spans: int = 0
+    warrant_spans: int = 0
+    warrant_report: list[dict] = field(default_factory=list)  # data/guardrails_auto.json
+    warrant_hazards: list[Hazard] = field(default_factory=list)
     user_file: Path | None = None
     user_bytes: bytes = b""  # the user file as read, rewritten after the folder is cleared
     deck_intrusion_m: float = 0.0
@@ -1145,16 +1180,81 @@ def _bridges(
     return terrain
 
 
+def railed_decks(plans: Sequence[BridgePlan]) -> list[tuple[float, float]]:
+    """Station ranges of the bridge decks that have a railing (not at-grade culverts)."""
+    return [(p.s0, p.s1) for p in plans if p.railing]
+
+
+def _auto_rails(
+    geo: TrackGeometry,
+    options: BuildOptions,
+    decks: Sequence[tuple[float, float]],
+    erase: Sequence[BarrierSpan],
+    sc: _Scenery,
+) -> list[BarrierSpan]:
+    """The automatic (warrant) guardrails, minus the user's `"kind": "none"` stretches."""
+    features = options.roadside_features
+    if features is None:
+        try:
+            features = fetch_roadside(
+                _route_lonlat(geo), cache_dir=options.cache_dir, offline=options.offline
+            )
+        except _DATA_ERRORS as e:
+            warnings.warn(
+                f"OSM water and driveways unavailable ({_short(e)}); automatic guardrails "
+                "use the lidar, bridges and the route's side roads only",
+                stacklevel=2,
+            )
+            features = None
+    m = geo.model
+    inputs = warrant_inputs(
+        m,
+        dtm_height_fn(geo),
+        geo.projection,
+        geo.route,
+        geo.way_id if len(geo.way_id) == len(m) else np.zeros(len(m), np.int64),
+        geo.oneway,
+        decks=decks,
+        features=features,
+        s_range=(geo.s_a, geo.s_b),
+        options=options.warrants,
+    )
+    inputs.driving_side = geo.driving_side
+    result = warrant_spans(inputs, options.warrants)
+    sc.warrant_hazards = result.hazards
+    spans: list[BarrierSpan] = []
+    report: list[dict] = []
+    for span, entry in zip(result.spans, result.report, strict=True):
+        pieces = [(span.s0, span.s1)]
+        for e in erase:
+            if e.side == span.side:
+                pieces = [
+                    (a, b)
+                    for p0, p1 in pieces
+                    for a, b in ((p0, min(p1, e.s0)), (max(p0, e.s1), p1))
+                    if b - a > 0.5
+                ]
+        for a, b in pieces:
+            spans.append(dataclasses.replace(span, s0=a, s1=b))
+            report.append(
+                {**entry, "from_m": round(a - geo.s_a, 1), "to_m": round(b - geo.s_a, 1),
+                 "length_m": round(b - a, 1)}
+            )  # fmt: skip
+    sc.warrant_report = report
+    return spans
+
+
 def _barriers(
     geo: TrackGeometry,
     ground: Callable[[np.ndarray], np.ndarray],
     options: BuildOptions,
     sc: _Scenery,
 ) -> None:
-    """Real roadside barriers only: OSM ways and the user's guardrails.json (bridge approach
-    rails only if asked for). Decks with a railing are skipped; culverts are plain road."""
+    """Roadside barriers: the user's guardrails.json, OSM ways, then (unless turned off) the
+    automatic rails the design rules require (bridge approach rails only if asked for).
+    Decks with a railing are skipped; culverts are plain road."""
     m = geo.model
-    decks = [(p.s0, p.s1) for p in sc.plans if p.railing]
+    decks = railed_decks(sc.plans)
     osm_spans: list[BarrierSpan] = []
     if options.osm_barriers is not None:
         osm = list(options.osm_barriers)
@@ -1172,13 +1272,16 @@ def _barriers(
         used = {sp.osm_id for sp in osm_spans}
         sc.osm_barrier_ways = [b for b in osm if b.id in used]
     user: list[BarrierSpan] = []
+    erase: list[BarrierSpan] = []
+    auto = options.auto_guardrails
     if options.guardrails_file is not None and Path(options.guardrails_file).is_file():
         path = Path(options.guardrails_file)
         # Read now: the file may live in the track folder that is cleared before writing.
         sc.user_bytes = path.read_bytes()
-        user = load_user_spans(
+        parsed = load_user_file(
             path, s_origin=geo.s_a, reverse=options.route_reversed, length_m=geo.length_m
         )
+        user, erase, auto = list(parsed.spans), list(parsed.erase), auto and parsed.auto
         sc.user_file = path
         if options.route_reversed:  # the copy sits next to the reversed route.json: say so
             data = json.loads(sc.user_bytes.decode("utf-8-sig"))
@@ -1187,8 +1290,12 @@ def _barriers(
             data = {**data, "reversed": not data.get("reversed", False)}
             sc.user_bytes = (json.dumps(data, indent=1) + "\n").encode("utf-8")
     sc.user_spans = len(user)
+    warranted = _auto_rails(geo, options, decks, erase, sc) if auto else []
     approach = APPROACH_RAIL_M if options.bridge_approach_rails else 0.0
-    sc.spans = plan_barriers(m, osm=osm_spans, user=user, bridges=decks, approach_m=approach)
+    sc.spans = plan_barriers(
+        m, osm=osm_spans, user=user, bridges=decks, approach_m=approach, heuristic=warranted
+    )
+    sc.warrant_spans = sum(1 for sp in sc.spans if sp.source == "warrant")
     sc.pieces += barrier_pieces(m, sc.spans, ground, options.bridge.barrier, bridges=decks)
 
 
@@ -1378,6 +1485,7 @@ def _scenery_stats(sc: _Scenery, geo: TrackGeometry, extra: Mapping[str, object]
         "barriers_m": barriers,
         "osm_barriers": sc.osm_barriers,
         "user_spans": sc.user_spans,
+        "warrant_spans": sc.warrant_spans,
         "bridges": bridges,
         "deck_intrusion_m": sc.deck_intrusion_m,
         "terrain_points_clamped": sc.terrain_clamped,
@@ -1646,6 +1754,25 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
     route.save(track_dir / "route.json")
     if sc.user_file is not None:  # bytes read before the old folder was cleared
         (track_dir / sc.user_file.name).write_bytes(sc.user_bytes)
+    if sc.warrant_report or sc.warrant_hazards:  # why each automatic guardrail is there
+        report = {
+            "about": "Automatic guardrails (docs/research/guardrails.md), metres from A as "
+            "driven. 'spans': what the rules warrant and why; 'built': what was built after "
+            "guardrails.json, OSM rails and bridge decks took their share.",
+            "spans": sc.warrant_report,
+            "built": [
+                {
+                    "side": sp.side,
+                    "from_m": round(sp.s0 - geo.s_a, 1),
+                    "to_m": round(sp.s1 - geo.s_a, 1),
+                }
+                for sp in sc.spans
+                if sp.source == "warrant"
+            ],  # fmt: skip
+        }
+        (data_dir / "guardrails_auto.json").write_text(
+            json.dumps(report, indent=1) + "\n", encoding="utf-8", newline="\n"
+        )
 
     images: list[Path] = []
     if options.debug_png:
@@ -1830,6 +1957,7 @@ _TREE_RGB = {CONIFER: (18, 72, 46), BUSH: (122, 140, 48)}  # anything else: deci
 _DECIDUOUS_RGB = (46, 122, 40)
 _BUILDING_RGB = (165, 62, 48)
 _RAIL_RGB = (255, 150, 0)
+_AUTO_RAIL_RGB = (255, 235, 0)  # automatic (warrant) guardrails
 _PARAPET_RGB = (250, 250, 250)
 _ABUTMENT_RGB = (125, 95, 60)
 
@@ -1870,7 +1998,8 @@ def _draw_scenery_over(dr, px, m: RoadModel, sc: _Scenery) -> None:
         sign = 1.0 if span.side == "left" else -1.0
         pts = _span_points(m, sign * edge, span.s0, span.s1)
         if len(pts) >= 2:
-            dr.line(px(pts), fill=_RAIL_RGB, width=3)
+            colour = _AUTO_RAIL_RGB if span.source == "warrant" else _RAIL_RGB
+            dr.line(px(pts), fill=colour, width=3)
     half = deck_half_width(m)
     for plan in sc.plans:
         for sign in (1.0, -1.0) if plan.railing else ():
@@ -1902,12 +2031,13 @@ def _legend(dr, sc: _Scenery) -> None:
         ("bush", _TREE_RGB[BUSH]),
         ("building", _BUILDING_RGB),
         ("guardrail", _RAIL_RGB),
+        ("guardrail (auto)", _AUTO_RAIL_RGB),
         ("bridge parapet", _PARAPET_RGB),
         ("abutment", _ABUTMENT_RGB),
         ("pier", (15, 15, 15)),
         ("hidden wall", (220, 30, 30)),
     ]
-    dr.rectangle((4, 4, 130, 8 + 13 * len(items)), fill=(255, 255, 255), outline=(0, 0, 0))
+    dr.rectangle((4, 4, 140, 8 + 13 * len(items)), fill=(255, 255, 255), outline=(0, 0, 0))
     for k, (label, colour) in enumerate(items):
         y = 8 + 13 * k
         dr.rectangle((8, y + 1, 18, y + 10), fill=colour, outline=(0, 0, 0))
