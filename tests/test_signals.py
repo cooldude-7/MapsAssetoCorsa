@@ -142,6 +142,14 @@ def test_no_stop_sign_on_a_signalised_approach():
     # The same junction without signals keeps its stop signs.
     plan, _ = _plan(nodes=(), items=[wrong])
     assert any(it.kind == SIGN_STOP for it in plan.items) and not plan.signals.junctions
+    # A signalised junction this layer does not plan (in the run-off, beyond B): the
+    # network's stop sign by its OSM signal node goes too; a photographed one stays.
+    node = OsmNode(98, *_lonlat((960.0, 0.0)), {"highway": "traffic_signals"})
+    runoff = StreetItem(SIGN_STOP, (975.0, 0.0, 12.0), (0.0, 1.0), "rule", ref="junction:77")
+    seen = StreetItem(SIGN_STOP, (975.0, 0.0, -12.0), (0.0, -1.0), "mapillary")
+    plan, _ = _plan(nodes=(SIGNAL, node), items=[runoff, seen], s_range=(0.0, 900.0))
+    stops = [it for it in plan.items if it.kind == SIGN_STOP]
+    assert [it.source for it in stops] == ["mapillary"]
 
 
 def test_signal_poles_stay_off_the_road_and_arms_reach_over_it():

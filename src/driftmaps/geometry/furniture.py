@@ -1146,13 +1146,17 @@ def plan_furniture(
 _TRAFFIC_LIGHT = "object--traffic-light--"
 _UNDER_SIGNALS = (SIGN_STOP, SIGN_YIELD, SIGN_ALL_WAY)
 UNDER_SIGNAL_M = 25.0  # stop / yield signs this far beyond a signalised junction's poles go
+UNDER_SIGNAL_NODE_M = 35.0  # ... and rule / OSM ones this close to an OSM signal node
 
 
 def _signals(pl: _Planner, juncs: list[_Junction], osm, mapillary: Sequence) -> None:
     """Ontario signals on every approach of each signalised route junction
     (`geometry.signals`): corner poles (signal items, moved off the surface by the next
     clearance pass) with a luminaire each; stop and yield signs on those approaches, and any
-    other signal item there, are dropped."""
+    other signal item there, are dropped. So are rule-made and OSM stop and yield signs
+    within `UNDER_SIGNAL_NODE_M` of any OSM traffic signal node, also at junctions this layer
+    does not plan (beyond A and B, in the run-off: the Burlington check's wrongly facing stop
+    sign on a signalised side street)."""
     nodes = [n for n in (osm.nodes if osm is not None else ()) if
              n.tags.get("highway") == "traffic_signals"]  # fmt: skip
     sig_xz = _xz_of(pl.proj, np.array([(n.lon, n.lat) for n in nodes])) if nodes else np.zeros(
@@ -1162,6 +1166,17 @@ def _signals(pl: _Planner, juncs: list[_Junction], osm, mapillary: Sequence) -> 
                 else np.zeros((0, 2)))  # fmt: skip
     plan = plan_signals(pl.signal_junctions(juncs), sig_xz, light_xz)
     pl.plan.signals = plan
+    if len(sig_xz):
+        tree = cKDTree(sig_xz)
+        keep = []
+        for it in pl.items:
+            if it.kind in _UNDER_SIGNALS and it.source in ("rule", "osm"):
+                d, _ = tree.query([it.position[0], it.position[2]])
+                if d <= UNDER_SIGNAL_NODE_M:
+                    pl.plan.stops_under_signals += 1
+                    continue
+            keep.append(it)
+        pl.items = keep
     if not plan.junctions:
         return
     st, _, _ = pl.frame.project(np.array([c for _, c, _ in plan.junctions]))
