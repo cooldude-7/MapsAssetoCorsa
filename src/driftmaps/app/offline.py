@@ -49,7 +49,9 @@ USER_AGENT = "AssettoCorsaMapGenerator (offline road data; Python urllib)"
 CHUNK = 1 << 20
 TIMEOUT_S = 60.0
 RETRIES = 5  # broken downloads resumed this many times in a row
-DISK_FACTOR = 2.0  # free space needed: the download x this (download + database + slack)
+# Free space needed, x the download: the .pbf, the node index while processing (~2x the .pbf)
+# and the database (~0.8x).
+DISK_FACTOR = 4.0
 
 
 @dataclass(frozen=True)

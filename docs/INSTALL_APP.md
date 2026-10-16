@@ -146,6 +146,13 @@ servers. They are sometimes busy or slow. Wait a minute and try again (move a po
 press **Create map** again). Also check that your internet works. Very long routes take longer;
 try a shorter one first.
 
+In Ontario you can skip the road servers: click the Assetto Corsa button at the top right, then
+**Download Ontario roads** under *Offline roads*. It downloads about 1 GB once (it continues
+where it stopped if interrupted) and takes a few minutes to process; after that roads, routes
+and guardrail/building data in Ontario load instantly from your PC (about 0.8 GB on disk, plus
+about 4 GB free space while it processes). **Update** fetches fresh data, **Delete** removes it.
+Command line: `drift-maps offline download|status|delete`.
+
 ### The browser didn't open, or the page won't load
 Type the address shown in the black window into your browser (usually
 <http://127.0.0.1:8765/>; if that port was busy the app picks the next one, like 8766). Make

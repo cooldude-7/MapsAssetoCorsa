@@ -263,10 +263,10 @@ def _check_osmium() -> str:
         stats = build_db(src, Path(tmp) / "t.sqlite", region="selftest", poly=_SELFTEST_POLY)
         db = OfflineDB(stats.path)
         try:
-            ways = db.tile_ways(*tile_xy(43.8043, -79.9919))
+            ways, complete = db.tile_ways(*tile_xy(43.8043, -79.9919))
         finally:
             db.close()
-    if not ways or ways[0]["nodes"] != [1, 2]:
+    if not complete or not ways or ways[0]["nodes"] != [1, 2]:
         raise RuntimeError("the offline road database didn't read back the test road")
     return f"pyosmium {osmium.version.pyosmium_release}, offline road database"
 

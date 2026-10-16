@@ -123,7 +123,7 @@ def test_xml_and_pbf_build_the_same_rows(region, tmp_path):
     a, b = offline.OfflineDB(out.path), offline.OfflineDB(region["stats"].path)
     try:
         x, y = tile_xy(43.81, -79.98)
-        assert a.tile_ways(x, y) == b.tile_ways(x, y)
+        assert a.tile_ways(x, y) == b.tile_ways(x, y) and a.tile_ways(x, y)[1]
         assert out.counts == region["stats"].counts
     finally:
         a.close()
@@ -316,8 +316,45 @@ def test_tile_outside_the_region_is_not_answered(use_db):
     x, y = tile_xy(43.6532, -79.3832)
     assert offline.tile_ways(x, y) is None
     x, y = tile_xy(43.81, -79.98)
-    ways, base = offline.tile_ways(x, y)
-    assert ways and base == OSM_BASE
+    ways, base, complete = offline.tile_ways(x, y)
+    assert ways and base == OSM_BASE and complete
+
+
+def test_a_tile_on_the_region_edge_comes_at_once_and_whole_later(region, tmp_path, monkeypatch):
+    # A region whose east edge (-79.97) cuts through the Forks of the Credit roads.
+    folder = tmp_path / "edge"
+    folder.mkdir()
+    edge = "e\n1\n -80.05 43.25\n -79.97 43.25\n -79.97 43.9\n -80.05 43.9\nEND\nEND\n"
+    offline.build_db(region["osm"], folder / "edge.sqlite", region="edge", poly=edge)
+    monkeypatch.setenv(offline.ENV_OFFLINE_DIR, str(folder))
+    offline.configure(None)
+    tile = (14, *tile_xy(43.8300, -79.9700))
+    ways, _, complete = offline.tile_ways(tile[1], tile[2])
+    assert not complete
+    asked = []
+    done = threading.Event()
+
+    def post(query):
+        asked.append(query)
+        done.set()
+        return ROADS.read_bytes()
+
+    store = TileStore(tmp_path / "cache", post=post)
+    found, err = store.get([tile])
+    assert err is None and [w["id"] for w in found[tile].ways] == [w["id"] for w in ways]
+    assert done.wait(10) and len(asked) == 1  # the whole tile, in the background
+    for _ in range(200):
+        if store._fill_worker is None:
+            break
+        time.sleep(0.01)
+    full = store.cached(tile)
+    over = TileStore(tmp_path / "o", post=lambda q: ROADS.read_bytes(), use_region_db=False)
+    assert [w["id"] for w in full.ways] == [w["id"] for w in over.get([tile])[0][tile].ways]
+    assert full is not found[tile]  # the downloaded tile replaced the partial one
+    assert (tmp_path / "cache" / "tiles").exists()  # kept on disk: next time it's whole at once
+    # Queries reaching over the edge are not answered from the database.
+    assert offline.corridor(FORKS_PINS, 400.0) is None
+    assert offline.corridor(FORKS_PINS[:1], 400.0) is not None  # the first pin is well inside
 
 
 def test_a_replaced_database_is_reopened_and_a_broken_one_ignored(region, tmp_path, monkeypatch):

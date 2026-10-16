@@ -4,10 +4,11 @@ Tiles are standard slippy-map tiles ("14/x/y", Web Mercator). Each tile holds ev
 way that crosses it, whole (the same road classes as the router's corridor query), cached
 gzip'd on disk under `<cache_dir>/tiles/14/<x>/<y>.json.gz` and in memory. When the player
 has downloaded a region's roads (`driftmaps.geo.offline`, e.g. Ontario), tiles inside it come
-from that database (a few ms, never Overpass). A cached tile answers instantly; the tiles a
-request is missing are fetched in ONE Overpass query (the bbox of those tiles, or a union of
-their boxes when they are scattered). Requests for different tiles download side by side; one
-that needs a tile already being downloaded waits for it.
+from that database (a few ms, never Overpass); a tile straddling its edge is answered with the
+part inside at once and fetched whole from Overpass in the background. A cached tile answers
+instantly; the tiles a request is missing are fetched in ONE Overpass query (the bbox of those
+tiles, or a union of their boxes when they are scattered). Requests for different tiles
+download side by side; one that needs a tile already being downloaded waits for it.
 
 The same data serves `POST /api/route-path` (a route along an explicit node path, built from
 the tiles in memory) and lets `/api/route` skip Overpass when cached tiles cover its corridor.
@@ -223,6 +224,9 @@ class TileStore:
         # Tiles being downloaded right now -> set when that download is over. A request waits
         # for another's download of its tiles instead of asking again, and never for others.
         self._inflight: dict[Tile, threading.Event] = {}
+        # Tiles straddling a downloaded region's edge, still to fetch whole (`_fill_later`).
+        self._fill: set[Tile] = set()
+        self._fill_worker: threading.Thread | None = None
 
     # -- cache -------------------------------------------------------------------------------
 
@@ -244,9 +248,21 @@ class TileStore:
             if data is not None:
                 self._mem.move_to_end(tile)
                 return data
-        data = self._from_region(tile)
+        region = self._from_region(tile)
+        if region is not None and region[1]:
+            self._remember(tile, region[0])
+            return region[0]
+        data = self._from_disk(tile)
         if data is not None:
+            self._remember(tile, data)
             return data
+        if region is not None:  # straddles the region's edge: the inside now, all of it later
+            self._remember(tile, region[0])
+            self._fill_later(tile)
+            return region[0]
+        return None
+
+    def _from_disk(self, tile: Tile) -> _TileData | None:
         path = self._path(tile)
         try:
             data = _TileData.from_json(gzip.decompress(path.read_bytes()))
@@ -255,11 +271,11 @@ class TileStore:
         except (OSError, ValueError, KeyError, TypeError, EOFError) as exc:
             log.warning("ignoring a broken tile cache file %s: %s", path, exc)
             return None
-        self._remember(tile, data)
         return data
 
-    def _from_region(self, tile: Tile) -> _TileData | None:
-        """The tile from the downloaded region database (`geo.offline`), if one covers it."""
+    def _from_region(self, tile: Tile) -> tuple[_TileData, bool] | None:
+        """(the tile from the downloaded region database (`geo.offline`), complete) if one
+        holds any of it; `complete` is False for a tile straddling the region's edge."""
         if not self.use_region_db or tile[0] != TILE_ZOOM:
             return None
         try:
@@ -269,9 +285,36 @@ class TileStore:
             return None
         if found is None:
             return None
-        data = _TileData(*found)
-        self._remember(tile, data)
-        return data
+        ways, osm_base, complete = found
+        return _TileData(ways, osm_base), complete
+
+    def _fill_later(self, tile: Tile) -> None:
+        """Download a tile the region database holds only part of, in the background (one
+        worker, MAX_TILES per Overpass query); it replaces the partial tile when it arrives."""
+        with self._lock:
+            if tile in self._fill:
+                return
+            self._fill.add(tile)
+            if self._fill_worker is not None and self._fill_worker.is_alive():
+                return
+            self._fill_worker = threading.Thread(
+                target=self._fill_run, name="road-tiles-fill", daemon=True
+            )
+            self._fill_worker.start()
+
+    def _fill_run(self) -> None:
+        while True:
+            with self._lock:
+                todo = sorted(self._fill)[:MAX_TILES]
+                if not todo:
+                    self._fill_worker = None
+                    return
+            try:
+                self._download(todo)
+            except Exception as exc:  # noqa: BLE001 - the partial tiles stay; next time again
+                log.warning("background road tiles download failed: %s", exc)
+            with self._lock:
+                self._fill.difference_update(todo)
 
     def _save(self, tile: Tile, data: _TileData) -> None:
         self._remember(tile, data)
