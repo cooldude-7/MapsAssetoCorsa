@@ -262,6 +262,13 @@ def test_commercial_roofs_stay_flat_and_gables_keep_brick_proportions():
     plaza = _one(_fp("burlington:7", _rect(-10, 30, 20, 15), "burlington", tags=retail,
                      peak_m=7.5, eave_m=4.0))  # fmt: skip
     assert plaza.roof.shape != ROOF_FLAT  # a low building with a real pitched roof
+    # In town a wide untyped building whose peak is 11 m above its eave (a garage's stair
+    # tower) is flat, not a barn-like 11 m gable; in the country it keeps its big roof.
+    big = _fp("burlington:11", _rect(-20, 40, 40, 20), "burlington", tags={}, peak_m=18.0,
+              eave_m=7.0)  # fmt: skip
+    got = _place([big, *_subdivision()])["burlington:11"]
+    assert got.roof.shape == ROOF_FLAT and got.eave_h == pytest.approx(7.6)
+    assert _place([big])["burlington:11"].roof.shape != ROOF_FLAT
     # A 3 m gable end of a brick house is mapped 1:1 on the band's window-free end (u in the
     # last 12 m), not on the 0.75 m strip stretched 4x into wood grain.
     house = _one(_fp("burlington:10", _rect(-7, 30, 14, 8), "burlington", peak_m=8.0, eave_m=5.0))

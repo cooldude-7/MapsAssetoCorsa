@@ -363,6 +363,7 @@ _MAX_RISE_M = {"shed": 2.5, "garage": 3.5, "house": 6.0, "townhouse": 4.0, "barn
 _COMMERCIAL_PITCH_M = 2.5
 _TALL_EAVE_M = 9.0
 _PARAPET_M = 0.6
+_WIDE_HALF_M = 8.0  # a house or row this wide (16 m) with a too-high peak: flat (see _heights)
 # NRCan Land Cover 2020 classes (geometry.vegetation.sample_landcover).
 _LC_FARM = (10, 15, 16)  # temperate grassland (pasture, hay), cropland, barren
 _LC_URBAN = 17
@@ -841,6 +842,7 @@ def _styles(
 def _heights(
     fp: Footprint, cat: str, area: float, perimeter: float, half_width: float, aspect: float,
     lid: tuple[float, float] | None, eroded: float, o: BuildingOptions, seed: object,
+    town: bool = False,
 ) -> tuple[str, float, float, str, str]:  # fmt: skip
     """(height source, eave, rise, roof shape, category) by the module docstring's steps 4-5."""
     peak, eave_m, msrc = _measured(fp)
@@ -861,6 +863,15 @@ def _heights(
             and (peak - eave_m < _COMMERCIAL_PITCH_M or eave_m >= _TALL_EAVE_M)
         ):
             flat_top = True  # shops, offices, apartment towers: flat, the peak is equipment
+        elif (
+            town
+            and cat not in ("barn", "commercial")
+            and half_width >= _WIDE_HALF_M
+            and peak - eave_m > _MAX_RISE_M[cat]
+        ):
+            # A wide building whose peak stands higher above its eave than any roof of its kind
+            # rises (a parking garage's stair tower, a church spire): flat at the eave.
+            shape, flat_top = ROOF_FLAT, True
         elif shape == ROOF_FLAT and half_width * 2.0 >= o.min_pitched_width_m:
             shape = ROOF_GABLED
     if cat == "barn" and shape == ROOF_FLAT and area >= 400.0 and fp.kind not in _BARN_KINDS:
@@ -1284,7 +1295,7 @@ def place_buildings(
         )
         lid = (med, p90) if src_l == "lidar" and med is not None and p90 is not None else None
         src, eave, rise, shape, cat = _heights(
-            fp, cat, poly.area, poly.length, hw, hl / max(hw, 1e-9), lid, eroded[k], o, seed
+            fp, cat, poly.area, poly.length, hw, hl / max(hw, 1e-9), lid, eroded[k], o, seed, town
         )
         if town and cat == "house" and shape == ROOF_FLAT and poly.area >= 400.0:
             cat = "commercial"  # a big flat-roofed building in town: shops, offices, a school
