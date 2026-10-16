@@ -72,7 +72,9 @@ __all__ = [
     "RoutePolyline",
     "RouterOptions",
     "SnappedPin",
+    "Continuation",
     "route_alternatives",
+    "route_continuations",
     "route_from_path",
     "route_from_pins",
     "route_on_graph",
@@ -1087,3 +1089,140 @@ def route_from_path(
     if route.length_m <= 0.0:
         raise RouteError("the route has no length")
     return route
+
+
+# --------------------------------------------------------------------------------------------
+# Run-up and run-off on the real roads beyond A and B
+# --------------------------------------------------------------------------------------------
+
+# A continuation goes on as straight as it can, within this turn at a node; where nothing goes
+# on that straight (a T-junction) it turns onto the bigger road, up to CONTINUE_T_TURN_DEG.
+CONTINUE_MAX_TURN_DEG = 50.0
+CONTINUE_T_TURN_DEG = 100.0
+_NOT_THROUGH = frozenset({"driveway", "parking_aisle", "drive-through", "emergency_access"})
+
+
+@dataclass(frozen=True)
+class Continuation:
+    """The real road beyond one end of a route: `lonlat` (K, 2) starts at the route's end
+    point and runs away from it; `nodes` are the OSM nodes it passes, in order."""
+
+    lonlat: np.ndarray
+    nodes: tuple[int, ...]
+
+    @property
+    def length_m(self) -> float:
+        proj = LocalProjection(float(self.lonlat[0, 1]), float(self.lonlat[0, 0]))
+        xy = proj.to_xy(self.lonlat)
+        return float(np.linalg.norm(np.diff(xy, axis=0), axis=1).sum())
+
+
+def _through_road(tags: Mapping[str, str]) -> bool:
+    hw = tags.get("highway", "")
+    if hw not in _CLASS_RANK and not hw.endswith("_link"):
+        return False
+    return tags.get("area") != "yes" and tags.get("service", "") not in _NOT_THROUGH
+
+
+def route_continuations(
+    route: Route,
+    ways: Sequence,
+    before_m: float,
+    after_m: float,
+    *,
+    max_turn_deg: float = CONTINUE_MAX_TURN_DEG,
+) -> tuple[Continuation | None, Continuation | None]:
+    """The real roads behind A and beyond B, as far as `before_m` / `after_m` metres.
+
+    From each end the walk goes on along the OSM network (`ways`: anything with `id`,
+    `nodes`, `lonlat` and `tags`, e.g. `overpass.Way`): at every node it takes the straightest
+    way on, preferring the same way and then the same name, within `max_turn_deg`; at a
+    T-junction (nothing that straight) it turns onto the bigger road, up to
+    `CONTINUE_T_TURN_DEG`. Never onto the route itself or a driveway. It stops at a dead end
+    or once long enough. None where there is no road at all, and for a loop."""
+    if route.closed or not route.edges:
+        return None, None
+    proj = route.projection()
+    coords: dict[int, np.ndarray] = {}
+    nbrs: dict[int, list[tuple[int, int, str]]] = {}
+    for way in ways:
+        if not _through_road(way.tags):
+            continue
+        xy = proj.to_xy(np.asarray(way.lonlat, np.float64))
+        name = way.tags.get("name", "") or way.tags.get("ref", "")
+        for k, nid in enumerate(way.nodes):
+            coords.setdefault(int(nid), xy[k])
+        for a, b in zip(way.nodes[:-1], way.nodes[1:], strict=True):
+            if a != b:
+                nbrs.setdefault(int(a), []).append((int(b), int(way.id), name))
+                nbrs.setdefault(int(b), []).append((int(a), int(way.id), name))
+    ids = route.node_path()
+    on_route = set(ids)
+    names = {w: (t.get("name", "") or t.get("ref", "")) for w, t in route.ways.items()}
+    rank = {int(w.id): _class_rank(w.tags.get("highway", "")) for w in ways}
+    cos_max = math.cos(math.radians(max_turn_deg))
+    cos_turn = math.cos(math.radians(CONTINUE_T_TURN_DEG))
+
+    def walk(end: np.ndarray, prev: int, node: int, way: int, need: float) -> Continuation | None:
+        if node not in coords:
+            return None
+        pts, path = [end, coords[node]], [node]
+        length = float(np.linalg.norm(coords[node] - end))
+        name = names.get(way, "")
+        last = coords.get(prev, end)
+        seen = {prev, node}
+        while length < need:
+            here = coords[node]
+            d_in = here - last
+            if np.linalg.norm(d_in) < 1e-6:
+                d_in = here - end
+            d_in = d_in / max(float(np.linalg.norm(d_in)), 1e-9)
+            best = turn = None
+            for q, w, nm in nbrs.get(node, ()):
+                if q in seen or q in on_route or q not in coords:
+                    continue
+                d = coords[q] - here
+                dl = float(np.linalg.norm(d))
+                if dl < 1e-6:
+                    continue
+                cos = float(d_in @ d) / dl
+                if cos >= cos_max:
+                    score = (0 if w == way else 1 if (nm and nm == name) else 2, -cos)
+                    if best is None or score < best[0]:
+                        best = (score, q, w, nm)
+                elif cos >= cos_turn:  # a T-junction: turn onto the bigger road
+                    score = (-rank.get(w, 0), -cos, q)
+                    if turn is None or score < turn[0]:
+                        turn = (score, q, w, nm)
+            best = best if best is not None else turn
+            if best is None:
+                break
+            _, q, way, nm = best
+            name = nm or name
+            last, node = here, q
+            seen.add(q)
+            pts.append(coords[q])
+            path.append(q)
+            length += float(np.linalg.norm(coords[q] - here))
+        xy = np.asarray(pts)
+        seg = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+        keep = np.concatenate([[0], np.flatnonzero(seg > 1e-6) + 1])
+        xy = xy[keep]
+        s = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(xy, axis=0), axis=1))])
+        if len(xy) < 2 or s[-1] < 1.0:
+            return None
+        if s[-1] > need:  # cut at exactly `need` metres
+            k = int(np.searchsorted(s, need))
+            t = (need - s[k - 1]) / (s[k] - s[k - 1])
+            xy = np.vstack([xy[:k], xy[k - 1] + t * (xy[k] - xy[k - 1])])
+        return Continuation(proj.from_xy(xy), tuple(path))
+
+    first, last = route.edges[0], route.edges[-1]
+    xy = proj.to_xy(np.array([route.nodes[n] for n in ids], dtype=np.float64))
+    start = xy[0] + (xy[1] - xy[0]) * route.start_t
+    end = xy[-2] + (xy[-1] - xy[-2]) * route.end_t
+    on_route.discard(first.u)
+    on_route.discard(last.v)
+    before = walk(start, first.v, first.u, first.way, before_m) if before_m > 0 else None
+    after = walk(end, last.u, last.v, last.way, after_m) if after_m > 0 else None
+    return before, after
