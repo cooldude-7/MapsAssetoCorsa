@@ -47,7 +47,7 @@ Highway Traffic Act s.124 and OTM Book 12), the rest ASSUMED:
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -430,16 +430,22 @@ def plan_signals(
     junctions: Sequence[tuple[int, np.ndarray, Sequence[SignalApproach]]],
     signal_xz: np.ndarray,
     light_xz: np.ndarray,
+    nodes: Collection[int] = (),
 ) -> SignalPlan:
     """Poles for every signalised junction among `junctions` ((node, centre XZ, legs)):
     `signal_xz` are the OSM traffic signal nodes, `light_xz` Mapillary traffic lights (XZ).
     Route junctions within CLUSTER_M of each other (a divided road's two carriageways) are
-    one intersection, signalised when any of them is."""
+    one intersection, signalised when any of them is. `nodes` are route nodes known to be
+    signalised otherwise (the network's junction control, `RoadNetwork.junctions[].controls`:
+    mapped or inferred signals)."""
     plan = SignalPlan()
     centres = np.array([np.asarray(j[1], np.float64) for j in junctions]).reshape(-1, 2)
     for group in _clusters(centres):
         others = np.delete(centres, group, axis=0)
-        if not any(signalised(centres[i], signal_xz, light_xz, others) for i in group):
+        known = any(int(junctions[i][0]) in nodes for i in group)
+        if not known and not any(
+            signalised(centres[i], signal_xz, light_xz, others) for i in group
+        ):
             continue
         node, centre, legs = _merge([junctions[i] for i in group])
         poles, reach = plan_junction(node, centre, legs)

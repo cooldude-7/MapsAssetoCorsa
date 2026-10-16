@@ -197,6 +197,10 @@ def test_signalised_by_osm_node_or_mapillary_light():
                        90.0, "2023-06-01T00:00:00Z", "2023-06-01T00:00:00Z")  # fmt: skip
     plan, _ = _plan(nodes=(), mapillary=[light])
     assert len(plan.signals.junctions) == 1
+    # ... or by the network's junction control (mapped or inferred signals).
+    plan, _ = _plan(nodes=(), signal_nodes={2})
+    assert len(plan.signals.junctions) == 1 and plan.signals.nodes == {2}
+    assert not _plan(nodes=())[0].signals.junctions
 
 
 def test_t_junction_gets_poles_for_all_three_approaches():

@@ -69,7 +69,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -1084,12 +1084,15 @@ def plan_furniture(
     surface: DrivableSurface | None = None,
     options: FurnitureOptions | None = None,
     town_at: Callable[[np.ndarray], bool] | None = None,
+    signal_nodes: Collection[int] = (),
 ) -> FurniturePlan:
     """Every street item for the track (see the module notes), de-duplicated, with the pole
     wires and the route's markings. `coverage` is Mapillary's photo positions (N, 2) lon/lat
     (None: no photos, rules everywhere); `way_id` the OSM way per station (speed limits);
     `surface` the drivable surface items keep off (`geometry.clearance`; default: the route's
-    asphalt and shoulders); `town_at(xz)` True in a town (no rule-made chevrons there)."""
+    asphalt and shoulders); `town_at(xz)` True in a town (no rule-made chevrons there);
+    `signal_nodes` route nodes the network knows to be signalised (besides OSM signal nodes
+    and Mapillary traffic lights)."""
     o = options or FurnitureOptions()
     s_range = s_range or (float(model.s[0]), float(model.s[-1]))
     way_id = np.asarray(way_id if way_id is not None else np.zeros(0), np.int64)
@@ -1128,7 +1131,7 @@ def plan_furniture(
     pl.pole_lines()
     pl.street_lights(juncs, surf)
     pl.items = dedupe(pl.items, o.dedupe_m, pole_radius_m=o.pole_dedupe_m, sides=sides(pl.items))
-    _signals(pl, juncs, osm, list(mapillary), surf)
+    _signals(pl, juncs, osm, list(mapillary), surf, signal_nodes)
     stats += clear(first=False)  # what the pole lines put on a side road or junction
     pl.items = _attach_lights(pl.items)
     plan = pl.plan
@@ -1157,6 +1160,7 @@ SIGNAL_POLE_EDGE_M = 1.2  # signal poles stand at least this far off the drivabl
 def _signals(
     pl: _Planner, juncs: list[_Junction], osm, mapillary: Sequence,
     surface: DrivableSurface | None = None,
+    signal_nodes: Collection[int] = (),
 ) -> None:  # fmt: skip
     """Ontario signals on every approach of each signalised route junction
     (`geometry.signals`): corner poles (signal items, moved off the surface by the next
@@ -1174,7 +1178,7 @@ def _signals(
     lights = [f for f in mapillary if f.value.startswith(_TRAFFIC_LIGHT)]
     light_xz = (_xz_of(pl.proj, np.array([(f.lon, f.lat) for f in lights])) if lights
                 else np.zeros((0, 2)))  # fmt: skip
-    plan = plan_signals(pl.signal_junctions(juncs), sig_xz, light_xz)
+    plan = plan_signals(pl.signal_junctions(juncs), sig_xz, light_xz, signal_nodes)
     pl.plan.signals = plan
     if len(sig_xz):
         tree = cKDTree(sig_xz)

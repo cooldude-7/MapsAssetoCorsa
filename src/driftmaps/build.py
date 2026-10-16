@@ -1873,6 +1873,14 @@ def _short(e: Exception) -> str:
     return text[0][:160] if text else type(e).__name__
 
 
+def _signal_nodes(sc: _Scenery) -> set[int]:
+    """Route junctions the network controls with signals (`Junction.controls`)."""
+    if sc.network is None:
+        return set()
+    return {int(j.node) for j in sc.network.junctions
+            if any(c[-1] == "signal" for c in j.controls)}  # fmt: skip
+
+
 TOWN_RADIUS_M = 150.0  # a point with TOWN_BUILDINGS town buildings this close is in a town
 TOWN_BUILDINGS = 5
 
@@ -1942,6 +1950,7 @@ def _furniture(
         m, geo.projection, geo.route, ground, s_range=(geo.s_a, geo.s_b), way_id=geo.way_id,
         items=street_items, osm=osm, mapillary=mly, coverage=coverage, surface=surface,
         options=options.furniture_options, town_at=_town_at(sc),
+        signal_nodes=_signal_nodes(sc),
     )  # fmt: skip
     sc.furniture = plan
     names = street_names(plan.items, plan.signals)
