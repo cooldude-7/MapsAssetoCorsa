@@ -17,7 +17,10 @@ and the road markings tied to them (stop bars, crosswalks, arrows).
 4. Items other builders made (`items`, e.g. side-road stop signs, roundabout signs, mailboxes).
 
 `dedupe` merges items of the same kind within `dedupe_m` on the same side of the road, keeping
-the best source (`PRIORITY`).
+the best source (`PRIORITY`). `geometry.clearance` keeps every item off the drivable surface
+(the route and, with the network, side roads, junctions, roundabouts and driveways), drops
+signs in fields and stray Mapillary poles, and faces measured signs to their road's traffic:
+once before the pole lines and once after them (their gap-filling poles; wires follow).
 
 **Placement numbers** (ASSUMED unless a source is given; docs/research/signs.md when it lands):
 - Sign lateral offset: nearest plate edge 2.0 m beyond the edge of pavement (OTM Book 1b /
@@ -45,6 +48,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -61,6 +65,7 @@ from driftmaps.ac.furniture_textures import (
 )
 from driftmaps.geo.barriers import _project
 from driftmaps.geo.project import LocalProjection
+from driftmaps.geometry.clearance import CLEARANCE_M, DrivableSurface, clear_items
 from driftmaps.geometry.primitives import MeshData, merge, split
 from driftmaps.geometry.road import RoadModel
 from driftmaps.geometry.street_items import (
@@ -155,6 +160,9 @@ class FurniturePlan:
     covered_fraction: float = 0.0
     controls: list[dict] = field(default_factory=list)  # route approaches and their control
     driveways: list[tuple[float, float]] = field(default_factory=list)  # Mapillary (lon, lat)
+    # `geometry.clearance`: items moved off / dropped, signs re-faced, and what still stands
+    # on the drivable surface ("on_surface", "near_surface": within CLEARANCE_M; both 0)
+    clearance: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -927,11 +935,14 @@ def plan_furniture(
     osm=None,
     mapillary: Sequence = (),
     coverage: np.ndarray | None = None,
+    surface: DrivableSurface | None = None,
     options: FurnitureOptions | None = None,
 ) -> FurniturePlan:
     """Every street item for the track (see the module notes), de-duplicated, with the pole
     wires and the route's markings. `coverage` is Mapillary's photo positions (N, 2) lon/lat
-    (None: no photos, rules everywhere); `way_id` the OSM way per station (speed limits)."""
+    (None: no photos, rules everywhere); `way_id` the OSM way per station (speed limits);
+    `surface` the drivable surface items keep off (`geometry.clearance`; default: the route's
+    asphalt and shoulders)."""
     o = options or FurnitureOptions()
     s_range = s_range or (float(model.s[0]), float(model.s[-1]))
     way_id = np.asarray(way_id if way_id is not None else np.zeros(0), np.int64)
@@ -945,6 +956,19 @@ def plan_furniture(
     pl.chevrons()
     pl.items += list(items)
     frame = pl.frame
+    surf = surface if surface is not None else DrivableSurface.build(model)
+    lines = [_xz_of(projection, ln.lonlat) for ln in (osm.power_lines if osm is not None else ())]
+
+    def clear(first: bool) -> Counter:
+        res = clear_items(
+            pl.items, surf, ground, plate_width=lambda k: _plate_size(k, None)[0],
+            sign_gap_m=o.sign_edge_gap_m, pole_edge_m=POLE_EDGE_M, wires=pl.plan.wires,
+            max_span_m=1.8 * o.pole_span_m[1], power_lines=lines, first=first,
+        )  # fmt: skip
+        pl.items, pl.plan.wires = res.items, res.wires
+        return res.stats
+
+    stats = clear(first=True)  # signs in fields, poles on side roads, facings
 
     def sides(its: Sequence[StreetItem]) -> np.ndarray:
         if not its:
@@ -956,9 +980,11 @@ def plan_furniture(
     pl.items = dedupe(pl.items, o.dedupe_m, pole_radius_m=o.pole_dedupe_m, sides=sides(pl.items))
     pl.pole_lines()
     pl.items = dedupe(pl.items, o.dedupe_m, pole_radius_m=o.pole_dedupe_m, sides=sides(pl.items))
+    stats += clear(first=False)  # what the pole lines put on a side road or junction
     pl.items = _attach_lights(pl.items)
     plan = pl.plan
     plan.items = pl.items
+    plan.clearance = dict(sorted(stats.items())) | _on_surface(plan.items, surf)
     plan.markings = _dedupe_markings(pl.markings)
     for it in plan.items:
         kind = _dedupe_group(it.kind) if it.kind.startswith(SIGN_SPEED_LIMIT) else it.kind
@@ -970,6 +996,19 @@ def plan_furniture(
         plan.counts[key][mk.source] = plan.counts[key].get(mk.source, 0) + 1
     plan.osm_nodes = sorted(set(plan.osm_nodes))
     return plan
+
+
+def _on_surface(items: Sequence[StreetItem], surf: DrivableSurface) -> dict[str, int]:
+    """How many standing items (signs, poles, lights, signals, hydrants) are on the drivable
+    surface, and within `CLEARANCE_M` of it (mailboxes may stand at its edge)."""
+    its = [it for it in items if it.kind != MAILBOX and (_is_sign(it.kind) or it.kind in (
+        POLE_UTILITY, LIGHT_STREET, SIGNAL_TRAFFIC, HYDRANT))]  # fmt: skip
+    if not its:
+        return {"on_surface": 0, "near_surface": 0}
+    xz = np.array([(it.position[0], it.position[2]) for it in its])
+    d = surf.distance(xz)
+    near = int((d < CLEARANCE_M - 0.05).sum())  # 0.05: the distance queries' tolerance
+    return {"on_surface": int((d <= 0.0).sum()), "near_surface": near}
 
 
 def _attach_lights(items: list[StreetItem]) -> list[StreetItem]:

@@ -1,14 +1,17 @@
 """Street furniture (`geometry.furniture`, `ac.furniture_textures`): which items a route gets
 from Mapillary, OSM and the Ontario rules, de-duplication, pole lines and wires, the meshes and
-the markings. Synthetic roads in AC coordinates (X east, Z south); no network."""
+the markings, and keeping items off the drivable surface (`geometry.clearance`: side roads,
+roundabout aprons, signs in fields). Synthetic roads in AC coordinates (X east, Z south)."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import shapely
 
 from driftmaps.ac.furniture_textures import (
     ATLAS_SIZE,
@@ -18,17 +21,22 @@ from driftmaps.ac.furniture_textures import (
 )
 from driftmaps.geo.mapillary import MapFeature
 from driftmaps.geo.project import LocalProjection
-from driftmaps.geo.street_features import OsmNode, StreetFeatures
+from driftmaps.geo.street_features import OsmLine, OsmNode, StreetFeatures
 from driftmaps.geometry import furniture as fu
+from driftmaps.geometry.clearance import CLEARANCE_M, DrivableSurface, clear_items
 from driftmaps.geometry.primitives import merge
 from driftmaps.geometry.road import RoadModel
+from driftmaps.geometry.roundabouts import Roundabout
 from driftmaps.geometry.street_items import (
+    HYDRANT,
+    MAILBOX,
     POLE_UTILITY,
     SIGN_ALL_WAY,
     SIGN_CHEVRON_LEFT,
     SIGN_CHEVRON_RIGHT,
     SIGN_SPEED_LIMIT,
     SIGN_STOP,
+    SIGN_YIELD,
     StreetItem,
 )
 
@@ -315,3 +323,172 @@ def test_atlas_draws_the_faces():
     assert tex.data[:4] == b"DDS " and len(tex.data) < 800_000
     with pytest.raises(ValueError):
         furniture_atlas_texture("x.jpg")
+
+
+# --------------------------------------------------------------------------------------------
+# Clear of the drivable surface
+# --------------------------------------------------------------------------------------------
+
+# A side road south from the route (along +Z) at x = 360: 6 m wide, 0.5 m shoulders.
+SIDE_X = 360.0
+SIDE_XZ = np.array([[SIDE_X, 0.0], [SIDE_X, 150.0]])
+# A roundabout off the route's north side (no arms: only its ring, apron and island).
+RB = Roundabout((7,), frozenset(), np.array([700.0, -60.0]), radius=15.0)
+
+
+def _net(side: bool = True, roundabout: bool = False):
+    line = shapely.LineString(SIDE_XZ)
+    paved, foot, islands, rbs, sides = [], [], [], [], []
+    if side:
+        paved.append(line.buffer(3.0, cap_style="flat"))
+        foot.append(line.buffer(3.5, cap_style="flat"))
+        sides.append(SimpleNamespace(xz=SIDE_XZ, oneway=0))
+    if roundabout:
+        c = shapely.Point(RB.centre)
+        ring = c.buffer(RB.outer_r, quad_segs=32).difference(c.buffer(RB.inner_r, quad_segs=32))
+        disc = c.buffer(RB.inner_r, quad_segs=32)
+        paved += [ring, disc]
+        foot += [ring, disc]
+        islands.append(disc)
+        rbs.append(RB)
+    return SimpleNamespace(
+        side_roads=sides,
+        roundabouts=rbs,
+        islands=islands,
+        driveways=[],
+        paved=shapely.union_all(paved),
+        footprint=shapely.union_all(foot),
+    )
+
+
+def _surface(**kw) -> DrivableSurface:
+    return DrivableSurface.build(STRAIGHT, net=_net(**kw))
+
+
+def _plan_on(surface, **kw):
+    return _plan(surface=surface, **kw)
+
+
+def _xz(it: StreetItem) -> np.ndarray:
+    return np.array([it.position[0], it.position[2]])
+
+
+def _assert_clear(plan, surface: DrivableSurface) -> None:
+    for it in plan.items:
+        d = surface.distance(_xz(it))[0]
+        assert d > (0.0 if it.kind == MAILBOX else CLEARANCE_M - 0.05), (it, d)
+    assert plan.clearance["on_surface"] == 0 and plan.clearance["near_surface"] == 0
+
+
+def test_items_on_a_side_road_move_off_it():
+    surface = _surface()
+    pole = _feature("p", "object--support--utility-pole", SIDE_X + 1.0, 30.0)
+    stop = _feature("s", "regulatory--stop--g1", SIDE_X - 0.5, 25.0, heading=180.0)  # wrong way
+    hydrant = StreetItem(HYDRANT, (SIDE_X - 2.0, 0.0, 90.0), (1.0, 0.0), "osm")
+    plan = _plan_on(surface, mapillary=[pole, stop], items=[hydrant])
+    (p,) = [it for it in plan.items if it.ref == "mly:p"]
+    # beyond the side road's shoulder (3.5 m) by the pole offset, on its own side
+    assert p.position[0] == pytest.approx(SIDE_X + 3.5 + fu.POLE_EDGE_M, abs=0.3)
+    assert p.position[2] == pytest.approx(30.0, abs=0.01)
+    (s,) = [it for it in plan.items if it.ref == "mly:s"]
+    # west of the side road, plate edge 2 m past the pavement: on the right of the drivers
+    # coming south from the route, facing them (north)
+    w = fu._plate_size(SIGN_STOP, None)[0]
+    assert s.position[0] == pytest.approx(SIDE_X - 3.0 - 2.0 - w / 2, abs=0.3)
+    assert s.facing == pytest.approx((0.0, -1.0), abs=1e-6)
+    (h,) = [it for it in plan.items if it.kind == HYDRANT]
+    assert h.position[0] < SIDE_X - 3.5 - CLEARANCE_M
+    assert plan.clearance["moved:pole"] == 1 and plan.clearance["moved:sign"] == 1
+    _assert_clear(plan, surface)
+
+
+def test_signs_in_fields_and_stray_poles_are_dropped():
+    surface = _surface(side=False)
+    field_sign = _feature("f", "regulatory--yield--g1", 200.0, 40.0, heading=90.0)
+    road_sign = _feature("r", "regulatory--yield--g1", 250.0, 7.0, heading=90.0)
+    stray = _feature("x", "object--support--utility-pole", 100.0, 35.0)
+    on_line = _feature("l", "object--support--utility-pole", 150.0, 35.0)
+    line = OsmLine(1, np.array([_lonlat((120.0, 35.0)), _lonlat((1000.0, 35.0))]))
+    plan = _plan_on(surface, mapillary=[field_sign, road_sign, stray, on_line],
+                 osm=StreetFeatures(power_lines=(line,)))  # fmt: skip
+    refs = {it.ref for it in plan.items}
+    assert "mly:f" not in refs and "mly:x" not in refs
+    assert {"mly:r", "mly:l"} <= refs
+    (r,) = [it for it in plan.items if it.ref == "mly:r"]
+    # right of the eastbound drivers (+Z), facing them; Mapillary said the other way
+    assert r.kind == SIGN_YIELD and r.facing == pytest.approx((-1.0, 0.0), abs=1e-6)
+    assert plan.clearance["dropped_far:sign"] == 1 and plan.clearance["dropped_far:pole"] == 1
+    assert plan.clearance["flipped:sign"] == 1
+
+
+def test_a_pole_on_a_roundabout_apron_moves_out_or_goes():
+    surface = _surface(roundabout=True)
+    c = RB.centre
+    apron_r = (RB.inner_r + RB.island_r) / 2
+    pole = StreetItem(POLE_UTILITY, (c[0], 0.0, c[1] + apron_r), (0.0, 1.0), "mapillary")
+    # a rule sign on the island's very edge: into the island; one on a tiny island: dropped
+    edge = StreetItem(SIGN_YIELD, (c[0] + RB.island_r - 0.1, 0.0, c[1]), (1.0, 0.0), "rule")
+    res = clear_items([pole, edge], surface, ground, plate_width=lambda k: 0.75,
+                      sign_gap_m=2.0, pole_edge_m=fu.POLE_EDGE_M)  # fmt: skip
+    for it in res.items:
+        q = _xz(it)
+        assert surface.distance(q)[0] >= CLEARANCE_M - 0.05
+    poles = [it for it in res.items if it.kind == POLE_UTILITY]
+    assert len(poles) + res.stats["dropped_no_room:pole"] + res.stats["dropped_island:pole"] == 1
+    for p in poles:  # out of the ring, not on the island
+        assert np.linalg.norm(_xz(p) - c) > RB.outer_r + CLEARANCE_M
+    (s,) = [it for it in res.items if it.kind == SIGN_YIELD]
+    assert np.linalg.norm(_xz(s) - c) <= RB.island_r - CLEARANCE_M + 0.01
+    tiny = DrivableSurface(
+        shapely.box(-50, -50, 50, 50).difference(shapely.Point(0, 0).buffer(0.4)),
+        shapely.Polygon(),
+        [shapely.Point(0, 0).buffer(0.4)],
+        [],
+    )
+    lone = StreetItem(SIGN_YIELD, (0.2, 0.0, 0.0), (1.0, 0.0), "rule")
+    res = clear_items([lone], tiny, ground, plate_width=lambda k: 0.75, sign_gap_m=2.0,
+                      pole_edge_m=fu.POLE_EDGE_M)  # fmt: skip
+    assert res.items == [] and res.stats["dropped_island:sign"] == 1
+
+
+def test_wires_follow_poles_moved_off_a_side_road():
+    # The pole line's gap is filled with rule poles at x = 315 and 360: the one at 360 stands
+    # on the side road and moves off it; the wires stay on the poles.
+    surface = _surface()
+    xs = [0, 45, 90, 135, 180, 225, 270, 405, 450, 495, 540]
+    poles = [_feature(f"p{k}", "object--support--utility-pole", x, 9.0) for k, x in enumerate(xs)]
+    photos = np.array([_lonlat((x, 0.0)) for x in np.arange(0.0, 1001.0, 20.0)])
+    plan = _plan_on(surface, mapillary=poles, coverage=photos)
+    got = [it for it in plan.items if it.kind == POLE_UTILITY]
+    assert len(got) == len(xs) + 2
+    assert not any(abs(it.position[0] - SIDE_X) < 3.5 + CLEARANCE_M for it in got)
+    at = {(round(it.position[0], 2), round(it.position[2], 2)) for it in got}
+    assert len(plan.wires) == len(got) - 1
+    for a, b in plan.wires:
+        assert (round(a[0], 2), round(a[2], 2)) in at and (round(b[0], 2), round(b[2], 2)) in at
+    _assert_clear(plan, surface)
+
+
+def test_nothing_ends_up_on_the_surface():
+    surface = _surface(roundabout=True)
+    rng = np.random.default_rng(3)
+    values = ["object--support--utility-pole", "regulatory--stop--g1", "object--street-light",
+              "regulatory--maximum-speed-limit-60--g1", "object--fire-hydrant"]  # fmt: skip
+    feats = [
+        _feature(f"r{k}", values[k % len(values)], float(x), float(z), heading=float(h))
+        for k, (x, z, h) in enumerate(
+            zip(
+                rng.uniform(0, 1000, 150),
+                rng.uniform(-80, 40, 150),
+                rng.uniform(0, 360, 150),
+                strict=True,
+            )  # fmt: skip
+        )
+    ]
+    rule = [
+        StreetItem(SIGN_STOP, (SIDE_X + 1.0, 0.0, 20.0), (0.0, 1.0), "rule"),
+        StreetItem(MAILBOX, (SIDE_X - 3.2, 0.0, 70.0), (1.0, 0.0), "rule"),
+    ]
+    plan = _plan_on(surface, mapillary=feats, items=rule)
+    assert len(plan.items) > 20
+    _assert_clear(plan, surface)

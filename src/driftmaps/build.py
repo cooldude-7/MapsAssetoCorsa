@@ -47,7 +47,9 @@ Pipeline (PLAN §5.1-§5.5, docs/research/geo.md §1-§3, ac_format.md §2, §3,
      `mapillary_token`), OSM nodes and power lines, Ontario rules where Mapillary has no
      photos, and the route's junction control (`street_items.approach_stops`: stop signs and
      stop bars where the route stops), plus every `StreetItem` other stages added to
-     `street_items`; de-duplicated and merged per 250 m cell on one procedural atlas.
+     `street_items`; de-duplicated and merged per 250 m cell on one procedural atlas. Nothing
+     stands on the drivable surface (`geometry.clearance`: route, side roads, junctions,
+     roundabouts, driveways); signs in fields and stray Mapillary poles are dropped.
    - **Trees** (`geometry.vegetation`): lidar tree tops (DSM - DTM) with NRCan land cover
      kinds, trunks kept outside the hidden walls (a car can never drive through a tree) and off
      building footprints and poles; `scenery_density` scales the tree budget.
@@ -218,6 +220,7 @@ from driftmaps.geometry.buildings import (
     building_scene,
     place_buildings,
 )
+from driftmaps.geometry.clearance import DrivableSurface
 from driftmaps.geometry.furniture import (
     FurnitureMesh,
     FurnitureOptions,
@@ -1880,9 +1883,12 @@ def _furniture(
                 warnings.warn(f"Mapillary signs and poles unavailable ({_short(e)})", stacklevel=2)
             mly, coverage = [], None
     m = geo.model
+    surface = DrivableSurface.build(
+        m, oneway=geo.oneway, net=sc.network, driving_side=geo.driving_side
+    )
     plan = plan_furniture(
         m, geo.projection, geo.route, ground, s_range=(geo.s_a, geo.s_b), way_id=geo.way_id,
-        items=street_items, osm=osm, mapillary=mly, coverage=coverage,
+        items=street_items, osm=osm, mapillary=mly, coverage=coverage, surface=surface,
         options=options.furniture_options,
     )  # fmt: skip
     sc.furniture = plan
@@ -2063,6 +2069,7 @@ def _furniture_stats(sc: _Scenery) -> dict:
         "meshes": len(sc.furniture_meshes),
         "route_controls": [c for c in plan.controls if c["control"]],
         "mapillary_driveways": plan.driveways,
+        "clearance": plan.clearance,
     }
 
 
