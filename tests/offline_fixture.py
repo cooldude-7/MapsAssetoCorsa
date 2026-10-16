@@ -13,6 +13,10 @@ import json
 from pathlib import Path
 from xml.sax.saxutils import quoteattr
 
+import numpy as np
+
+from driftmaps.geo.project import LocalProjection
+
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "osm"
 ROADS = FIXTURES / "forks_of_the_credit.json"
 BUILDINGS = FIXTURES / "buildings_snake_rd.json"
@@ -29,8 +33,7 @@ POLY = f"""region
 END
 END
 """
-# Made-up roadside features near Mill St, Waterdown (43.3307, -79.8865): ids far above real ones.
-MILL_ST = (43.3307, -79.8865)
+# Made-up roadside features beside Mill St, Waterdown: ids far above real ones.
 LAKE_REL = 9_000_000_001
 OSM_BASE = "2026-10-15T13:51:13Z"
 
@@ -39,9 +42,29 @@ def _load(path: Path) -> list[dict]:
     return json.loads(path.read_text(encoding="utf-8"))["elements"]
 
 
-def _square(nid0: int, lat: float, lon: float, d: float) -> tuple[list[int], dict[int, tuple]]:
-    pts = [(lat - d, lon - d), (lat - d, lon + d), (lat + d, lon + d), (lat + d, lon - d)]
-    nodes = {nid0 + k: p for k, p in enumerate(pts)}
+def _mill_frame():
+    """(anchor (lat, lon), at(along_m, left_m) -> (lat, lon)) on Mill St's bridge way."""
+    g = next(el for el in _load(BARRIERS) if el["id"] == 24486613)["geometry"]
+    a, b = g[0], g[-1]
+    proj = LocalProjection((a["lat"] + b["lat"]) / 2, (a["lon"] + b["lon"]) / 2)
+    d = proj.to_xy([b["lon"], b["lat"]]) - proj.to_xy([a["lon"], a["lat"]])
+    t = d / np.hypot(*d)
+    left = np.array([-t[1], t[0]])
+
+    def at(along: float, side: float) -> tuple[float, float]:
+        lon, lat = proj.from_xy(t * along + left * side).tolist()
+        return round(lat, 7), round(lon, 7)
+
+    return at(0.0, 0.0), at
+
+
+MILL_ST, _at = _mill_frame()
+
+
+def _square(nid0: int, along: float, side: float, half: float) -> tuple[list[int], dict]:
+    pts = [(along - half, side - half), (along + half, side - half),
+           (along + half, side + half), (along - half, side + half)]  # fmt: skip
+    nodes = {nid0 + k: _at(*p) for k, p in enumerate(pts)}
     return [*nodes, nid0], nodes
 
 
@@ -56,27 +79,25 @@ def region_elements() -> tuple[dict[int, tuple[float, float]], list[dict], list[
             for nid, g in zip(el["nodes"], el["geometry"], strict=True):
                 nodes[nid] = (g["lat"], g["lon"])
             ways.append({"id": el["id"], "nodes": el["nodes"], "tags": el.get("tags", {})})
-    lat, lon = MILL_ST
     nid = 9_100_000_000
-    # A lake (multipolygon relation, untagged member ways) 20 m east of the road.
-    outer, pts = _square(nid, lat, lon + 0.0006, 0.0002)
+    # A lake (multipolygon relation, untagged member way) 20 m left of the road.
+    outer, pts = _square(nid, 0.0, 30.0, 10.0)
     nodes.update(pts)
     ways.append({"id": 9_200_000_001, "nodes": outer, "tags": {}})
-    # A pond way (natural=water) and a cliff, both closed; a river line; a driveway.
-    pond, pts = _square(nid + 10, lat + 0.0005, lon - 0.0004, 0.0001)
+    # A pond way (natural=water) and a cliff, both closed, ~20 m and ~15 m to the right.
+    pond, pts = _square(nid + 10, 40.0, -25.0, 5.0)
     nodes.update(pts)
     ways.append({"id": 9_200_000_002, "nodes": pond, "tags": {"natural": "water"}})
-    cliff, pts = _square(nid + 20, lat - 0.0005, lon - 0.0004, 0.0001)
+    cliff, pts = _square(nid + 20, -40.0, -20.0, 5.0)
     nodes.update(pts)
     ways.append({"id": 9_200_000_003, "nodes": cliff, "tags": {"natural": "cliff"}})
-    nodes[nid + 30] = (lat - 0.001, lon + 0.0003)
-    nodes[nid + 31] = (lat + 0.001, lon + 0.0003)
+    # A river crossing under the road and a driveway leaving it to the left.
+    nodes[nid + 30], nodes[nid + 31] = _at(60.0, -40.0), _at(60.0, 40.0)
     ways.append(
         {"id": 9_200_000_004, "nodes": [nid + 30, nid + 31],
          "tags": {"waterway": "river", "name": "Test Creek"}}
     )  # fmt: skip
-    nodes[nid + 40] = (lat, lon - 0.0001)
-    nodes[nid + 41] = (lat, lon - 0.0004)
+    nodes[nid + 40], nodes[nid + 41] = _at(-20.0, 4.0), _at(-20.0, 20.0)
     ways.append(
         {"id": 9_200_000_005, "nodes": [nid + 40, nid + 41],
          "tags": {"highway": "service", "service": "driveway"}}

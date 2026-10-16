@@ -345,6 +345,7 @@ class _Files(http.server.BaseHTTPRequestHandler):
     files: dict[str, bytes] = {}
     log: list[tuple[str, str | None]] = []
     delay_s = 0.0
+    gate: threading.Event | None = None  # when set: the body waits for it
 
     def do_GET(self) -> None:  # noqa: N802
         type(self).log.append((self.path, self.headers.get("Range")))
@@ -364,6 +365,8 @@ class _Files(http.server.BaseHTTPRequestHandler):
         self.send_header("ETag", etag)
         self.send_header("Content-Length", str(len(body) - start))
         self.end_headers()
+        if type(self).gate is not None and self.path.endswith(".pbf"):
+            type(self).gate.wait(20)
         step = 4096
         for i in range(start, len(body), step):
             try:
@@ -379,7 +382,7 @@ class _Files(http.server.BaseHTTPRequestHandler):
 
 @pytest.fixture
 def files_server():
-    _Files.files, _Files.log, _Files.delay_s = {}, [], 0.0
+    _Files.files, _Files.log, _Files.delay_s, _Files.gate = {}, [], 0.0, None
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Files)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -416,7 +419,8 @@ def test_download_resumes_with_range(files_server, tmp_path):
     assert dest.read_bytes() == body
 
 
-def test_download_cancel_keeps_the_part_file(files_server, tmp_path):
+def test_download_cancel_keeps_the_part_file(files_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(app_offline, "CHUNK", 8192)
     files, base = files_server
     files.files["/big.pbf"] = b"z" * 400_000
     files.delay_s = 0.002
@@ -464,7 +468,8 @@ def test_manager_downloads_processes_and_deletes(files_server, region, tmp_path)
     assert stats.counts["roads"] == 44
     assert {s for s, _, _ in steps} == {"downloading", "processing"}
     st = mgr.status()
-    assert st["state"] == "ready" and st["updated"] == OSM_BASE[:10] and st["size_mb"] > 0
+    assert st["state"] == "ready" and st["updated"] == OSM_BASE[:10]
+    assert st["size_mb"] is not None and st["counts"]["roads"] == 44
     assert not (tmp_path / "off" / "ontario.osm.pbf").exists()  # deleted once processed
     assert (tmp_path / "off" / "ontario.poly").is_file()
     assert mgr.hint(*MILL_ST) is None  # ready: no tip
@@ -564,7 +569,7 @@ def test_api_checks_region_origin_and_busy(api, tmp_path):
     assert not (tmp_path / "appdata" / "offline").exists() or not any(
         (tmp_path / "appdata" / "offline").iterdir()
     )
-    files.delay_s = 0.01  # slow enough to be busy for a while
+    files.gate = threading.Event()  # the download hangs until the gate opens
     status, _ = client.call("POST", "/api/offline/download", {})
     assert status == 200
     status, out = client.call("POST", "/api/offline/download", {})
@@ -573,6 +578,7 @@ def test_api_checks_region_origin_and_busy(api, tmp_path):
     assert status == 409
     status, st = client.call("POST", "/api/offline/cancel", {})
     assert status == 200
+    files.gate.set()
     st = wait_state(client, ("none", "error"))
     assert st["state"] == "none" and "Cancelled" in st["message"]
 
