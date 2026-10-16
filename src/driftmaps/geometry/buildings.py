@@ -1,38 +1,55 @@
-"""Buildings beside the road: footprints -> heights, roofs, textured KN5 meshes.
+"""Buildings beside the road: footprints -> heights, roofs, doors, textured KN5 meshes.
 
-Decisions: docs/research/scenery.md §3 and §7 ("Buildings", "Budgets"), geo.md §4.
+Decisions: docs/research/scenery.md §3 and §7 ("Buildings", "Budgets"), geo.md §4, and the
+builders' buildings.md (2026-10-16: sources, conflation, heights, typical Ontario sizes).
 
 **Placement** (`place_buildings`), in AC coordinates (X = east, Y = up, Z = south):
 
-1. Footprints (`geo.buildings.Footprint`, lon/lat) are projected to XZ, repaired, holes dropped
-   (drawn solid), and kept when `min_area_m2` <= area <= `max_area_m2`, within
-   `max_distance_m` (150 m) of the centreline, and clear of the road: a footprint that touches
-   the corridor polygon (road + verge, as the hidden walls use) grown by `clearance_m`, or that
-   comes within `clearance_m` of the road's drivable edge, is dropped (never clipped). At most
-   `max_buildings` (400) are kept, nearest the road first.
+1. Footprints (`geo.buildings.Footprint`, lon/lat, already conflated by
+   `geo.buildings.conflate`) are projected to XZ, repaired, holes dropped (drawn solid), and
+   kept when `min_area_m2` (10 m2: garages, sheds and barns count) <= area <= `max_area_m2`,
+   within `max_distance_m` (300 m) of the centreline, and clear of the road: a footprint that
+   touches the corridor polygon (road + verge, as the hidden walls use) grown by
+   `clearance_m`, or that comes within `clearance_m` of the road's drivable edge, is dropped
+   (never clipped).
 2. Ground: the built terrain (`ground(xz)`, not the raw DTM: cut/fill changed it) under the
    ring and a 3 m interior lattice. The walls start `sink_m` (0.5 m) below its LOWEST point;
    heights are measured from its median.
-3. Height, in order (the first that applies):
-   - **lidar** `canopy(xz)` = DSM - DTM (NRCan HRDEM, OGL-Canada) on a 1 m lattice inside the
-     footprint eroded by 1 m: when at least `min_lidar_samples` are valid and their median is
-     >= `min_lidar_height_m` (a lower median means the building is newer than the survey). The
-     median, clamped to `height_clamp` (3-30 m), is the roof's mean height; the spread
-     p90 - median gives the pitch (a gable sampled uniformly has median = eave + rise / 2 and
-     p90 = eave + 0.9 rise, so rise = 2.5 (p90 - median), corrected for the eroded lattice
-     seeing only the upper part of each slope; pitch capped at 45 degrees). On a small house or
-     shed (< 400 m2) a median above 12 m is tree canopy over the roof, not the roof: ignored.
+3. Category: house, garage, shed, barn or commercial, from the type (OSM `building`, the
+   municipal type) or, untyped, the size (buildings.md §5: sheds < 25 m2, garages < 70 m2,
+   barns >= 450 m2 unless flat).
+4. Heights, the first that applies (buildings.md §4):
+   - **measured**: municipal eave + peak (Burlington EAVEHGT / PEAKHGT, Milton): the roof
+     exactly; a municipal or NRCan lidar peak (`heightmax`, median +0.24 m against Burlington)
+     alone: the peak, the pitch as below.
+   - **lidar** DSM - DTM (NRCan HRDEM, OGL-Canada) on a 1 m lattice inside the footprint
+     eroded by 1 m: when at least `min_lidar_samples` are valid and their median is >=
+     `min_lidar_height_m`. The median and p90 give the ridge (a gable sampled uniformly has
+     median = eave + rise / 2, p90 = eave + 0.9 rise, corrected for the eroded lattice). On a
+     small house or shed (< 400 m2) a median above 12 m is tree canopy over the roof: ignored.
    - OSM `height` (roof top), then `building:levels` x `storey_m` (3 m, the eave), then the
-     Microsoft ML height (roof top), then `default_height_m` (6 m, roof top).
-4. Roof: OSM `roof:shape` when tagged (flat / gabled family / hipped family); else flat for
-   commercial / industrial kinds, footprints >= `flat_roof_area_m2` that are not barns, narrow
-   ones (< `min_pitched_width_m`), and lidar spreads < `flat_lidar_spread_m`; otherwise pitched:
-   hipped for near-square houses (some, deterministic), gabled for the rest. The ridge runs
-   along the long axis of the footprint's minimum rotated rectangle. Without lidar the pitch is
-   22-35 degrees (deterministic per building), rise capped at `max_roof_rise_m`.
-5. Look: wall and roof styles from `ac.building_textures` (siding / brick / stucco for houses,
-   red or grey boards and metal roofs for barns and sheds, block and membrane for commercial),
-   chosen by a hash of (seed, building id), so a rebuild gives the same street.
+     Microsoft ML height (the MEAN height over the footprint = mid-roof: median -0.15 m
+     against Burlington's mid-roof, -1.30 m against the peak), then a typical peak per
+     category (shed 3.2 m, garage 4 m, house 6 m, barn 8.5 m; rural Caledon / Burlington).
+   - **Pitch**, without a measured eave: from the lidar spread only when it is clearly steep
+     (>= `steep_pitch_deg`) or clearly low (<= `low_pitch_deg`); otherwise drawn (per
+     building, deterministic) from the measured Ontario distribution (Burlington, n = 12,000:
+     p10 14.8, median 22.5, p90 33.7 degrees); barns steeper, sheds lower.
+5. Roof: OSM `roof:shape` when tagged; flat for commercial kinds, a measured peak - eave <
+   0.6 m, big untyped footprints without lidar, narrow ones (< `min_pitched_width_m`) and
+   lidar spreads < `flat_lidar_spread_m`; otherwise pitched: hipped for some near-square
+   houses (deterministic), gabled for the rest. The ridge runs along the long axis of the
+   footprint's minimum rotated rectangle.
+6. Look: wall and roof styles from `ac.building_textures` by category (brick, vinyl siding and
+   stone houses with asphalt shingles; red / grey board or white steel barns with metal
+   roofs), chosen by a hash of (seed, building id), so a rebuild gives the same street; a
+   garage or shed next to a house usually matches it. The FRONT wall faces the nearest road
+   (`roads`, the route by default): houses get a front door there (and, if wide, an attached
+   garage's door at one end), garages their garage doors, barns a sliding or steel door,
+   sheds a door. House walls show whole windows, centred per wall; garage walls are blank.
+7. Budget: buildings in order of how far they are from the road, relative to their size (a
+   big barn 200 m away comes before a shed at 100 m), until `budget_bytes` of mesh
+   (44 B a vertex + 6 B a triangle in the KN5).
 
 **Meshes** (`building_meshes`, `building_scene`): the roof is a piecewise-planar height field
 over the minimum rotated rectangle (gable: 2 planes split by the ridge; hip: 2 trapezoids + 2
@@ -41,14 +58,16 @@ roof whose gable-end walls follow it. The footprint ring is noded where it cross
 crease and where its roof edge crosses a storey line; walls are cut at storey lines (every wall
 quad stays inside one atlas band, see `ac.building_textures`), roof pieces are triangulated
 with constrained Delaunay on the same ring vertices, so walls and roof meet exactly (the solid
-is closed apart from its open bottom; `floor=True` closes it too, for tests). Normals are flat
-and outward, winding CCW from outside, UVs never mirrored.
+is closed apart from its open bottom; `floor=True` closes it too, for tests). Doors are quads
+3 cm in front of their wall. Normals are flat and outward, winding CCW from outside, UVs never
+mirrored.
 
-Batched per `cell_m` (250 m) cell into visual-only meshes `buildings_<nnn>` (no digit prefix,
-no collision) with `lod_out_m`; one `ksPerPixel` material on one BC1 atlas, so a cell is one
-draw call. Buildings whose footprint is within `collide_within_m` (15 m) of the road's drivable
-edge also get hidden, double-sided collision walls `1WALL_bld_<nnn>` (ac_format.md §3.2), up to
-the eave.
+Batched per `cell_m` (250 m) cell into visual-only meshes (no digit prefix, no collision):
+`buildings_<nnn>` with `lod_out_m` (1200 m) and, for small buildings (< `detail_area_m2`,
+sheds and small garages), `buildings_s<nnn>` with `detail_lod_out_m` (400 m: they are a few
+pixels beyond). One `ksPerPixel` material on one BC1 atlas, so a batch is one draw call.
+Buildings whose footprint is within `collide_within_m` (15 m) of the road's drivable edge also
+get hidden, double-sided collision walls `1WALL_bld_<nnn>` (ac_format.md §3.2), up to the eave.
 
 `buildings_polygon` gives the footprints (buffered) for the tree builder's exclusion mask.
 """
@@ -70,9 +89,13 @@ from driftmaps.ac.building_textures import (
     ATLAS_SEED,
     ATLAS_SIZE,
     ATLAS_U_M,
+    DOORS,
     STOREY_M,
+    WINDOWED,
     band_v,
     building_atlas_texture,
+    door_uv,
+    wall_u_start,
 )
 from driftmaps.ac.model import Material, MaterialProperty, TextureMapping
 from driftmaps.geometry.primitives import (
@@ -91,6 +114,7 @@ if TYPE_CHECKING:
     from driftmaps.geometry.road import RoadModel
 
 __all__ = [
+    "CATEGORIES",
     "ROOF_FLAT",
     "ROOF_GABLED",
     "ROOF_HIPPED",
@@ -99,6 +123,7 @@ __all__ = [
     "BuildingOptions",
     "BuildingStats",
     "CanopyFn",
+    "Door",
     "GroundFn",
     "Roof",
     "building_material",
@@ -107,6 +132,8 @@ __all__ = [
     "buildings_polygon",
     "choose_height",
     "extrude_building",
+    "mesh_bytes",
+    "ontario_pitch",
     "place_buildings",
 ]
 
@@ -118,6 +145,7 @@ CanopyFn = Callable[[np.ndarray], np.ndarray]  # XZ (N, 2) -> DSM - DTM metres, 
 ROOF_FLAT = "flat"
 ROOF_GABLED = "gabled"
 ROOF_HIPPED = "hipped"
+CATEGORIES = ("house", "garage", "shed", "barn", "commercial")
 
 # OSM roof:shape values -> our three shapes.
 _ROOF_TAGS = {
@@ -133,40 +161,171 @@ _ROOF_TAGS = {
     "mansard": ROOF_HIPPED,
     "side_hipped": ROOF_HIPPED,
 }
-_FLAT_KINDS = frozenset({
-    "commercial", "industrial", "retail", "warehouse", "office", "school", "supermarket",
-    "hospital", "public", "civic", "government", "college", "university", "hotel",
-    "apartments", "parking", "service", "transportation", "train_station", "fire_station",
-    "sports_hall", "kindergarten", "manufacture", "storage_tank",
-})
-_FARM_KINDS = frozenset({
-    "barn", "farm_auxiliary", "stable", "cowshed", "sty", "silo", "greenhouse", "shed",
-    "hut", "garage", "garages", "carport", "boathouse", "outbuilding",
-})
-_SMALL_CAPPED_KINDS = frozenset({
-    "yes", "house", "detached", "residential", "semidetached_house", "bungalow", "cabin",
-    "garage", "garages", "carport", "shed", "hut", "outbuilding", "farm_auxiliary",
-})
-
-# (style, weight) tables; deterministic draws per building.
-_HOUSE_WALLS = (
-    ("siding_white", 18), ("siding_cream", 14), ("siding_grey", 14), ("siding_blue", 7),
-    ("brick_red", 18), ("brick_brown", 12), ("brick_buff", 9), ("stucco", 8),
+_FLAT_KINDS = frozenset(
+    {
+        "commercial",
+        "industrial",
+        "retail",
+        "warehouse",
+        "office",
+        "school",
+        "supermarket",
+        "hospital",
+        "public",
+        "civic",
+        "government",
+        "college",
+        "university",
+        "hotel",
+        "apartments",
+        "parking",
+        "service",
+        "transportation",
+        "train_station",
+        "fire_station",
+        "sports_hall",
+        "kindergarten",
+        "manufacture",
+        "storage_tank",
+    }
 )
-_HOUSE_ROOFS = (("shingle_charcoal", 60), ("shingle_brown", 30), ("metal_grey", 10))
-_BARN_WALLS = (("barn_red", 55), ("shed_wood", 45))
-_BARN_ROOFS = (("metal_grey", 60), ("metal_green", 25), ("shingle_charcoal", 15))
-_SHED_WALLS = (("shed_wood", 60), ("siding_white", 20), ("siding_grey", 20))
-_COMMERCIAL_WALLS = (("commercial", 60), ("brick_red", 20), ("brick_buff", 20))
+_BARN_KINDS = frozenset(
+    {
+        "barn",
+        "farm_auxiliary",
+        "stable",
+        "cowshed",
+        "sty",
+        "silo",
+        "greenhouse",
+        "riding_hall",
+    }
+)
+_GARAGE_KINDS = frozenset({"garage", "garages", "carport", "boathouse"})
+_SHED_KINDS = frozenset({"shed", "hut", "outbuilding", "kiosk"})
+_HOUSE_KINDS = frozenset(
+    {
+        "house",
+        "detached",
+        "residential",
+        "semidetached_house",
+        "bungalow",
+        "cabin",
+        "terrace",
+        "farm",
+        "church",
+        "chapel",
+        "static_caravan",
+        "dormitory",
+    }
+)
+_SMALL_CAPPED_KINDS = frozenset(
+    {
+        "yes",
+        "house",
+        "detached",
+        "residential",
+        "semidetached_house",
+        "bungalow",
+        "cabin",
+        "garage",
+        "garages",
+        "carport",
+        "shed",
+        "hut",
+        "outbuilding",
+        "farm_auxiliary",
+    }
+)
+
+# (style, weight) tables; deterministic draws per building. ASSUMED Ontario mixes.
+_HOUSE_WALLS = (
+    ("brick_red", 15),
+    ("brick_brown", 11),
+    ("brick_buff", 9),
+    ("brick_orange", 4),
+    ("brick_charcoal", 4),
+    ("stone", 4),
+    ("siding_white", 13),
+    ("siding_cream", 10),
+    ("siding_grey", 10),
+    ("siding_tan", 6),
+    ("siding_blue", 5),
+    ("siding_sage", 3),
+    ("siding_brown", 3),
+    ("board_white", 2),
+    ("stucco", 2),
+)
+_HOUSE_ROOFS = (
+    ("shingle_charcoal", 38),
+    ("shingle_grey", 22),
+    ("shingle_brown", 18),
+    ("shingle_black", 14),
+    ("metal_charcoal", 4),
+    ("metal_grey", 2),
+    ("metal_green", 2),
+)
+_BARN_WALLS = (
+    ("barn_red", 35),
+    ("barn_grey", 25),
+    ("steel_white", 25),
+    ("steel_red", 5),
+    ("shed_wood", 10),
+)
+_BARN_ROOFS = (
+    ("metal_grey", 45),
+    ("metal_charcoal", 16),
+    ("metal_green", 12),
+    ("metal_red", 12),
+    ("metal_blue", 5),
+    ("shingle_charcoal", 10),
+)
+_SHED_WALLS = (
+    ("shed_wood", 30),
+    ("siding_white", 15),
+    ("siding_grey", 15),
+    ("siding_cream", 10),
+    ("barn_red", 15),
+    ("steel_white", 15),
+)
+_SHED_ROOFS = (
+    ("shingle_charcoal", 40),
+    ("shingle_brown", 15),
+    ("shingle_grey", 15),
+    ("metal_grey", 20),
+    ("metal_green", 10),
+)
+_COMMERCIAL_WALLS = (("commercial", 60), ("brick_red", 15), ("brick_buff", 15),
+                     ("steel_white", 10))  # fmt: skip
+_DEFAULT_PEAK_M = {"shed": 3.2, "garage": 4.0, "house": 6.0, "barn": 8.5, "commercial": 6.0}
+_MIN_EAVE_M = {"shed": 2.0, "garage": 2.3, "house": 2.4, "barn": 3.0, "commercial": 3.0}
+_MAX_RISE_M = {"shed": 2.5, "garage": 3.5, "house": 6.0, "barn": 9.0, "commercial": 4.0}
+
+# Ontario roof pitch (degrees): quantiles of the implied pitch of Burlington's houses
+# (buildings.md §5: p10 14.8, median 22.5, p90 33.7), tails ASSUMED.
+_PITCH_QUANTILES = ((0.0, 10.0), (0.1, 14.8), (0.5, 22.5), (0.9, 33.7), (1.0, 42.0))
+
+
+def ontario_pitch(u: float, category: str = "house") -> float:
+    """Roof pitch in degrees for a uniform `u` in [0, 1): the measured Ontario distribution
+    for houses and garages; barns steeper (+6 degrees), sheds lower (x 0.8)."""
+    qs, ds = zip(*_PITCH_QUANTILES, strict=True)
+    p = float(np.interp(u, qs, ds))
+    if category == "barn":
+        return min(45.0, p + 6.0)
+    if category == "shed":
+        return p * 0.8
+    return p
 
 
 @dataclass(frozen=True)
 class BuildingOptions:
-    max_distance_m: float = 150.0  # from the centreline (scenery.md §7: footprints within 150 m)
+    max_distance_m: float = 300.0  # from the centreline: what is seen from the road
     clearance_m: float = 2.0  # kept clear of the corridor polygon / the drivable edge
-    min_area_m2: float = 9.0
+    min_area_m2: float = 10.0
     max_area_m2: float = 20_000.0
-    max_buildings: int = 400  # scenery.md §7 budget
+    max_buildings: int = 6000  # hard cap (nearest first); the byte budget usually binds first
+    budget_bytes: int = 5_000_000  # mesh bytes in the KN5 (44 B / vertex + 6 B / triangle)
     # Height (see module docstring).
     erode_m: float = 1.0
     sample_step_m: float = 1.0
@@ -174,12 +333,13 @@ class BuildingOptions:
     min_lidar_height_m: float = 2.0
     height_clamp: tuple[float, float] = (3.0, 30.0)
     storey_m: float = 3.0
-    default_height_m: float = 6.0
+    default_height_m: float = 6.0  # an untyped house's peak without any height source
     # Roof.
     flat_roof_area_m2: float = 600.0
     flat_lidar_spread_m: float = 0.5  # p90 - median below this -> flat (ASSUMED threshold)
     min_pitched_width_m: float = 3.5  # narrower minimum-rectangle -> flat
-    pitch_deg: tuple[float, float] = (22.0, 35.0)  # without lidar
+    steep_pitch_deg: float = 35.0  # lidar pitch at or above this is believed
+    low_pitch_deg: float = 10.0  # ... and at or below this
     max_roof_rise_m: float = 6.0
     max_pitch_deg: float = 45.0
     # Small houses / sheds (area < small_area_m2) whose lidar median exceeds this are under
@@ -188,12 +348,16 @@ class BuildingOptions:
     small_max_lidar_m: float = 12.0
     min_eave_m: float = 2.4
     hipped_share: float = 0.35  # share of near-square houses (aspect < 1.4) given a hip roof
+    attached_garage_share: float = 0.55  # wide houses with an attached garage door in front
+    doors: bool = True
     # Mesh.
     sink_m: float = 0.5
     collide_within_m: float = 15.0  # from the drivable edge; None-like: < 0 disables
     collide_extra_m: float = 0.5  # collision walls this much taller than the eave
     cell_m: float = 250.0
     lod_out_m: float = 1200.0
+    detail_area_m2: float = 40.0  # smaller buildings go to the short-range batches
+    detail_lod_out_m: float = 400.0
     cast_shadows: bool = True
     atlas_size: int = ATLAS_SIZE
 
@@ -296,8 +460,12 @@ class Roof:
             return [self._xz([(-hl - m, 0.0), (hl + m, 0.0)])]
         a = hl - hw
         e, w = a + hw + m, hw + m
-        out = [self._xz([(a, 0.0), (e, w)]), self._xz([(a, 0.0), (e, -w)]),
-               self._xz([(-a, 0.0), (-e, w)]), self._xz([(-a, 0.0), (-e, -w)])]
+        out = [
+            self._xz([(a, 0.0), (e, w)]),
+            self._xz([(a, 0.0), (e, -w)]),
+            self._xz([(-a, 0.0), (-e, w)]),
+            self._xz([(-a, 0.0), (-e, -w)]),
+        ]
         if a > 1e-9:
             out.append(self._xz([(-a, 0.0), (a, 0.0)]))
         return out
@@ -326,11 +494,32 @@ def _min_rect(poly: shapely.Polygon) -> tuple[np.ndarray, np.ndarray, np.ndarray
 # --------------------------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class Door:
+    """A door quad on wall `edge` of the ring: from XZ `a` to `b` (along the wall, in the
+    ring's direction), `y0` to `y0 + height`, textured with `DOORS[style]`."""
+
+    style: str
+    edge: int
+    a: np.ndarray
+    b: np.ndarray
+    y0: float
+    height: float
+
+    @property
+    def centre(self) -> np.ndarray:
+        return 0.5 * (self.a + self.b)
+
+
 @dataclass
 class Building:
     """One building ready to mesh. `ring` (K, 2) is the open XZ outline, clockwise in the
     (x, z) plane (so `left of each edge` is outside). Heights are metres above `ground_y`
-    (median terrain under the footprint); walls start at `base_y`."""
+    (median terrain under the footprint); walls start at `base_y`.
+
+    `front_edge` is the ring edge (i -> i + 1) facing the nearest road (None if unknown),
+    `doors` the door quads, `wall_u0` the atlas u start (metres) of each ring edge's wall
+    (None: continuous along the ring from `u_offset`)."""
 
     id: str
     source: str
@@ -346,6 +535,11 @@ class Building:
     road_distance_m: float = math.inf
     collide: bool = False
     u_offset: float = 0.0
+    category: str = "house"
+    front_edge: int | None = None
+    doors: tuple[Door, ...] = ()
+    wall_u0: tuple[float, ...] | None = None
+    mesh: MeshData | None = field(default=None, repr=False, compare=False)
 
     @property
     def polygon(self) -> shapely.Polygon:
@@ -372,6 +566,15 @@ class Building:
         c = self.polygon.centroid
         return np.array([c.x, c.y])
 
+    @property
+    def front_normal(self) -> np.ndarray | None:
+        """Outward unit XZ normal of the front wall."""
+        if self.front_edge is None:
+            return None
+        a, b = self.ring[self.front_edge], self.ring[(self.front_edge + 1) % len(self.ring)]
+        d = (b - a) / max(float(np.linalg.norm(b - a)), 1e-12)
+        return np.array([-d[1], d[0]])
+
 
 def choose_height(
     lidar: np.ndarray | None,
@@ -382,12 +585,13 @@ def choose_height(
     max_lidar_m: float | None = None,
     options: BuildingOptions | None = None,
 ) -> tuple[str, float, float | None, float | None]:
-    """(source, height, lidar median, lidar p90) by the rule in the module docstring.
+    """(source, height, lidar median, lidar p90) of the unmeasured sources, in order.
 
-    `height` is the roof's MEAN height for "lidar", the eave for "levels", the roof TOP for
-    "height", "microsoft" and "default". `lidar` holds DSM - DTM samples inside the footprint
-    (NaN = no data). A lidar median above `max_lidar_m` is taken for tree canopy over the roof
-    and ignored (`place_buildings` sets it for small houses and sheds)."""
+    `height` is the roof's MEAN height for "lidar" and "microsoft" (Microsoft's ML height is
+    the mean over the footprint: about mid-roof), the eave for "levels", the roof TOP for
+    "height" and "default". `lidar` holds DSM - DTM samples inside the footprint (NaN = no
+    data). A lidar median above `max_lidar_m` is taken for tree canopy over the roof and
+    ignored (`place_buildings` sets it for small houses and sheds)."""
     o = options or BuildingOptions()
     lo, hi = o.height_clamp
     if lidar is not None:
@@ -407,49 +611,166 @@ def choose_height(
     return "default", float(np.clip(o.default_height_m, lo, hi)), None, None
 
 
+def _category(fp: Footprint, area: float) -> str:
+    """house / garage / shed / barn / commercial (module docstring, step 3); a big untyped
+    footprint is a barn here and may become commercial once its roof is known to be flat."""
+    kind = fp.kind
+    if kind in _FLAT_KINDS:
+        return "commercial"
+    if kind in _BARN_KINDS:
+        return "barn"
+    if kind in _GARAGE_KINDS:
+        return "garage" if area < 150.0 else "barn"
+    if kind in _SHED_KINDS:
+        return "shed" if area < 30.0 else "garage"
+    if kind in _HOUSE_KINDS:
+        return "house"
+    if area < 25.0:
+        return "shed"
+    if area < 70.0:
+        return "garage"
+    if area >= 450.0:
+        return "barn"
+    return "house"
+
+
+def _measured(fp: Footprint) -> tuple[float | None, float | None, str]:
+    """(peak, eave, source label) measured for this footprint (municipal or NRCan lidar)."""
+    peak = fp.peak_m if fp.peak_m is not None and 1.8 <= fp.peak_m <= 80.0 else None
+    if peak is None:
+        return None, None, ""
+    eave = fp.eave_m if fp.eave_m is not None and 1.5 <= fp.eave_m <= peak else None
+    if eave is not None or not (fp.lidar or any(a.startswith("nrcan:") for a in fp.also)):
+        return peak, eave, fp.source
+    return peak, None, "nrcan"
+
+
 def _roof_shape(
-    fp: Footprint, area: float, half_width: float, aspect: float, spread: float | None,
-    o: BuildingOptions, seed: object,
-) -> str:
+    fp: Footprint, cat: str, area: float, half_width: float, aspect: float,
+    spread: float | None, o: BuildingOptions, seed: object,
+) -> str:  # fmt: skip
     tagged = _ROOF_TAGS.get((fp.roof_shape or "").strip().lower())
     if half_width * 2.0 < o.min_pitched_width_m:
         return ROOF_FLAT
     if tagged is not None:
         return tagged
-    kind = fp.kind
-    if kind in _FLAT_KINDS:
+    if cat == "commercial":
         return ROOF_FLAT
-    barn = kind in _FARM_KINDS
     if spread is not None and spread < o.flat_lidar_spread_m:
         return ROOF_FLAT
-    if area >= o.flat_roof_area_m2 and not barn and spread is None:
+    if area >= o.flat_roof_area_m2 and fp.kind not in _BARN_KINDS and spread is None:
         return ROOF_FLAT
-    if aspect < 1.4 and not barn and _u01(seed, fp.id, "hip") < o.hipped_share:
+    if aspect < 1.4 and cat == "house" and _u01(seed, fp.id, "hip") < o.hipped_share:
         return ROOF_HIPPED
     return ROOF_GABLED
 
 
-def _styles(fp: Footprint, area: float, roof: str, seed: object) -> tuple[str, str]:
-    kind = fp.kind
+def _styles(fp: Footprint, cat: str, area: float, roof: str, seed: object) -> tuple[str, str]:
     uw, ur = _u01(seed, fp.id, "wall"), _u01(seed, fp.id, "roofstyle")
-    if kind in _FLAT_KINDS or (roof == ROOF_FLAT and area >= 400.0):
-        walls = _COMMERCIAL_WALLS
-    elif kind in ("barn", "farm_auxiliary", "stable", "cowshed", "sty", "silo") or (
-        kind == "yes" and area >= 450.0
-    ):
-        walls = _BARN_WALLS
-    elif kind in _FARM_KINDS or area < 40.0:
-        walls = _SHED_WALLS
-    else:
-        walls = _HOUSE_WALLS
+    walls, roofs = {
+        "commercial": (_COMMERCIAL_WALLS, None),
+        "barn": (_BARN_WALLS, _BARN_ROOFS),
+        "shed": (_SHED_WALLS, _SHED_ROOFS),
+        "garage": (_HOUSE_WALLS, _HOUSE_ROOFS),
+        "house": (_HOUSE_WALLS, _HOUSE_ROOFS),
+    }[cat]
     wall_style = _pick(walls, uw)
     if roof == ROOF_FLAT:
         roof_style = "flat_membrane" if area >= 60.0 else "metal_grey"
-    elif walls is _BARN_WALLS:
-        roof_style = _pick(_BARN_ROOFS, ur)
+    elif cat == "barn" and wall_style.startswith("steel"):
+        roof_style = _pick([r for r in _BARN_ROOFS if r[0].startswith("metal")], ur)
     else:
-        roof_style = _pick(_HOUSE_ROOFS, ur)
+        roof_style = _pick(roofs or _HOUSE_ROOFS, ur)
     return wall_style, roof_style
+
+
+def _heights(
+    fp: Footprint, cat: str, area: float, perimeter: float, half_width: float, aspect: float,
+    lid: tuple[float, float] | None, eroded: float, o: BuildingOptions, seed: object,
+) -> tuple[str, float, float, str, str]:  # fmt: skip
+    """(height source, eave, rise, roof shape, category) by the module docstring's steps 4-5."""
+    peak, eave_m, msrc = _measured(fp)
+    spread = (lid[1] - lid[0]) if lid is not None else None
+    if peak is not None and spread is not None and area < 400.0:
+        # A house with a measured peak: only a clearly flat DSM makes its roof flat (a low
+        # gable, eroded, already looks flat to p90 - median < 0.5 m).
+        spread = spread if spread < 0.5 * o.flat_lidar_spread_m else None
+    shape = _roof_shape(fp, cat, area, half_width, aspect, None if eave_m is not None else spread,
+                        o, seed)  # fmt: skip
+    if peak is not None and eave_m is not None and peak - eave_m < 0.6:
+        shape = ROOF_FLAT
+    if cat == "barn" and shape == ROOF_FLAT and area >= 400.0 and fp.kind not in _BARN_KINDS:
+        cat = "commercial"
+    lo, hi = o.height_clamp
+    hi_cat = min(o.max_roof_rise_m, _MAX_RISE_M[cat]) if cat != "barn" else _MAX_RISE_M[cat]
+    cap = min(hi_cat, math.tan(math.radians(o.max_pitch_deg)) * half_width)
+    if shape == ROOF_FLAT:
+        if peak is not None:
+            return msrc, float(np.clip(peak, 2.0, hi)), 0.0, shape, cat
+        if lid is not None:
+            return "lidar", float(np.clip(lid[0], lo, hi)), 0.0, shape, cat
+    lidar_pitch = None
+    ridge_lidar = None
+    if lid is not None and shape != ROOF_FLAT:
+        med, p90 = lid
+        visible = 2.5 * (p90 - med)
+        span = max(0.3, (half_width - eroded - 0.5 * o.sample_step_m) / half_width)
+        rise_l = float(np.clip(visible / span, 0.3, max(0.8, cap)))
+        lidar_pitch = math.degrees(math.atan(rise_l / half_width))
+        ridge_lidar = (rise_l, med, span)
+    if shape == ROOF_FLAT:
+        rise = 0.0
+    elif peak is not None and eave_m is not None:
+        rise = min(peak - eave_m, cap)
+    else:
+        pitch = None
+        # Lidar pitch from a 1 m DSM is believed only when clearly steep, or clearly low
+        # without a measured peak (it underestimates the rise: buildings.md §4).
+        if lidar_pitch is not None and (
+            lidar_pitch >= o.steep_pitch_deg or (peak is None and lidar_pitch <= o.low_pitch_deg)
+        ):
+            pitch = min(lidar_pitch, o.max_pitch_deg)
+        if pitch is None:
+            pitch = ontario_pitch(_u01(seed, fp.id, "pitch"), cat)
+        # Wings, not the bounding rectangle, set the rise of an L- or T-shaped house.
+        wing = min(half_width, 2.0 * area / max(perimeter, 1e-9))
+        rise = math.tan(math.radians(pitch)) * wing
+        if peak is not None and pitch != lidar_pitch:
+            # Burlington (n = 675): eave = peak - this rise, kept within 0.30-0.45 of the peak,
+            # is off by |0.51| m (p50) / 1.61 m (p90); the bare pitch rule by 0.58 / 1.88 m.
+            rise = float(np.clip(rise, 0.30 * peak, 0.45 * peak))
+        rise = float(np.clip(rise, 0.8, max(0.8, cap)))
+    # Eave from the height source.
+    if peak is not None:
+        src, eave = msrc, peak - rise
+    elif ridge_lidar is not None:
+        _, med, span = ridge_lidar
+        ridge = min(med + 0.5 * rise * span, hi)  # median = eave + the seen half of the rise
+        src, eave = "lidar", ridge - rise
+    else:
+        src, h, _, _ = choose_height(None, tag_height=fp.height_m, levels=fp.levels,
+                                     ms_height=fp.ms_height_m, options=o)  # fmt: skip
+        if src == "default":
+            h = o.default_height_m if cat == "house" else _DEFAULT_PEAK_M[cat]
+            if cat == "barn" and area >= 800.0:
+                h = 9.7
+        if shape == ROOF_FLAT:
+            eave = h if src != "microsoft" else h
+        elif src == "levels":
+            eave = h
+        elif src == "microsoft":
+            eave = h - 0.5 * rise
+        else:
+            eave = h - rise
+    min_eave = min(o.min_eave_m, _MIN_EAVE_M[cat]) if cat in ("shed", "garage") else max(
+        o.min_eave_m, _MIN_EAVE_M[cat])  # fmt: skip
+    if eave < min_eave:
+        rise = max(0.0, rise - (min_eave - eave))
+        eave = min_eave
+        if rise < 0.5 and shape != ROOF_FLAT:
+            shape, rise = ROOF_FLAT, 0.0
+    eave = float(min(eave, hi))
+    return src, eave, float(rise), shape, cat
 
 
 def _to_polygon(fp: Footprint, projection: LocalProjection) -> shapely.Polygon | None:
@@ -486,6 +807,146 @@ def _road_frame(model: RoadModel) -> tuple[shapely.LineString, cKDTree, np.ndarr
     return shapely.LineString(xz), cKDTree(xz), model.outer
 
 
+# --------------------------------------------------------------------------------------------
+# Front walls, doors, window layout
+# --------------------------------------------------------------------------------------------
+
+
+def _front_edge(ring: np.ndarray, towards: np.ndarray) -> int:
+    """The ring edge whose outward normal best faces the unit XZ direction `towards`
+    (edges weighted by length up to 10 m, so a short bay does not win)."""
+    d = np.roll(ring, -1, axis=0) - ring
+    length = np.linalg.norm(d, axis=1)
+    nrm = np.stack([-d[:, 1], d[:, 0]], axis=1) / np.maximum(length, 1e-12)[:, None]
+    score = (nrm @ towards) * np.minimum(length, 10.0) + 1e-3 * length
+    score[length < 1.0] = -np.inf
+    return int(np.argmax(score))
+
+
+def _door_spans(
+    b: Building, length: float, o: BuildingOptions, seed: object
+) -> list[tuple[str, float, float, float]]:
+    """(door style, centre along the front wall in metres, width, height) for a building."""
+    u = _u01(seed, b.id, "doors")
+    out: list[tuple[str, float, float, float]] = []
+    cat = b.category
+    if cat == "house":
+        garage = None
+        if length >= 10.0 and b.area_m2 >= 110.0 and u < o.attached_garage_share:
+            double = length >= 13.0 and _u01(seed, b.id, "double") < 0.6
+            gs = ("garage2_" if double else "garage1_") + (
+                "white" if _u01(seed, b.id, "gcol") < 0.75 else "almond")  # fmt: skip
+            d = DOORS[gs]
+            left = _u01(seed, b.id, "gside") < 0.5
+            c = 0.8 + 0.5 * d.width_m if left else length - 0.8 - 0.5 * d.width_m
+            garage = (gs, c, d.width_m, d.height_m)
+            out.append(garage)
+        door = _pick((("door_white", 45), ("door_dark", 35), ("door_red", 20)),
+                     _u01(seed, b.id, "dcol"))  # fmt: skip
+        w = DOORS[door].width_m
+        if garage is not None:
+            g0, g1 = garage[1] - 0.5 * garage[2], garage[1] + 0.5 * garage[2]
+            free = (g1 + 1.0, length - 0.6) if g0 < length - g1 else (0.6, g0 - 1.0)
+        else:
+            free = (0.6, length - 0.6)
+        if free[1] - free[0] >= w:
+            mid = 0.5 * (free[0] + free[1])
+            jitter = (_u01(seed, b.id, "dpos") - 0.5) * 0.3 * (free[1] - free[0] - w)
+            out.append((door, mid + jitter, w, DOORS[door].height_m))
+    elif cat == "garage":
+        for name in ("garage2_white", "garage1_white"):
+            d = DOORS[name]
+            if length >= d.width_m + 0.8:
+                if _u01(seed, b.id, "gcol") >= 0.75:
+                    name = name.replace("white", "almond")
+                out.append((name, 0.5 * length, d.width_m, d.height_m))
+                break
+    elif cat == "barn":
+        name = "steel_door" if b.wall_style.startswith("steel") else "barn_door"
+        d = DOORS[name]
+        k = float(np.clip((b.eave_h - 0.4) / d.height_m, 0.8, 1.4))
+        if length >= d.width_m * k + 1.0:
+            out.append((name, 0.5 * length, d.width_m * k, d.height_m * k))
+    elif cat == "shed":
+        name = "door_white" if _u01(seed, b.id, "dcol") < 0.5 else "door_dark"
+        d = DOORS[name]
+        if length >= d.width_m + 0.4:
+            out.append((name, 0.5 * length, d.width_m, min(d.height_m, 2.1)))
+    return out
+
+
+def _place_doors(
+    buildings: Sequence[Building], ground: GroundFn, o: BuildingOptions, seed: object
+) -> None:
+    """Fill `doors` (and keep `front_edge`) for every building with a front wall."""
+    plans = []
+    for b in buildings:
+        if b.front_edge is None:
+            continue
+        i = b.front_edge
+        a, c = b.ring[i], b.ring[(i + 1) % len(b.ring)]
+        length = float(np.linalg.norm(c - a))
+        if length < 1.0:
+            continue
+        d = (c - a) / length
+        for style_name, mid, w, h in _door_spans(b, length, o, seed):
+            plans.append((b, i, a + d * (mid - 0.5 * w), a + d * (mid + 0.5 * w), style_name, h))
+    if not plans:
+        return
+    centres = np.array([0.5 * (p[2] + p[3]) for p in plans])
+    nrm = np.array([[-(p[3] - p[2])[1], (p[3] - p[2])[0]] for p in plans])
+    nrm /= np.maximum(np.linalg.norm(nrm, axis=1), 1e-12)[:, None]
+    g = np.asarray(ground(centres + 0.8 * nrm), np.float64)  # just outside the wall
+    doors: dict[str, list[Door]] = {}
+    for (b, i, pa, pb, style_name, h), gy in zip(plans, g, strict=True):
+        y0 = float(gy) if np.isfinite(gy) else b.ground_y
+        y0 = max(y0, b.base_y + 0.2)
+        if style_name.startswith("door_"):
+            y0 += 0.15  # a step up to the front door
+        h = min(h, b.eave_y - 0.15 - y0)
+        if h < 1.8:
+            continue
+        doors.setdefault(b.id, []).append(Door(style_name, i, pa, pb, y0, h))
+    for b in buildings:
+        b.doors = tuple(doors.get(b.id, ()))
+
+
+def _wall_starts(b: Building, seed: object) -> tuple[float, ...] | None:
+    """Per-edge atlas u start (metres): whole windows centred on house walls, blank walls on
+    garages and sheds in a windowed style; None (continuous) for the other bands."""
+    if b.wall_style not in WINDOWED:
+        return None
+    windows = b.category in ("house", "commercial")
+    ring = b.ring
+    seg = np.linalg.norm(np.roll(ring, -1, axis=0) - ring, axis=1)
+    return tuple(
+        round(wall_u_start(float(L), _u01(seed, b.id, "win", i), windows), 4)
+        for i, L in enumerate(seg)
+    )
+
+
+def _match_outbuildings(buildings: Sequence[Building], seed: object) -> None:
+    """Garages and sheds within 35 m of a house usually wear the house's colours."""
+    houses = [b for b in buildings if b.category == "house"]
+    if not houses:
+        return
+    tree = cKDTree(np.array([h.centroid for h in houses]))
+    for b in buildings:
+        if b.category not in ("garage", "shed"):
+            continue
+        d, j = tree.query(b.centroid)
+        if d <= 35.0 and _u01(seed, b.id, "match") < 0.75:
+            h = houses[int(j)]
+            b.wall_style = h.wall_style
+            if b.roof.shape != ROOF_FLAT:
+                b.roof_style = h.roof_style
+
+
+def mesh_bytes(mesh: MeshData) -> int:
+    """What a mesh costs in the KN5: 44 B per vertex + 6 B per triangle (uint16 indices)."""
+    return 44 * mesh.vertex_count + 6 * mesh.triangle_count
+
+
 def place_buildings(
     footprints: Sequence[Footprint],
     projection: LocalProjection,
@@ -496,13 +957,16 @@ def place_buildings(
     canopy: CanopyFn | None = None,
     options: BuildingOptions | None = None,
     seed: int | str = 0,
+    roads: Sequence[np.ndarray] | None = None,
 ) -> list[Building]:
-    """Turn footprints into `Building`s (module docstring, steps 1-5), sorted by id.
+    """Turn footprints into `Building`s (module docstring, steps 1-7), sorted by id.
 
     `corridor` is the road corridor polygon in XZ (e.g. `walls.corridor_polygon(model,
     model.outer + verge)`); footprints touching it (grown by `clearance_m`) are dropped.
     `canopy(xz)` returns lidar DSM - DTM heights (e.g. `vegetation.CanopySampler`); None or
-    NaN means no lidar, and the tag / default heights are used. `seed` should be the track id.
+    NaN means no lidar, and the measured / tag / default heights are used. `roads` are extra
+    XZ polylines (side roads) a front wall may face; the route always counts. `seed` should be
+    the track id. Each building's mesh is made here (for the byte budget) and kept in `mesh`.
     """
     o = options or BuildingOptions()
     if not footprints:
@@ -543,12 +1007,15 @@ def place_buildings(
     g_all = np.asarray(ground(np.concatenate(g_pts)), np.float64)
     g_owner_all = np.concatenate(g_owner)
 
-    # Lidar samples inside every eroded footprint, one batched call.
+    # Lidar samples inside every eroded footprint, one batched call (not needed when the
+    # footprint has measured heights).
     lidar: list[np.ndarray | None] = [None] * len(cand)
     eroded = np.zeros(len(cand))  # how far inside the outline the lidar was sampled
     if canopy is not None:
         c_pts, c_owner = [], []
-        for k, (_, _, poly) in enumerate(cand):
+        for k, (_, fp, poly) in enumerate(cand):
+            if _measured(fp)[1] is not None:  # eave and peak measured: nothing to learn
+                continue
             inner = poly.buffer(-o.erode_m)
             pts = _lattice(inner, o.sample_step_m)
             eroded[k] = o.erode_m
@@ -557,7 +1024,7 @@ def place_buildings(
                 eroded[k] = 0.0
             c_pts.append(pts)
             c_owner.append(np.full(len(pts), k))
-        pts_all = np.concatenate(c_pts)
+        pts_all = np.concatenate(c_pts) if c_pts else np.zeros((0, 2))
         chm = None
         if len(pts_all):
             try:
@@ -566,8 +1033,14 @@ def place_buildings(
                 log.warning("lidar building heights unavailable, using tags/defaults: %s", exc)
         if chm is not None:
             owner = np.concatenate(c_owner)
+            order = np.argsort(owner, kind="stable")
+            bounds = np.searchsorted(owner[order], np.arange(len(cand) + 1))
             for k in range(len(cand)):
-                lidar[k] = chm[owner == k]
+                if bounds[k + 1] > bounds[k]:
+                    lidar[k] = chm[order[bounds[k] : bounds[k + 1]]]
+
+    road_lines = [line] + [shapely.LineString(r) for r in (roads or []) if len(r) >= 2]
+    road_tree = shapely.STRtree(road_lines)
 
     out: list[Building] = []
     for k, (d_edge, fp, poly) in enumerate(cand):
@@ -577,55 +1050,29 @@ def place_buildings(
             continue
         ground_y, base_y = float(np.median(g)), float(g.min()) - o.sink_m
         centre, L, S, hl, hw = _min_rect(poly)
+        cat = _category(fp, poly.area)
         small = poly.area < o.small_area_m2 and fp.kind in _SMALL_CAPPED_KINDS
-        src, h, med, p90 = choose_height(
-            lidar[k], tag_height=fp.height_m, levels=fp.levels, ms_height=fp.ms_height_m,
-            max_lidar_m=o.small_max_lidar_m if small else None, options=o,
+        src_l, _, med, p90 = choose_height(
+            lidar[k], max_lidar_m=o.small_max_lidar_m if small else None, options=o
         )
-        spread = (p90 - med) if (med is not None and p90 is not None) else None
-        shape = _roof_shape(fp, poly.area, hw, hl / max(hw, 1e-9), spread, o, seed)
-        rise = 0.0
-        ridge = None
-        rise_cap = min(o.max_roof_rise_m, math.tan(math.radians(o.max_pitch_deg)) * hw)
-        if shape != ROOF_FLAT:
-            if spread is not None:
-                # Uniform slope samples: p90 - median = 0.4 x the rise they span. The eroded
-                # lattice (cell centres) only spans the upper (hw - erode - step / 2) / hw of
-                # each slope, so scale up.
-                # Pitch capped at `max_pitch_deg` (overhanging trees inflate p90).
-                visible = 2.5 * spread
-                span = max(0.3, (hw - eroded[k] - 0.5 * o.sample_step_m) / hw)
-                rise = float(np.clip(visible / span, 0.8, max(0.8, rise_cap)))
-                visible = min(visible, rise * span)
-                ridge = min(med + 0.5 * visible, o.height_clamp[1])
-            else:
-                lo_p, hi_p = o.pitch_deg
-                pitch = lo_p + (hi_p - lo_p) * _u01(seed, fp.id, "pitch")
-                rise = math.tan(math.radians(pitch)) * hw
-            rise = float(np.clip(rise, 0.8, max(0.8, rise_cap)))
-        # Eave from the chosen height (see choose_height for what `h` means per source).
-        if shape == ROOF_FLAT:
-            eave = h
-        elif src == "lidar":
-            eave = (ridge if ridge is not None else h + 0.5 * rise) - rise
-        elif src == "levels":
-            eave = h
-        else:
-            eave = h - rise
-        if eave < o.min_eave_m:
-            rise = max(0.0, rise - (o.min_eave_m - eave))
-            eave = o.min_eave_m
-            if rise < 0.5:
-                shape, rise = ROOF_FLAT, 0.0
-        eave = min(eave, o.height_clamp[1])
-        wall_style, roof_style = _styles(fp, poly.area, shape, seed)
+        lid = (med, p90) if src_l == "lidar" and med is not None and p90 is not None else None
+        src, eave, rise, shape, cat = _heights(
+            fp, cat, poly.area, poly.length, hw, hl / max(hw, 1e-9), lid, eroded[k], o, seed
+        )
+        wall_style, roof_style = _styles(fp, cat, poly.area, shape, seed)
         roof = Roof(shape, centre, L, S, hl, hw, rise if shape != ROOF_FLAT else 0.0)
+        ring = np.asarray(poly.exterior.coords)[:-1].copy()
+        cpt = poly.centroid
+        nearest = road_lines[int(road_tree.nearest(cpt))]
+        q = np.asarray(shapely.shortest_line(cpt, nearest).coords)
+        towards = q[1] - q[0]
+        nt = float(np.linalg.norm(towards))
         out.append(
             Building(
                 id=fp.id,
                 source=fp.source,
                 kind=fp.kind,
-                ring=np.asarray(poly.exterior.coords)[:-1].copy(),
+                ring=ring,
                 roof=roof,
                 eave_h=float(eave),
                 ground_y=ground_y,
@@ -636,9 +1083,33 @@ def place_buildings(
                 road_distance_m=float(d_edge),
                 collide=o.collide_within_m >= 0 and d_edge <= o.collide_within_m,
                 u_offset=round(_u01(seed, fp.id, "u") * ATLAS_U_M, 3),
+                category=cat,
+                front_edge=_front_edge(ring, towards / nt) if nt > 1e-6 else None,
             )
         )
-    return sorted(out, key=lambda b: b.id)
+    _match_outbuildings(out, seed)
+    for b in out:
+        b.wall_u0 = _wall_starts(b, seed)
+    if o.doors:
+        _place_doors(out, ground, o, seed)
+
+    # Byte budget: nearest the road relative to size first.
+    def priority(b: Building) -> tuple[float, str]:
+        return b.road_distance_m / math.sqrt(np.clip(b.area_m2, 15.0, 1500.0) / 150.0), b.id
+
+    kept: list[Building] = []
+    used = 0
+    for b in sorted(out, key=priority):
+        m = extrude_building(b, storey_m=o.storey_m, sink_m=o.sink_m, atlas_size=o.atlas_size)
+        cost = mesh_bytes(m)
+        if used + cost > o.budget_bytes:
+            log.info("building budget: %d of %d buildings (%.1f MB)", len(kept), len(out),
+                     used / 1e6)  # fmt: skip
+            break
+        b.mesh = m
+        used += cost
+        kept.append(b)
+    return sorted(kept, key=lambda b: b.id)
 
 
 def buildings_polygon(buildings: Sequence[Building], buffer_m: float = 2.0) -> shapely.Geometry:
@@ -740,12 +1211,31 @@ def _dedupe_loop(poly: list[tuple[float, float]], tol: float = 1e-9) -> list[tup
     return out
 
 
+def _ring_u(b: Building, ring: np.ndarray) -> np.ndarray:
+    """Atlas u (metres) at each vertex of the noded `ring`, for the wall that starts there:
+    continuous along the ring from `u_offset`, or, with `wall_u0`, each original edge's own
+    start plus the distance along that edge (so its windows stay centred)."""
+    seg = np.linalg.norm(np.roll(ring, -1, axis=0) - ring, axis=1)
+    if b.wall_u0 is None or len(b.wall_u0) != len(b.ring):
+        return np.concatenate([[0.0], np.cumsum(seg)[:-1]]) + b.u_offset
+    out = np.empty(len(ring))
+    j = -1
+    n0 = len(b.ring)
+    for k, p in enumerate(ring):
+        nxt = b.ring[(j + 1) % n0]
+        if j < n0 - 1 and abs(p[0] - nxt[0]) + abs(p[1] - nxt[1]) < 1e-9:
+            j += 1
+        jj = max(j, 0)
+        out[k] = b.wall_u0[jj] + float(np.linalg.norm(p - b.ring[jj]))
+    return out
+
+
 def _walls(b: Building, ring: np.ndarray, rows: np.ndarray, size: int) -> MeshData:
     v_top, v_bot = band_v(b.wall_style, size)
     top = b.eave_y + b.roof.height(ring)
     n = len(ring)
     seg = np.linalg.norm(np.roll(ring, -1, axis=0) - ring, axis=1)
-    s0 = np.concatenate([[0.0], np.cumsum(seg)[:-1]]) + b.u_offset
+    s0 = _ring_u(b, ring)
     pos, nrm, uvs, idx = [], [], [], []
     count = 0
     for i in range(n):
@@ -778,8 +1268,11 @@ def _walls(b: Building, ring: np.ndarray, rows: np.ndarray, size: int) -> MeshDa
     if not pos:
         return _empty()
     return MeshData(
-        np.concatenate(pos), np.concatenate(nrm), np.concatenate(uvs),
-        np.tile([1.0, 0.0, 0.0], (count, 1)), np.asarray(idx, np.int64).reshape(-1),
+        np.concatenate(pos),
+        np.concatenate(nrm),
+        np.concatenate(uvs),
+        np.tile([1.0, 0.0, 0.0], (count, 1)),
+        np.asarray(idx, np.int64).reshape(-1),
     )
 
 
@@ -837,7 +1330,10 @@ def _planar_piece(
     uniq, first, inv = np.unique(key, axis=0, return_index=True, return_inverse=True)
     n = len(uniq)
     return MeshData(
-        flat_p[first], np.tile(normal, (n, 1)), flat_uv[first], np.tile([1.0, 0.0, 0.0], (n, 1)),
+        flat_p[first],
+        np.tile(normal, (n, 1)),
+        flat_uv[first],
+        np.tile([1.0, 0.0, 0.0], (n, 1)),
         inv.reshape(-1),
     )
 
@@ -873,13 +1369,47 @@ def _roof(b: Building, ring: np.ndarray, size: int, margin: float) -> list[MeshD
         else:
             rel = tris - b.roof.centre
             u = (rel @ b.roof.long_axis + b.u_offset) / ATLAS_U_M
-            frac = np.clip(0.5 + (rel @ b.roof.short_axis) / (2 * b.roof.half_width + 1e-9),
-                           0.0, 1.0)
+            frac = np.clip(
+                0.5 + (rel @ b.roof.short_axis) / (2 * b.roof.half_width + 1e-9), 0.0, 1.0
+            )
         v = v_top + frac * (v_bot - v_top)
         normal = np.array([-grad[0], 1.0, -grad[1]])
         normal /= np.linalg.norm(normal)
         out.append(_planar_piece(tris, y, normal, u, v, up=True))
     return out
+
+
+def _door_quads(b: Building, size: int, offset_m: float = 0.03) -> MeshData:
+    """The doors: one quad each, `offset_m` in front of its wall, facing out."""
+    if not b.doors:
+        return _empty()
+    pos, nrm, uvs, idx = [], [], [], []
+    for d in b.doors:
+        along = d.b - d.a
+        length = float(np.linalg.norm(along))
+        if length < 1e-6:
+            continue
+        t = along / length
+        n2 = np.array([-t[1], t[0]])
+        a = d.a + offset_m * n2
+        c = d.b + offset_m * n2
+        y0, y1 = d.y0, d.y0 + d.height
+        pos.append([[a[0], y0, a[1]], [c[0], y0, c[1]], [c[0], y1, c[1]], [a[0], y1, a[1]]])
+        nrm.append(np.tile([n2[0], 0.0, n2[1]], (4, 1)))
+        u0, u1, v_top, v_bot = door_uv(d.style, size)
+        uvs.append([[u0, v_bot], [u1, v_bot], [u1, v_top], [u0, v_top]])
+        base = 4 * len(idx) // 6
+        idx.extend([base, base + 1, base + 2, base, base + 2, base + 3])
+    if not pos:
+        return _empty()
+    count = 4 * len(pos)
+    return MeshData(
+        np.asarray(pos, np.float64).reshape(-1, 3),
+        np.concatenate(nrm),
+        np.asarray(uvs, np.float64).reshape(-1, 2),
+        np.tile([1.0, 0.0, 0.0], (count, 1)),
+        np.asarray(idx, np.int64),
+    )
 
 
 def extrude_building(
@@ -889,13 +1419,17 @@ def extrude_building(
     sink_m: float = 0.5,
     floor: bool = False,
     atlas_size: int = ATLAS_SIZE,
+    doors: bool = True,
 ) -> MeshData:
-    """The building's visual mesh: walls (cut at storey lines) + roof (+ a floor at `base_y`
-    with `floor=True`, which makes the solid closed). Flat outward normals, tangents along u."""
+    """The building's visual mesh: walls (cut at storey lines) + roof + door quads (+ a floor
+    at `base_y` with `floor=True`, which makes the solid closed). Flat outward normals,
+    tangents along u."""
     margin = 1.0
     rows = _wall_rows(b, storey_m, sink_m)
     ring = _noded_ring(b, np.unique(rows[:, :2]), margin)
     parts = [_walls(b, ring, rows, atlas_size), *_roof(b, ring, atlas_size, margin)]
+    if doors:
+        parts.append(_door_quads(b, atlas_size))
     if floor:
         tris = _triangles(shapely.Polygon(ring))
         if len(tris):
@@ -948,8 +1482,12 @@ class BuildingStats:
     vertices: int = 0
     triangles: int = 0
     texture_bytes: int = 0
+    mesh_bytes: int = 0
+    doors: int = 0
     by_height_source: dict[str, int] = field(default_factory=dict)
     by_roof: dict[str, int] = field(default_factory=dict)
+    by_category: dict[str, int] = field(default_factory=dict)
+    by_source: dict[str, int] = field(default_factory=dict)
 
 
 def building_material(name: str = "dm_buildings", texture_name: str = "dm_buildings.dds"):
@@ -972,9 +1510,11 @@ def building_material(name: str = "dm_buildings", texture_name: str = "dm_buildi
 def building_meshes(
     buildings: Sequence[Building], *, options: BuildingOptions | None = None
 ) -> list[BuildingMesh]:
-    """Batch the buildings per `cell_m` cell: `buildings_<nnn>` (visual, `lod_out_m`) and, for
+    """Batch the buildings per `cell_m` cell: `buildings_<nnn>` (visual, `lod_out_m`),
+    `buildings_s<nnn>` for the small ones (< `detail_area_m2`, `detail_lod_out_m`) and, for
     buildings with `collide`, hidden `1WALL_bld_<nnn>` walls. Cells are numbered in sorted
-    order; `_<p>` suffixes appear when a cell needs several meshes (> 65,535 vertices)."""
+    order; `_<p>` suffixes appear when a batch needs several meshes (> 65,535 vertices). A
+    building's `mesh` (from `place_buildings`) is used when present."""
     o = options or BuildingOptions()
     if not buildings:
         return []
@@ -983,19 +1523,27 @@ def building_meshes(
         key = tuple(int(v) for v in np.floor(b.centroid / o.cell_m))
         cells.setdefault(key, []).append(b)
     out: list[BuildingMesh] = []
-    visual_flags: MeshFlags = {"lod_out": o.lod_out_m, "cast_shadows": o.cast_shadows}
     hidden: MeshFlags = {"is_renderable": False, "cast_shadows": False}
     for ci, key in enumerate(sorted(cells)):
         members = sorted(cells[key], key=lambda b: b.id)
-        parts = [extrude_building(b, storey_m=o.storey_m, sink_m=o.sink_m,
-                                  atlas_size=o.atlas_size)
-                 for b in members]
-        parts = [p for p in parts if p.vertex_count]
-        if parts:
+        groups = (
+            ("", [b for b in members if b.area_m2 >= o.detail_area_m2], o.lod_out_m),
+            ("s", [b for b in members if b.area_m2 < o.detail_area_m2], o.detail_lod_out_m),
+        )
+        for tag, group, lod in groups:
+            parts = [
+                b.mesh if b.mesh is not None else extrude_building(
+                    b, storey_m=o.storey_m, sink_m=o.sink_m, atlas_size=o.atlas_size)
+                for b in group
+            ]  # fmt: skip
+            parts = [p for p in parts if p.vertex_count]
+            if not parts:
+                continue
             pieces = split(merge(parts))
+            flags: MeshFlags = {"lod_out": lod, "cast_shadows": o.cast_shadows}
             for p, piece in enumerate(pieces):
-                name = f"buildings_{ci:03d}" + (f"_{p}" if len(pieces) > 1 else "")
-                out.append(BuildingMesh(name, piece, len(members), False, dict(visual_flags)))
+                name = f"buildings_{tag}{ci:03d}" + (f"_{p}" if len(pieces) > 1 else "")
+                out.append(BuildingMesh(name, piece, len(group), False, dict(flags)))
         walls_ = [w for b in members if b.collide and (w := _collision(b, o.collide_extra_m))]
         if walls_:
             pieces = split(merge(walls_))
@@ -1033,10 +1581,19 @@ def building_scene(
         stats.meshes += 1
         stats.vertices += m.data.vertex_count
         stats.triangles += m.data.triangle_count
+        if not m.collision:
+            stats.mesh_bytes += mesh_bytes(m.data)
     stats.buildings = len(buildings)
     stats.colliding = sum(b.collide for b in buildings)
+    stats.doors = sum(len(b.doors) for b in buildings)
+
+    def count(d: dict[str, int], k: str) -> None:
+        d[k] = d.get(k, 0) + 1
+
     for b in buildings:
-        stats.by_height_source[b.height_source] = stats.by_height_source.get(b.height_source, 0) + 1
-        stats.by_roof[b.roof.shape] = stats.by_roof.get(b.roof.shape, 0) + 1
+        count(stats.by_height_source, b.height_source)
+        count(stats.by_roof, b.roof.shape)
+        count(stats.by_category, b.category)
+        count(stats.by_source, b.source)
     stats.texture_bytes = len(scene.textures[tex_name].data)
     return stats

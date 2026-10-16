@@ -448,7 +448,7 @@ def test_corridor_exclusion_distance_and_cap():
         _fp("osm:w2", _rect(20, 3, 10, 8)),  # overlaps the asphalt: dropped
         _fp("osm:w3", _rect(40, 5.5, 10, 8)),  # 1.5 m from the drivable edge (4 m): dropped
         _fp("osm:w4", _rect(60, 10, 10, 8)),  # in the corridor (outer + 8 m verge): dropped
-        _fp("osm:w5", _rect(80, 160, 10, 8)),  # > 150 m from the centreline: dropped
+        _fp("osm:w5", _rect(80, 310, 10, 8)),  # > 300 m from the centreline: dropped
         _fp("osm:w6", _rect(100, -40, 10, 8)),  # 40 m off on the other side: kept
         _fp("osm:w7", _rect(120, 20, 2, 2)),  # 4 m^2, too small: dropped
     ]
@@ -634,7 +634,8 @@ def test_scene_kn5_is_valid_and_cells_are_batched():
     mat = k.materials[0]
     assert mat.shader == "ksPerPixel" and mat.textures[0].texture_name == "dm_buildings.dds"
     info = read_dds_info(k.textures[0].data)
-    assert info.format == "BC1" and info.width == 1024 and info.mip_count == 11
+    assert info.format == "BC1" and (info.width, info.height) == (1024, 2048)
+    assert info.mip_count == 12
     assert stats.vertices < 28 * 200  # lean: ~50-120 vertices per house
     # Deterministic: same seed, same looks; meshes identical.
     again = place_buildings(fps, PROJ, road, _flat(), seed="track")
@@ -655,7 +656,8 @@ def test_cells_split_past_the_vertex_limit():
         many.append(bb)
     meshes = building_meshes(many)
     assert len(meshes) >= 2 and all(m.data.vertex_count <= 65535 for m in meshes)
-    assert meshes[0].name == "buildings_000_0"
+    assert meshes[0].name == "buildings_s000_0"  # 20 m2 each: the short-range batches
+    assert meshes[0].flags["lod_out"] == BuildingOptions().detail_lod_out_m
     assert b.area_m2 == pytest.approx(96.0)
 
 
@@ -665,9 +667,9 @@ def test_cells_split_past_the_vertex_limit():
 
 
 def test_atlas_layout_tiling_and_determinism():
-    assert len(STYLES) == BAND_COUNT and sorted(s.band for s in STYLES) == list(range(16))
+    assert len(STYLES) == BAND_COUNT and sorted(s.band for s in STYLES) == list(range(32))
     img = np.asarray(building_atlas(256, seed=3)).astype(float)
-    assert img.shape == (256, 256, 3)
+    assert img.shape == (512, 256, 3)
     assert np.array_equal(img, np.asarray(building_atlas(256, seed=3)))
     # Bands tile left-right: the seam step is like any other column step.
     seam = np.abs(img[:, 0] - img[:, -1]).mean()
@@ -675,7 +677,7 @@ def test_atlas_layout_tiling_and_determinism():
     assert seam < 2.5 * typical
     for s in STYLES:
         v0, v1 = band_v(s, 256)
-        assert s.band / 16 < v0 < v1 < (s.band + 1) / 16
+        assert s.band / 32 < v0 < v1 < (s.band + 1) / 32
     with pytest.raises(ValueError):
         building_atlas(100)
     tex = building_atlas_texture("x.png", 64)
