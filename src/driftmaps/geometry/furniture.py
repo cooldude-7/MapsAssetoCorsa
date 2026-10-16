@@ -137,7 +137,8 @@ class FurnitureOptions:
 
 @dataclass
 class Marking:
-    """A road marking on the route: `kind` "stop_bar", "crosswalk", "zebra" or "arrow:<dir>",
+    """A road marking on the route: `kind` "stop_bar", "crosswalk" (two lines), "zebra"
+    (bars), "ladder" (bars between two lines) or "arrow:<dir>",
     at station `s`, between lateral offsets `l0` < `l1` (+ = left), from `source`."""
 
     kind: str
@@ -699,7 +700,7 @@ class _Planner:
                     h = self.frame.half(s_j)
                     for s_cw in (s_first - cw, s_last + cw):  # both legs of the route
                         if self.frame.s0 <= s_cw <= self.frame.s1:
-                            self.markings.append(Marking("zebra", s_cw, -h, h, "rule"))
+                            self.markings.append(Marking("ladder", s_cw, -h, h, "rule"))
                 s_bar = s_j - gap if forward else s_j + gap
                 if self.span(s_bar, forward) is None:
                     continue  # no lane this way here: the other carriageway's approach
@@ -1146,7 +1147,7 @@ def _attach_lights(items: list[StreetItem]) -> list[StreetItem]:
 
 def _mark_group(kind: str) -> str:
     base = kind.split(":")[0]
-    return "crossing" if base in ("zebra", "crosswalk") else base
+    return "crossing" if base in ("zebra", "crosswalk", "ladder") else base
 
 
 def _dedupe_markings(marks: list[Marking]) -> list[Marking]:
@@ -1784,7 +1785,10 @@ def marking_meshes(
             for off in (-CROSSWALK_GAP_M / 2, CROSSWALK_GAP_M / 2):
                 rect(mk.s + off - CROSSWALK_LINE_M / 2, mk.s + off + CROSSWALK_LINE_M / 2, mk.l0,
                      mk.l1)  # fmt: skip
-        elif mk.kind == "zebra":
+        elif mk.kind in ("zebra", "ladder"):
+            if mk.kind == "ladder":  # zebra bars between two crosswalk lines
+                for off in (-ZEBRA_LEN_M / 2, ZEBRA_LEN_M / 2 - CROSSWALK_LINE_M):
+                    rect(mk.s + off, mk.s + off + CROSSWALK_LINE_M, mk.l0, mk.l1)
             width = mk.l1 - mk.l0
             n = max(1, int((width + ZEBRA_GAP_M) // (ZEBRA_BAR_M + ZEBRA_GAP_M)))
             used = n * ZEBRA_BAR_M + (n - 1) * ZEBRA_GAP_M

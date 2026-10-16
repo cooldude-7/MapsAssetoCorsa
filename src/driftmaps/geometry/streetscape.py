@@ -133,8 +133,9 @@ class UrbanContext:
         xz = np.asarray(xz, np.float64).reshape(-1, 2)
         if self._sidewalks is None:
             return np.zeros(len(xz), bool)
-        d, _ = self._sidewalks.query(xz, distance_upper_bound=reach_m)
-        return np.isfinite(d)
+        reach = np.broadcast_to(np.asarray(reach_m, np.float64), (len(xz),))
+        d, _ = self._sidewalks.query(xz, distance_upper_bound=float(reach.max()) if len(xz) else 0)
+        return np.isfinite(d) & (d <= reach)
 
     def urban(
         self,
@@ -326,3 +327,78 @@ def walk_sides(
         left = _smooth_runs(left, np.asarray(s, np.float64), 20.0)
         right = _smooth_runs(right, np.asarray(s, np.float64), 20.0)
     return left, right
+
+
+# --------------------------------------------------------------------------------------------
+# The urban section around the network's side roads (polygons)
+# --------------------------------------------------------------------------------------------
+
+# Bands outward from the asphalt edge: (name, mesh material, index of its outer column in
+# `section_offsets`). Fewer than the route's columns, to keep the vertex count down (the
+# network has kilometres of them): the curb face and top are one band (its lift still follows
+# `section_lift` at every vertex) and the terrain meets the sidewalk's back edge directly.
+BANDS: tuple[tuple[str, str, int], ...] = (
+    ("gutter", "kerb", 1),
+    ("curb", "kerb", 3),
+    ("boulevard", "boulevard", 4),
+    ("walk", "sidewalk", 5),
+)
+BAND_SEG_M = 3.0  # longest boundary edge of the bands
+
+
+def urban_bands(
+    base: shapely.Geometry,
+    exclude: shapely.Geometry,
+    no_walk: shapely.Geometry | None = None,
+    sidewalk_m: float = SIDEWALK_LOCAL_M,
+) -> dict[str, shapely.Geometry]:
+    """The section's bands (`BANDS`) around the curbed asphalt `base`, as polygons, minus
+    `exclude` (other surfaces). Buffers of the whole base, so the curb follows every corner's
+    radius (curb returns) and every cul-de-sac bulb. Inside `no_walk` the sidewalk band is
+    boulevard grass."""
+    offs, _ = section_offsets(sidewalk_m)
+    # Simplified once (5 cm), so neighbouring bands share the very same boundary vertices.
+    rings = [base] + [base.buffer(float(offs[i]), quad_segs=6).simplify(0.05) for _, _, i in BANDS]
+    out: dict[str, shapely.Geometry] = {}
+    taken = exclude.buffer(0.01) if exclude is not None and not exclude.is_empty else None
+    for k, (name, _, _) in enumerate(BANDS):
+        band = rings[k + 1].difference(rings[k])
+        if taken is not None:
+            band = band.difference(taken)
+        out[name] = band
+    if no_walk is not None and not no_walk.is_empty and not out["walk"].is_empty:
+        grass = out["walk"].intersection(no_walk)
+        out["walk"] = out["walk"].difference(no_walk)
+        out["boulevard"] = shapely.union(out["boulevard"], grass)
+    return out
+
+
+def band_heights(
+    base: shapely.Geometry,
+    height,
+    sidewalk_m: float = SIDEWALK_LOCAL_M,
+    mouths: shapely.Geometry | None = None,
+):
+    """height(xz) + the section's lift at the distance from `base`; inside `mouths` (driveway
+    curb cuts) the curb drops to `DEPRESSED_CURB_M` and the boulevard ramps up from it."""
+    offs, lifts = section_offsets(sidewalk_m)
+    o3, o4 = float(offs[3]), float(offs[4])
+    l4 = float(lifts[4])
+    edge = base.boundary
+    shapely.prepare(edge)
+    if mouths is not None and not mouths.is_empty:
+        shapely.prepare(mouths)
+
+    def fn(xz: np.ndarray) -> np.ndarray:
+        xz = np.asarray(xz, np.float64).reshape(-1, 2)
+        pts = shapely.points(xz)
+        d = shapely.distance(edge, pts)
+        lift = section_lift(d, sidewalk_m)
+        if mouths is not None and not mouths.is_empty:
+            cut = shapely.contains_xy(mouths, xz[:, 0], xz[:, 1])
+            ramp = DEPRESSED_CURB_M + (l4 - DEPRESSED_CURB_M) * np.clip((d - o3) / (o4 - o3), 0, 1)
+            low = np.where(d <= o3, np.minimum(lift, DEPRESSED_CURB_M), ramp)
+            lift = np.where(cut & (d <= o4 + 1e-6), low, lift)
+        return np.asarray(height(xz), np.float64) + lift
+
+    return fn

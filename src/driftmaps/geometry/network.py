@@ -75,6 +75,7 @@ from driftmaps.geometry.street_items import (
     approach_stops,
     highway_rank,
 )
+from driftmaps.geometry.streetscape import SIDEWALK_LOCAL_M, section_width
 
 __all__ = [
     "CORNER_RADIUS_M",
@@ -622,7 +623,12 @@ MATERIALS: dict[str, tuple[str, str, str, dict]] = {
     "gravel": ("1GRAVEL_net", "gravel", "gravel", {}),
     "paint_white": ("paint_white_net", "paint_white", "paint_white", dict(DECAL_FLAGS)),
     "paint_yellow": ("paint_yellow_net", "paint_yellow", "paint_yellow", dict(DECAL_FLAGS)),
-    "curb": ("1ROAD_curb", "concrete", "concrete", {}),
+    "curb": ("1KERB_curb", "concrete", "concrete", {}),
+    # The urban section around curbed side roads (geometry.streetscape).
+    "kerb": ("1KERB_net", "concrete", "concrete", {}),
+    "boulevard": ("1GRASS_bv_net", "grass", "grass", {}),
+    "sidewalk": ("1ROAD_sw_net", "concrete", "concrete", {}),
+    "apron": ("1ROAD_ap_net", "concrete", "concrete", {}),
     "pavers": ("1ROAD_apron", "pavers", "pavers", {}),
     "island_grass": ("1GRASS_isl", "grass", "grass", {}),
     "island_concrete": ("1ROAD_isl", "concrete", "concrete", {}),
@@ -682,6 +688,9 @@ class RouteMasks:
     edge_left: np.ndarray
     edge_right: np.ndarray
     centre: np.ndarray
+    # Driveway curb cuts on the route's urban section (True: the curb is lowered).
+    cut_left: np.ndarray | None = None
+    cut_right: np.ndarray | None = None
 
     @classmethod
     def keep_all(cls, n_seg: int) -> RouteMasks:
@@ -707,6 +716,7 @@ class SideRoad:
     start_node: int
     end_node: int
     urban: np.ndarray | None = None  # (N,) curbed urban section (`geometry.streetscape`)
+    along: bool = True  # s runs along its OSM way's direction
 
     @property
     def highway(self) -> str:
@@ -758,6 +768,13 @@ class RoadNetwork:
     junction_xz: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)), repr=False)
     driveway_ways: list[NetWay] = field(default_factory=list, repr=False)
     driveways: list = field(default_factory=list)
+    # The urban section around curbed side roads: its band polygons, the curbed asphalt they
+    # are measured from, the route's urban segments, and its meshes (re-made with the curb
+    # cuts once the driveways are known; the build adds them to the KN5 last).
+    urban_bands: dict[str, shapely.Geometry] = field(default_factory=dict, repr=False)
+    urban_base: shapely.Geometry = field(default_factory=shapely.Polygon, repr=False)
+    route_urban_seg: np.ndarray | None = field(default=None, repr=False)
+    urban_pieces: list[ScenePiece] = field(default_factory=list)
 
     def corridor(self, verge_m: float) -> shapely.Geometry:
         """The network's share of the hidden-wall corridor (simplified to 0.25 m: the paved
@@ -1053,6 +1070,7 @@ def build_network(
     route_way_tags: Mapping[int, Mapping[str, str]] | None = None,
     urban: object | None = None,
     route_urban: np.ndarray | None = None,
+    walks: object | None = None,
 ) -> RoadNetwork:
     """Build the network around the route `model` (see the module docstring).
 
@@ -1214,6 +1232,11 @@ def build_network(
         shoulder = (
             options.shoulder_m if (rural and paved) else (0.5 if hw_cls != "service" else 0.3)
         )
+        urban_flags = None
+        if urban is not None:
+            urban_flags = urban.urban(xz, [tags] * len(xz), m0.half_width, m0.s)
+            if paved and float(np.mean(urban_flags)) > 0.5:
+                shoulder = 0.0  # curbed: the urban section takes the shoulder's place
         ow = is_oneway(tags)
         along = bool(r["along"][len(r["along"]) // 2])
         oneway = 0 if ow == 0 else (ow if along else -ow)
@@ -1246,8 +1269,8 @@ def build_network(
             start_node=r["start_node"],
             end_node=r["end_node"],
         )
-        if urban is not None:
-            sr.urban = urban.urban(xz, [tags] * len(xz), m0.half_width, m0.s)
+        sr.urban = urban_flags
+        sr.along = along
         built[i] = sr.index
         sides.append(sr)
         owners.append(CentreLine(xz, y, m0.half_width, f"side{sr.index}"))
@@ -1433,11 +1456,17 @@ def build_network(
         if k
     ]
     route_sh_kept = _union(kept_sh)
+    route_useg = (
+        route_urban[:-1] & route_urban[1:]
+        if route_urban is not None and len(route_urban) == n_st
+        else np.zeros(n_st - 1, bool)
+    )
+    rural_idx = near_idx[~route_useg[near_idx]]  # an urban section is not paved over
     gone_sh = [
         q
         for q, g in zip(
-            np.concatenate([sh_left_q[near_idx], sh_right_q[near_idx]]),
-            np.concatenate([removed["left"][near_idx], removed["right"][near_idx]]),
+            np.concatenate([sh_left_q[rural_idx], sh_right_q[rural_idx]]),
+            np.concatenate([removed["left"][rural_idx], removed["right"][rural_idx]]),
             strict=True,
         )
         if g
@@ -1470,16 +1499,25 @@ def build_network(
         if p.area <= NOTCH_MAX_M2 and p.distance(network_area) < 0.01
     ]
     shoulder_all = _union([shoulder_all, *fill])
-    net.paved = _union([paved_all, islands_all])
+
+    # ---- The urban section around curbed roads (geometry.streetscape) ---------------------
+    bands, urban_base = _urban_section(
+        sides, carriage, junctions, model, route_useg, near, hidden_seg, asphalt_q,
+        sh_left_q, sh_right_q, masks, _union([paved_all, islands_all, shoulder_all]), walks,
+    )  # fmt: skip
+    net.urban_bands, net.urban_base, net.route_urban_seg = bands, urban_base, route_useg
+    net.paved = _union([paved_all, islands_all, *bands.values()])
     net.islands = islands
     net.polygons = {
         "asphalt": asphalt,
         "gravel": _union([gravel_road, shoulder_all]),
         "islands": islands_all,
+        "urban": _union(list(bands.values())),
     }
 
     batch = Batcher(options.batch_m)
     meshes: list[MeshData] = []
+    urban_meshes: list[MeshData] = []  # their outer edges: terrain edge points every 2.5 m
 
     def add(
         key: str,
@@ -1509,6 +1547,10 @@ def build_network(
         for key, mesh in rbm.island_meshes(isl, height, options.cell_m):
             batch.add(key, mesh)
             meshes.append(mesh)
+    if bands:  # meshed now for the terrain's edge points; again after the driveways
+        upieces, umeshes = urban_section_meshes(net, None, options)
+        net.urban_pieces = upieces
+        urban_meshes = umeshes
     for isl, kind in raised:  # curbed medians: drivable over the curb, no hidden walls
         top = "island_concrete" if kind == "raised_concrete" else "island_grass"
         for key, mesh in rbm.island_meshes(isl, height, options.cell_m, top=top):
@@ -1590,8 +1632,11 @@ def build_network(
     # ---- Terrain and walls -----------------------------------------------------------------
     foot = _union([net.paved, shoulder_all])
     net.footprint = foot
-    if meshes:
-        bp = np.concatenate([boundary_points(mm) for mm in meshes])
+    if meshes or urban_meshes:
+        bp = np.concatenate(
+            [boundary_points(mm) for mm in meshes]
+            + [boundary_points(mm, 2.5) for mm in urban_meshes]
+        )
         if len(bp):
             near_route = np.flatnonzero(near & ~hidden_seg)
             route_foot = (
@@ -1680,6 +1725,112 @@ def _medians(
             if divided.median_width(q) >= 0.6:
                 out.append((q, divided.median_kind(q)))
     return out
+
+
+def _urban_section(
+    sides: Sequence[SideRoad],
+    carriage: Sequence[shapely.Geometry],
+    junctions: Sequence[Junction],
+    model: RoadModel,
+    route_useg: np.ndarray,
+    near: np.ndarray,
+    hidden: np.ndarray,
+    asphalt_q: np.ndarray,
+    sh_left_q: np.ndarray,
+    sh_right_q: np.ndarray,
+    masks: RouteMasks,
+    taken: shapely.Geometry,
+    walks,
+) -> tuple[dict[str, shapely.Geometry], shapely.Geometry]:
+    """(band polygons, curbed asphalt) of the urban section around the curbed side roads and
+    round the route's urban junction mouths (`streetscape.urban_bands`)."""
+    from driftmaps.geometry import streetscape as sts
+
+    ids = [
+        sr.index
+        for sr in sides
+        if sr.paved and sr.urban is not None and float(np.mean(sr.urban)) > 0.5
+    ]
+    uset = set(ids)
+    parts = [carriage[k] for k in ids]
+    for j in junctions:
+        if j.fillets is None or j.fillets.is_empty:
+            continue
+        on_urban_route = j.route_s is not None and bool(
+            route_useg[min(model.index_at(j.route_s), len(route_useg) - 1)]
+        )
+        if on_urban_route or any(k in uset for k, _ in j.legs):
+            parts.append(j.fillets)
+    ri = np.flatnonzero(near & ~hidden & route_useg)
+    parts += list(asphalt_q[ri])
+    if not parts:
+        return {}, shapely.Polygon()
+    base = _union(parts)
+    # Everything else keeps its surface: the network's paved areas, islands and shoulders, the
+    # route's asphalt and the route's own shoulders or urban section where they stay.
+    wide = np.flatnonzero(np.convolve((near & ~hidden).astype(float), np.ones(41), "same") > 0)
+    kept = [
+        q
+        for q, k in zip(
+            np.concatenate([sh_left_q[wide], sh_right_q[wide]]),
+            np.concatenate([masks.shoulder_left[wide], masks.shoulder_right[wide]]),
+            strict=True,
+        )
+        if k
+    ]
+    exclude = _union([taken, *asphalt_q[wide], *kept])
+    no_walk = []
+    for k in ids:
+        sr = sides[k]
+        m = sr.model
+        n = len(m)
+        xz = sr.xz
+        left2 = m.left[:, [0, 2]]
+        municipal = walks.sides(xz, left2, m.half_width) if walks else None
+        wl, wr = sts.walk_sides([sr.tags] * n, np.full(n, sr.along), sr.urban, municipal, m.s)
+        reach = m.half_width + float(sts.section_width(sts.SIDEWALK_LOCAL_M)) + 0.5
+        for mask, sign in ((wl, 1.0), (wr, -1.0)):
+            for a, b in _runs(~mask):
+                if b - a < 1:
+                    continue
+                inner = xz[a : b + 1] - left2[a : b + 1] * sign * 0.0
+                outer = xz[a : b + 1] + left2[a : b + 1] * sign * reach[a : b + 1, None]
+                ring = np.concatenate([inner, outer[::-1]])
+                no_walk.append(shapely.make_valid(shapely.Polygon(ring)))
+    bands = sts.urban_bands(base, exclude, _union(no_walk) if no_walk else None)
+    return {k: v for k, v in bands.items() if not v.is_empty}, base
+
+
+def urban_section_meshes(
+    net: RoadNetwork, mouths: shapely.Geometry | None, options: NetworkOptions
+) -> tuple[list[ScenePiece], list[MeshData]]:
+    """(KN5 pieces, meshes) of the network's urban section, with the curb lowered inside the
+    driveway `mouths` (their boulevard paved: an apron)."""
+    from driftmaps.geometry import streetscape as sts
+
+    batch = Batcher(options.batch_m)
+    meshes: list[MeshData] = []
+    if not net.urban_bands or net.height is None:
+        return [], []
+    fn = sts.band_heights(net.urban_base, net.height, mouths=mouths)
+    cut = mouths if mouths is not None and not mouths.is_empty else None
+    for name, key, _ in sts.BANDS:
+        geom = net.urban_bands.get(name)
+        if geom is None or geom.is_empty:
+            continue
+        pieces = [(key, geom)]
+        if cut is not None and name == "boulevard":
+            pieces = [(key, geom.difference(cut)), ("apron", geom.intersection(cut))]
+        for k, g in pieces:
+            for poly in _polygons(g, 0.01):
+                mesh = mesh_polygon(
+                    poly, fn, cell_m=options.cell_m, uv_tile_m=1.5 if k == "sidewalk" else 2.0,
+                    seg_m=sts.BAND_SEG_M,
+                )  # fmt: skip
+                if mesh is not None:
+                    batch.add(k, mesh)
+                    meshes.append(mesh)
+    return batch.pieces(), meshes
 
 
 def _seg_mask(idx: np.ndarray, n: int) -> np.ndarray:
@@ -2027,6 +2178,7 @@ CROSSWALK_EDGE_M = 1.0
 CROSSWALK_LEN_M = 3.0
 STOP_LINE_SETBACK_M = 1.0
 ZEBRA_BAR_M, ZEBRA_GAP_M = 0.5, 0.6  # ladder blocks across the road (as furniture.py)
+CROSSWALK_LINE_M = 0.20  # OTM Book 11: crosswalk lines 10-20 cm wide
 CONNECTOR_MAX_M = 35.0  # a side road this short between two carriageways is a connector
 
 
@@ -2077,6 +2229,9 @@ def _side_crosswalk(
     for b in range(n):
         lo = -hw + (width - used) / 2 + b * (ZEBRA_BAR_M + ZEBRA_GAP_M)
         out.append(_lane_quad(m, s_c, lo, lo + ZEBRA_BAR_M, CROSSWALK_LEN_M))
+    for off in (-1.0, 1.0):  # a ladder: the bars between two crosswalk lines (OTM Book 11)
+        s_l = s_c + off * (CROSSWALK_LEN_M / 2 - CROSSWALK_LINE_M / 2)
+        out.append(_lane_quad(m, s_l, -hw, hw, CROSSWALK_LINE_M))
     return out, s_c + sign * (CROSSWALK_LEN_M / 2 + 0.3)
 
 
@@ -2246,6 +2401,7 @@ def _sidewalk_tagged(tags: Mapping[str, str]) -> bool:
 # no flares, asphalt.
 DRIVEWAY_RURAL_WIDTH_M = 4.5
 DRIVEWAY_URBAN_WIDTH_M = 5.5
+CURB_CUT_TRANSITION_M = 0.3  # Hamilton RD-106: 300 mm transitions each side of a curb cut
 DRIVEWAY_FLARE_M = 3.0
 DRIVEWAY_PERPENDICULAR_M = 15.0
 DRIVEWAY_MAX_M = 150.0
@@ -2300,7 +2456,7 @@ def _roads_for_driveways(net: RoadNetwork) -> list[tuple[int, CentreLine, float]
         if b > a:
             cl = CentreLine(m.centre[a : b + 1, [0, 2]], m.centre[a : b + 1, 1],
                             m.half_width[a : b + 1])  # fmt: skip
-            out.append((-1, cl, float(np.median(m.shoulder[a : b + 1]))))
+            out.append((-1, cl, m.shoulder[a : b + 1].copy()))  # per station
     for sr in net.side_roads:
         if highway_rank(sr.highway) > highway_rank("service") or sr.highway == "service":
             out.append((sr.index, CentreLine(sr.xz, sr.model.centre[:, 1], sr.model.half_width),
@@ -2458,10 +2614,29 @@ def build_driveways(
 
     # Clip, mesh and mark the mouths.
     carriage = _union([c for c in net.carriage])
-    cut = _union(
-        [carriage, net.paved.difference(_union(net.islands)) if net.islands else net.paved]
-    )
     route_left, route_right, left_outer, right_outer = net.route_columns
+    useg = net.route_urban_seg
+    if useg is None or len(useg) != len(route_left) - 1:
+        useg = np.zeros(len(route_left) - 1, bool)
+    urban_strip = shapely.Polygon()
+    if useg.any():  # the route's urban section: driveways start behind its sidewalk
+        urban_strip = _union(
+            [footprint_polygon(left_outer, route_left, useg),
+             footprint_polygon(route_right, right_outer, useg)]
+        )  # fmt: skip
+    cut = _union(
+        [
+            carriage,
+            net.paved.difference(_union(net.islands)) if net.islands else net.paved,
+            urban_strip,
+        ]
+    )
+    if net.masks.cut_left is None:
+        net.masks.cut_left = np.zeros(len(useg), bool)
+        net.masks.cut_right = np.zeros(len(useg), bool)
+    out_l = 0.5 * (left_outer[:-1, [0, 2]] + left_outer[1:, [0, 2]])
+    out_r = 0.5 * (right_outer[:-1, [0, 2]] + right_outer[1:, [0, 2]])
+    mouths: list[shapely.Geometry] = []  # curb cuts on the side roads' urban section
     outer_cls = [CentreLine(cl.xz, cl.y, cl.hw + sh) for _, cl, sh in roads]
 
     stencil = np.array([[0, 0], [1.5, 0], [-1.5, 0], [0, 1.5], [0, -1.5]], np.float64)
@@ -2501,6 +2676,13 @@ def build_driveways(
             if near_seg:
                 idx = np.array(sorted(near_seg))
                 grown = poly.buffer(0.6)
+                urb = useg[idx]
+                for outs, cut_mask in ((out_l, net.masks.cut_left), (out_r, net.masks.cut_right)):
+                    hit = urb & shapely.contains_xy(poly.buffer(1.0), outs[idx, 0], outs[idx, 1])
+                    if hit.any():  # the curb drops across the driveway (a curb cut)
+                        cut_mask[idx[hit]] = True
+                        res.masks_changed = True
+                idx = idx[~urb]
                 for mids, quads, edge_mask, sh_mask in (
                     (mid_l, sh_l, net.masks.edge_left, net.masks.shoulder_left),
                     (mid_r, sh_r, net.masks.edge_right, net.masks.shoulder_right),
@@ -2513,11 +2695,23 @@ def build_driveways(
                     if covered.any():
                         sh_mask[idx[covered]] = False
                         res.masks_changed = True
+        elif net.urban_bands and not d.rural:
+            # A side road's urban section: the curb cut, across the driveway's width.
+            reach = float(section_width(SIDEWALK_LOCAL_M)) + 0.5
+            ln = shapely.LineString([d.mouth - d.normal * 0.5, d.mouth + d.normal * reach])
+            near_poly = poly.intersection(shapely.Point(d.mouth).buffer(reach + 4.0))
+            width = DRIVEWAY_URBAN_WIDTH_M
+            if not near_poly.is_empty:
+                across = np.array([-d.normal[1], d.normal[0]])
+                pts = shapely.get_coordinates(near_poly)
+                width = float(np.ptp((pts - d.mouth) @ across)) if len(pts) else width
+            mouths.append(ln.buffer(min(width, 9.0) / 2 + CURB_CUT_TRANSITION_M, cap_style="flat"))
         if d.rural:
             # The mailbox: just beyond the shoulder, beside the driveway on its right (seen
             # from the road), facing the road.
             right = np.array([-d.normal[1], d.normal[0]])
             shoulder = next((sh for idx, _, sh in roads if idx == d.road), 1.0)
+            shoulder = float(np.median(np.atleast_1d(shoulder)))
             base = d.mouth + d.normal * (shoulder + MAILBOX_SETBACK_M)
             across = shapely.LineString([base - right * 20.0, base + right * 20.0])
             half = 0.0
@@ -2534,6 +2728,8 @@ def build_driveways(
     res.pieces = batch.pieces()
     for p in res.pieces:  # their own names: they come after the network's pieces
         p.name = p.name.replace("_net", "_dw")
+    if mouths and net.urban_bands:
+        net.urban_pieces, _ = urban_section_meshes(net, _union(mouths), options)
     return res
 
 

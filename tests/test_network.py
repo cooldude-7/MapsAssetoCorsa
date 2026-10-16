@@ -308,7 +308,7 @@ def test_roundabout_islands_signs_and_markings(roundabout):
             assert np.linalg.norm(v) < rb.island_r
             assert float(np.dot(v / np.linalg.norm(v), it.facing)) > 0.99
     names = {p.name[:9] for p in net.pieces}
-    assert {"1ROAD_apr", "1GRASS_is", "1ROAD_cur", "paint_whi"} <= names
+    assert {"1ROAD_apr", "1GRASS_is", "1KERB_cur", "paint_whi"} <= names  # curbs: KERB
     # Hidden walls inside every island.
     assert len(net.island_walls) == 5
 

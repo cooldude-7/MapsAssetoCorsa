@@ -9,7 +9,8 @@ it equally. With right-hand traffic the lanes in the driving direction are on th
 line between the two directions sits `centre` metres left of the centreline.
 
 Markings (OTM Book 11, docs/research/intersections.md):
-- white broken lane lines (3 m line, 6 m gap) between lanes of the same direction; a solid
+- white broken lane lines (3 m line, 6 m gap; 9 m on rural roads) between lanes of the
+  same direction; a solid
   white line where a turn-only lane runs beside a through lane (its storage length);
 - yellow centre line between the two directions: double solid on multi-lane roads and urban
   arterials, single broken on urban two-lane collectors, none on urban local streets; rural
@@ -40,11 +41,13 @@ __all__ = [
     "way_lanes",
 ]
 
-# OTM Book 11 (2000) Table 3-1 / Fig. 3-1: broken lines are 3.0 m segments with 6.0 m gaps
-# (urban and rural); lane lines 10-15 cm wide (ASSUMED 12 cm, like the route's centre line).
+# OTM Book 11 (2000) s.3.5: broken lane lines are 3 m segments with 6 m gaps on urban roads
+# and 9 m gaps on rural roads, about 10 cm wide; a broken directional dividing (centre) line
+# is 3 m / 6 m everywhere.
 BROKEN_LINE_M = 3.0
 BROKEN_GAP_M = 6.0
-LANE_LINE_WIDTH_M = 0.12
+BROKEN_GAP_RURAL_M = 9.0
+LANE_LINE_WIDTH_M = 0.10
 
 _TURN_ONLY = frozenset({"left", "right", "sharp_left", "sharp_right", "slight_left",
                         "slight_right", "reverse", "merge_to_left", "merge_to_right"})  # fmt: skip
@@ -187,9 +190,9 @@ class PaintLine:
     role: str
 
 
-def _broken(s: np.ndarray) -> np.ndarray:
+def _broken(s: np.ndarray, gap: float = BROKEN_GAP_M) -> np.ndarray:
     mid = 0.5 * (s[:-1] + s[1:])
-    return (mid % (BROKEN_LINE_M + BROKEN_GAP_M)) < BROKEN_LINE_M
+    return (mid % (BROKEN_LINE_M + gap)) < BROKEN_LINE_M
 
 
 def _seg(mask: np.ndarray) -> np.ndarray:
@@ -220,6 +223,7 @@ def paint_lines(
     oneway = np.asarray(oneway)
     hw = lanes.half_width
     broken = _broken(s)
+    rural_broken = _broken(s, BROKEN_GAP_RURAL_M)
     out: list[PaintLine] = []
     rank = np.array([highway_rank(h) for h in highway])
     two_way = (lanes.n_fwd > 0) & (lanes.n_bwd > 0) & (oneway == 0)
@@ -273,7 +277,8 @@ def paint_lines(
                     tb = bool(set(b.split(";")) <= _TURN_ONLY) if b else False
                     solid[i] = ta != tb
             seg = _seg(exists)
-            keep = seg & (broken | _seg(solid))
+            dashes = np.where(urban[:-1], broken, rural_broken)
+            keep = seg & (dashes | _seg(solid))
             if keep.any():
                 out.append(PaintLine("white", off, LANE_LINE_WIDTH_M, keep, "lane"))
 
