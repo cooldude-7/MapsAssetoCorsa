@@ -268,6 +268,11 @@ def build(
     debug_png: bool = typer.Option(True, help="Write top-down debug images to <out>/debug."),
     trees: bool = typer.Option(True, help="Trees from the lidar canopy (NRCan, Canada only)."),
     buildings: bool = typer.Option(True, help="Buildings from OSM + Microsoft footprints."),
+    furniture: bool = typer.Option(
+        True,
+        help="Signs, hydro poles, street lights and stop bars (OSM, Ontario rules, and "
+        "Mapillary with $DRIFTMAPS_MAPILLARY_TOKEN).",
+    ),
     guardrails: bool = typer.Option(
         True,
         help="Guardrails from guardrails.json and OSM, plus the automatic ones (bridges keep "
@@ -347,6 +352,7 @@ def build(
         force=force,
         trees=trees,
         buildings=buildings,
+        furniture=furniture,
         guardrails=guardrails,
         auto_guardrails=auto_guardrails,
         bridge_approach_rails=bridge_approach_rails,

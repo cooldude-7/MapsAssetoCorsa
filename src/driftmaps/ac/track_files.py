@@ -974,15 +974,15 @@ DATA_SOURCES: dict[str, str] = {
     ),
 }
 
-# One OSM credit when the buildings and barriers come from OSM too (their ways are listed in
-# route_osm.geojson next to the road's).
+# One OSM credit when the buildings, barriers and street furniture come from OSM too (their
+# ways and nodes are listed in route_osm.geojson next to the road's).
 DATA_SOURCES["osm_scenery"] = (
     DATA_SOURCES["osm"]
-    .replace("Road data:", "Road, barrier and building data:")
+    .replace("Road data:", "Road, barrier, street furniture and building data:")
     .replace(
         "The route data used to build this track (geometry, OSM way IDs and tags)",
-        "The OSM data used to build this track (the road, buildings and barriers: geometry, "
-        "OSM IDs and tags)",
+        "The OSM data used to build this track (the road, buildings, barriers, signs and "
+        "poles: geometry, OSM IDs and tags)",
     )
 )
 
