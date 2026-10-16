@@ -18,9 +18,9 @@ builders' buildings.md (2026-10-16: sources, conflation, heights, typical Ontari
    ring and a 3 m interior lattice. The walls start `sink_m` (0.5 m) below its LOWEST point;
    heights are measured from its median.
 3. Context and category. A footprint is in a **dense town** (`_town_context`) with at least
-   20 other house-sized footprints (60-450 m2) within 100 m (a subdivision has 40-80), in a
-   **town** with at least 10 unless the NRCan land cover is known and under 30 % urban (a
-   hamlet among fields), else in the **country** (a farm's barns and sheds do not count).
+   20 other footprints of 60 m2 or more within 100 m (a subdivision has 40-80), in a **town**
+   with at least 10 unless most are barn-sized (> 450 m2) or the NRCan land cover is known
+   and under 30 % urban (a hamlet among fields), else in the **country**.
    Category: house, townhouse, garage, shed, barn or commercial, from the type (OSM
    `building`, the municipal type) or, untyped, the size (buildings.md §5: sheds < 25 m2,
    garages < 70 m2, barns >= 450 m2 unless flat). Barns only stand in the country (the
@@ -393,11 +393,13 @@ class BuildingOptions:
     min_area_m2: float = 10.0
     max_area_m2: float = 20_000.0
     max_buildings: int = 6000  # hard cap (nearest first); the byte budget usually binds first
-    # Context (`_town_context`): house-sized footprints within `context_radius_m`; a town from
-    # `town_neighbours` (with some urban land cover), a dense town from `dense_neighbours`.
-    # Barns only stand in the country, townhouse rows only in a dense town.
+    # Context (`_town_context`): footprints of `min_neighbour_m2` or more within
+    # `context_radius_m`; a town from `town_neighbours` (mostly not barn-sized, with some urban
+    # land cover), a dense town from `dense_neighbours`. Barns only stand in the country,
+    # townhouse rows only in a dense town.
     context_radius_m: float = 100.0
-    house_area_m2: tuple[float, float] = (60.0, 450.0)
+    min_neighbour_m2: float = 60.0
+    big_m2: float = 450.0
     town_neighbours: int = 10
     dense_neighbours: int = 20
     # Townhouse rows (in towns; untyped, residential or terrace footprints): the minimum
@@ -754,26 +756,30 @@ def _town_context(
     """Per candidate (indices into `polys`, every footprint found): 0 in the country, 1 in a
     town, 2 in a dense town (a subdivision or downtown: townhouse rows only stand there).
 
-    Counted: the house-sized footprints (`house_area_m2`) within `context_radius_m`, other
-    than the building itself (a subdivision has 40-80 houses in 100 m; a farm a house or two
-    among barns and sheds, which do not count, and NRCan maps a big farmstead's yards as
-    urban, so the land cover alone cannot tell). With at least `dense_neighbours` a building
-    is in a dense town; with at least `town_neighbours` in a town, unless the land cover
-    around it (its centre and 8 points 75 m out) is known and less than 30 % urban (class
-    17: a hamlet among fields and woods); otherwise in the country.
+    Counted: the footprints of at least `min_neighbour_m2` (no sheds) within
+    `context_radius_m`, other than the building itself (a subdivision has 40-80 houses in
+    100 m, a downtown block as many shops; a farm a house or two among barns, and NRCan maps a
+    big farmstead's yards as urban, so the land cover alone cannot tell). With at least
+    `dense_neighbours` a building is in a dense town; with at least `town_neighbours` in a
+    town, unless most of them are big (> `big_m2`: a farm's barns) or the land cover around
+    it (its centre and 8 points 75 m out) is known and less than 30 % urban (class 17: a
+    hamlet among fields and woods); otherwise in the country.
     """
     if not len(cand):
         return np.zeros(0, np.int8)
     cents = np.array([[c.x, c.y] for c in (p.centroid for p in polys)])
     area = np.array([p.area for p in polys])
-    lo, hi = o.house_area_m2
-    homes = (area >= lo) & (area <= hi)
-    if homes.any():
-        n = cKDTree(cents[homes]).query_ball_point(
-            cents[cand], o.context_radius_m, return_length=True
-        ) - homes[np.asarray(cand, np.int64)].astype(int)
-    else:
-        n = np.zeros(len(cand), np.int64)
+    idx = np.asarray(cand, np.int64)
+
+    def neighbours(mask: np.ndarray) -> np.ndarray:
+        if not mask.any():
+            return np.zeros(len(idx), np.int64)
+        got = cKDTree(cents[mask]).query_ball_point(cents[idx], o.context_radius_m,
+                                                     return_length=True)  # fmt: skip
+        return got - mask[idx].astype(np.int64)
+
+    n = neighbours(area >= o.min_neighbour_m2)
+    big = neighbours(area > o.big_m2)
     urban = np.zeros(len(cand))
     known = np.zeros(len(cand), bool)
     if landcover is not None:
@@ -789,7 +795,7 @@ def _town_context(
         known = k > 0
         urban = (lc == _LC_URBAN).sum(axis=1) / np.maximum(k, 1)
     dense = n >= o.dense_neighbours
-    town = dense | ((n >= o.town_neighbours) & (~known | (urban >= 0.3)))
+    town = dense | ((n >= o.town_neighbours) & (2 * big < n) & (~known | (urban >= 0.3)))
     return town.astype(np.int8) + dense.astype(np.int8)
 
 
