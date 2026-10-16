@@ -224,6 +224,33 @@ def test_chevrons_on_the_outside_of_a_sharp_curve_back_to_back():
     assert not _of(plan, SIGN_CHEVRON_LEFT)
 
 
+def test_rule_chevrons_only_on_rural_roads():
+    m = _curve_model(left=True)
+    ids = np.full(len(m), 11)
+
+    def chevrons(tags, **kw):
+        route = FakeRoute({1: (-200, 0), 2: (0, -400)}, [Edge(11, 1, 2)], {11: tags})
+        plan = fu.plan_furniture(m, PROJ, route, ground, way_id=ids, **kw)
+        return _of(plan, SIGN_CHEVRON_LEFT) + _of(plan, SIGN_CHEVRON_RIGHT)
+
+    rural = {"highway": "secondary", "maxspeed": "80"}
+    assert chevrons(rural)
+    assert not chevrons(rural | {"maxspeed": "50"})  # a curvy suburban street
+    assert not chevrons({"highway": "residential"})  # untagged: 50 km/h
+    assert chevrons({"highway": "unclassified"})  # untagged rural road: 80 km/h
+    assert not chevrons(rural | {"sidewalk": "both"})
+    assert not chevrons(rural | {"sidewalk:right": "separate"})
+    assert not chevrons(rural | {"lit": "yes"})
+    assert not chevrons(rural, town_at=lambda xz: True)  # in a subdivision
+    assert chevrons(rural, town_at=lambda xz: False)
+    # A photographed chevron stays wherever it really is, town or not.
+    lon, lat = _lonlat((33.0, 0.0))  # 8 m outside the curve
+    mly = [MapFeature("c1", "complementary--chevron-left--g1", float(lon), float(lat), 240.0,
+                      "2019-06-01T00:00:00Z", "2019-06-01T00:00:00Z")]  # fmt: skip
+    got = chevrons(rural | {"maxspeed": "50"}, town_at=lambda xz: True, mapillary=mly)
+    assert got and all(it.source == "mapillary" for it in got)
+
+
 # --------------------------------------------------------------------------------------------
 # Poles, de-duplication
 # --------------------------------------------------------------------------------------------

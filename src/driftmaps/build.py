@@ -527,6 +527,16 @@ class BuildResult:
                 + "; heights "
                 + (", ".join(f"{k} {v}" for k, v in sorted(bd["height_source"].items())) or "-")
             )
+            pl = bd.get("placement") or {}
+            if pl.get("found"):
+                lines.append(
+                    f"         placed {pl['placed']} of {pl['candidates']} in reach "
+                    f"({pl['town']} in town, {pl['street_front']} street front within 60 m); "
+                    f"dropped: on the road {pl['road']}, wall corridor {pl['corridor']}, "
+                    f"too far {pl['far']}, size {pl['size']}, budget {pl['budget']} "
+                    f"({pl.get('mesh_bytes', 0) / 1e6:.1f} of "
+                    f"{pl.get('budget_bytes', 0) / 1e6:.0f} MB)"
+                )
             rails = ", ".join(f"{k} {v:.0f} m" for k, v in sorted(sc["barriers_m"].items()))
             lines.append(
                 f"rails    {rails or 'none'} (OSM barriers found: {sc['osm_barriers']}, "
@@ -547,6 +557,15 @@ class BuildResult:
                     f"{fu['mapillary_used']} items, photos on "
                     f"{100 * fu['mapillary_photo_coverage']:.0f}% of the road"
                 )
+                sg = fu.get("signals") or {}
+                if sg.get("junctions"):
+                    lines.append(
+                        f"signals  {sg['junctions']} junctions, {sg['approaches']} approaches: "
+                        f"{sg['poles']} poles, {sg['heads']} heads ({sg['arrow_heads']} "
+                        f"left arrows), {sg['ped_heads']} pedestrian heads "
+                        f"({sg['ped_posts']} posts); stop signs dropped: {sg['stops_dropped']}; "
+                        f"at {', '.join(f'{v:.0f}' for v in sg.get('stations', []))} m"
+                    )
             for b in sc["bridges"]:
                 lines.append(
                     f"bridge   {b['length_m']:.0f} m at {b['from_a_m']:.0f} m from A, deck up to "
@@ -1412,6 +1431,7 @@ class _Scenery:
     trees: TreeSet | None = None
     buildings: list[Building] = field(default_factory=list)
     footprints: BuildingFootprints | None = None
+    building_report: dict[str, int] = field(default_factory=dict)  # place_buildings' counts
     attributions: list[str] = field(default_factory=list)
     osm_barriers: int = 0
     osm_barrier_ways: list[OsmBarrier] = field(default_factory=list)  # matched to the road
@@ -1995,10 +2015,14 @@ def _buildings(
     sc.footprints = res
     roads = _building_roads(geo, options)
 
+    landcover = _landcover_fn(geo, options)
+    paved = sc.network.paved if sc.network is not None else None
+
     def place(c: CanopyFn | None) -> list[Building]:
         return place_buildings(
             res.footprints, geo.projection, geo.model, ground,
-            corridor=corridor, canopy=c, seed=track_id, roads=roads,
+            corridor=corridor, canopy=c, seed=track_id, roads=roads, landcover=landcover,
+            paved=paved, report=sc.building_report,
         )  # fmt: skip
 
     try:
@@ -2009,6 +2033,13 @@ def _buildings(
     if sc.buildings:
         lines = res.attributions_for({b.id for b in sc.buildings})
         sc.attributions += [a for a in lines if a not in sc.attributions]
+
+
+def _landcover_fn(geo: TrackGeometry, options: BuildOptions) -> LandcoverFn:
+    """NRCan land cover on AC XZ points (trees: kinds; buildings: farm or town)."""
+    if options.landcover_source is not None:
+        return options.landcover_source(geo.projection)
+    return LandcoverSampler(geo.projection, cache_dir=options.cache_dir)
 
 
 def _building_roads(geo: TrackGeometry, options: BuildOptions) -> list[np.ndarray]:
@@ -2061,6 +2092,35 @@ def _control_nodes(feats: StreetFeatures) -> tuple[OsmNode, ...]:
     )
 
 
+def _signal_nodes(sc: _Scenery) -> set[int]:
+    """Route junctions the network controls with signals (`Junction.controls`)."""
+    if sc.network is None:
+        return set()
+    return {int(j.node) for j in sc.network.junctions
+            if any(c[-1] == "signal" for c in j.controls)}  # fmt: skip
+
+
+TOWN_RADIUS_M = 150.0  # a point with TOWN_BUILDINGS town buildings this close is in a town
+TOWN_BUILDINGS = 5
+
+
+def _town_at(sc: _Scenery) -> Callable[[np.ndarray], bool] | None:
+    """XZ -> True in a town: TOWN_BUILDINGS of the placed buildings in a town context
+    (`geometry.buildings._town_context`) within TOWN_RADIUS_M. None without buildings."""
+    town = [b.centroid for b in sc.buildings if b.town]
+    if not sc.buildings:
+        return None
+    if not town:
+        return lambda xz: False
+    tree = cKDTree(np.array(town))
+
+    def at(xz: np.ndarray) -> bool:
+        p = np.asarray(xz, np.float64).reshape(-1)[:2]
+        return len(tree.query_ball_point(p, TOWN_RADIUS_M)) >= TOWN_BUILDINGS
+
+    return at
+
+
 def _furniture(
     geo: TrackGeometry,
     ground: Callable[[np.ndarray], np.ndarray],
@@ -2103,9 +2163,10 @@ def _furniture(
         m, geo.projection, geo.route, ground, s_range=(geo.s_a, geo.s_b), way_id=geo.way_id,
         items=street_items, osm=osm, mapillary=mly, coverage=coverage, surface=surface,
         options=options.furniture_options, lanes=geo.lane_layout, urban=geo.urban,
+        town_at=_town_at(sc), signal_nodes=_signal_nodes(sc),
     )  # fmt: skip
     sc.furniture = plan
-    names = street_names(plan.items)
+    names = street_names(plan.items, plan.signals)
     sc.furniture_names = tuple(sorted(names, key=names.get))
     way_id = geo.way_id if len(geo.way_id) == len(m) else None
     tree = cKDTree(m.centre[:, [0, 2]])
@@ -2143,10 +2204,7 @@ def _trees(
         max_trees=int(round(vopt.max_trees * density)),
         max_trees_per_km=vopt.max_trees_per_km * density,
     )
-    if options.landcover_source is not None:
-        landcover = options.landcover_source(geo.projection)
-    else:
-        landcover = LandcoverSampler(geo.projection, cache_dir=options.cache_dir)
+    landcover = _landcover_fn(geo, options)
     exclude = _tree_exclusion(geo, sc)
     try:
         sc.trees = place_trees(
@@ -2253,6 +2311,7 @@ def _scenery_stats(sc: _Scenery, geo: TrackGeometry, extra: Mapping[str, object]
             "footprints_found": dict(sc.footprints.found) if sc.footprints else {},
             "conflation": _conflation_stats(sc.footprints),
             "categories": dict(bld_stats.by_category),
+            "placement": dict(sc.building_report),
             "sources": dict(bld_stats.by_source),
             "doors": bld_stats.doors,
             "mesh_bytes": bld_stats.mesh_bytes,
@@ -2283,6 +2342,8 @@ def _furniture_stats(sc: _Scenery) -> dict:
         "route_controls": [c for c in plan.controls if c["control"]],
         "mapillary_driveways": plan.driveways,
         "clearance": plan.clearance,
+        "signals": plan.signals.stats()
+        | {"stops_dropped": plan.stops_under_signals, "stations": plan.signal_stations},
     }
 
 

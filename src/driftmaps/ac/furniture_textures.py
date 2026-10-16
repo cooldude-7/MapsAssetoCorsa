@@ -20,6 +20,9 @@ and the TAC Manual of Uniform Traffic Control Devices for Canada:
   mirror (UVs flipped by the geometry).
 - Street name blades: white legend on green. ASSUMED: Burlington's and Oakville's own blade
   designs could not be confirmed (2026-10-16), so the generic Ontario white-on-green is used.
+- Signal lenses (`geometry.signals`): a green left-turn arrow on black, and the pedestrian
+  signal's orange hand and white walking person on black (OTM Book 12 / TAC symbols); signal
+  heads are black with black backplates bordered in fluorescent yellow.
 
 The legend font is Pillow's bundled one (Aileron), stretched to each legend box: close to the
 narrow FHWA/Clearview lettering of the real signs, and the same on every PC.
@@ -87,6 +90,10 @@ _SIGNS: dict[str, Tile] = {
     "chevron": Tile(640, 0, 96, 128),
     "keep_right": Tile(736, 0, 102, 128),
     "all_way": Tile(840, 0, 180, 60),
+    # Signal lenses (square; under the swatches, beside the wood).
+    "lens_arrow_left": Tile(128, 352, 64, 64),
+    "ped_hand": Tile(192, 352, 64, 64),
+    "ped_walk": Tile(256, 352, 64, 64),
 }
 for _k, _v in enumerate(SPEEDS):
     _SIGNS[f"speed_limit:{_v}"] = Tile(128 * _k, 128, 128, 160)
@@ -113,6 +120,8 @@ SWATCHES: dict[str, tuple[int, int, int]] = {
     "concrete": (172, 170, 164),
     "transformer": (120, 128, 124),
     "paint_white": (235, 235, 230),
+    "backplate_yellow": (222, 228, 40),  # fluorescent yellow retroreflective border
+    "lens_off": (34, 34, 32),
 }
 _SWATCH_Y = 288
 _SWATCH = 32
@@ -329,7 +338,49 @@ def _name(w: int, h: int, text: str) -> Image.Image:
     return img
 
 
+def _lens_arrow_left(w: int, h: int) -> Image.Image:
+    """A lit green left-turn arrow on a black lens."""
+    img = Image.new("RGB", (w, h), (16, 16, 16))
+    d = ImageDraw.Draw(img)
+    d.ellipse([w * 0.04, h * 0.04, w * 0.96, h * 0.96], fill=(20, 40, 30))
+    g = (60, 235, 150)
+    d.rectangle([w * 0.42, h * 0.42, w * 0.80, h * 0.58], fill=g)
+    _polygon(d, np.array([[w * 0.16, h * 0.50], [w * 0.46, h * 0.24], [w * 0.46, h * 0.76]]), g)
+    return img
+
+
+def _ped_hand(w: int, h: int) -> Image.Image:
+    """The lit upraised hand (don't walk), Portland orange on black."""
+    img = Image.new("RGB", (w, h), (16, 16, 16))
+    d = ImageDraw.Draw(img)
+    o = (255, 120, 30)
+    d.rounded_rectangle([w * 0.30, h * 0.42, w * 0.70, h * 0.84], radius=w * 0.10, fill=o)
+    for k, top in enumerate((0.22, 0.16, 0.18, 0.26)):  # four fingers
+        x0 = w * (0.30 + 0.10 * k)
+        d.rounded_rectangle([x0, h * top, x0 + w * 0.085, h * 0.55], radius=w * 0.04, fill=o)
+    _polygon(d, np.array([[w * 0.30, h * 0.62], [w * 0.16, h * 0.44], [w * 0.22, h * 0.40],
+                          [w * 0.34, h * 0.52]]), o)  # fmt: skip
+    return img
+
+
+def _ped_walk(w: int, h: int) -> Image.Image:
+    """The walking person (unlit here: dark grey on black)."""
+    img = Image.new("RGB", (w, h), (16, 16, 16))
+    d = ImageDraw.Draw(img)
+    c = (70, 70, 66)
+    lw = int(w * 0.09)
+    d.ellipse([w * 0.44, h * 0.10, w * 0.58, h * 0.24], fill=c)
+    d.line([(w * 0.50, h * 0.28), (w * 0.47, h * 0.58)], fill=c, width=lw)
+    d.line([(w * 0.47, h * 0.58), (w * 0.34, h * 0.88)], fill=c, width=lw)
+    d.line([(w * 0.47, h * 0.58), (w * 0.62, h * 0.88)], fill=c, width=lw)
+    d.line([(w * 0.36, h * 0.48), (w * 0.50, h * 0.32), (w * 0.64, h * 0.46)], fill=c, width=lw)
+    return img
+
+
 _FACES = {
+    "lens_arrow_left": _lens_arrow_left,
+    "ped_hand": _ped_hand,
+    "ped_walk": _ped_walk,
     "stop": _stop,
     "yield": _yield,
     "stop_ahead": _stop_ahead,

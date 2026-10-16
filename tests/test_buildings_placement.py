@@ -6,6 +6,7 @@ import math
 
 import numpy as np
 import pytest
+import shapely
 
 from driftmaps.ac.building_textures import (
     ATLAS_U_M,
@@ -135,7 +136,8 @@ def test_budget_lod_batches_and_distance():
     assert "osm:far" not in {b.id for b in allb}  # beyond 300 m
     total = sum(mesh_bytes(b.mesh) for b in allb)
     small = place_buildings(fps, PROJ, road, _flat, seed="t",
-                            options=BuildingOptions(budget_bytes=total // 3))  # fmt: skip
+                            options=BuildingOptions(budget_bytes=total // 3, frontage_m=0.0,
+                                                    town_budget_bytes=total // 3))  # fmt: skip
     assert 0 < len(small) < len(allb)
     near = max(b.road_distance_m for b in small)
     kept = {b.id for b in small}
@@ -146,3 +148,146 @@ def test_budget_lod_batches_and_distance():
     lods = {m.flags.get("lod_out") for m in meshes if not m.collision}
     assert lods == {BuildingOptions().lod_out_m, BuildingOptions().detail_lod_out_m}
     assert math.isclose(sum(m.building_count for m in meshes if not m.collision), len(allb))
+
+
+def _subdivision(n_rows=2) -> list:
+    """Rows of 13 detached houses (12 x 9 m, 15 m apart) at z = 20 and z = 90: 26 within
+    100 m of the lot at z = 50-70 between them."""
+    return [
+        _fp(f"osm:h{r}{i:02d}", _rect(-96 + 15 * i, 20 + 70 * r, 12, 9), tags={})
+        for r in range(n_rows)
+        for i in range(13)
+    ]
+
+
+def _place(fps, **kw):
+    return {b.id: b for b in place_buildings(fps, PROJ, _road(), _flat, seed="t", **kw)}
+
+
+def _cover(cls):
+    return lambda xz: np.full(len(xz), cls, np.uint8)
+
+
+def test_barns_only_in_the_country():
+    big = _fp("ms:q:big", _rect(-14, 50, 28, 20), "microsoft", tags={})  # 560 m2, untyped
+    alone = _place([big])["ms:q:big"]
+    assert alone.category == "barn" and not alone.town
+    town = _place([big, *_subdivision()])
+    assert town["ms:q:big"].category != "barn" and town["ms:q:big"].town
+    assert town["ms:q:big"].wall_style not in ("barn_red", "barn_grey", "steel_white")
+    # An OSM-tagged barn stays a barn wherever it stands.
+    tagged = _fp("osm:barn", _rect(-15, 50, 30, 20), tags={"building": "barn"})
+    assert _place([tagged, *_subdivision()])["osm:barn"].category == "barn"
+    # A hamlet (12 houses within 100 m): in the country among fields and woods, else a town.
+    hamlet = _subdivision(1)[:12]
+    assert _place([big, *hamlet], landcover=_cover(15))["ms:q:big"].category == "barn"
+    assert _place([big, *hamlet], landcover=_cover(6))["ms:q:big"].category == "barn"
+    assert _place([big, *hamlet], landcover=_cover(17))["ms:q:big"].category != "barn"
+    assert _place([big, *hamlet])["ms:q:big"].category != "barn"  # no land cover: a town
+    # A farm: a house or two among barns and sheds (which do not count), even where NRCan maps
+    # the farmstead as urban.
+    farm = [_fp(f"ms:q:b{i}", _rect(-60 + 30 * i, 100, 25, 20), "microsoft", tags={})
+            for i in range(5)] + [_fp(f"ms:q:s{i}", _rect(-60 + 8 * i, 20, 4, 4), "microsoft",
+                                      tags={}) for i in range(12)]  # fmt: skip
+    got = _place([big, *farm, *_subdivision(1)[:3]], landcover=_cover(15))
+    assert got["ms:q:big"].category == "barn" and got["ms:q:b0"].category == "barn"
+    # A district of big buildings on all-urban land cover (shops by the lake) is a town.
+    got = _place([big, *farm, *_subdivision(1)[:3]], landcover=_cover(17))
+    assert got["ms:q:big"].category != "barn" and got["ms:q:big"].town
+
+
+def test_town_houses_are_brick_rows_with_a_door_per_unit():
+    from driftmaps.geometry.buildings import _TOWN_HOUSE_WALLS, _TOWNHOUSE_WALLS
+
+    row = _fp("ms:q:row", _rect(-16, 50, 32, 10), "microsoft", tags={})  # 5 units of 6.4 m
+    got = _place([row, *_subdivision()])
+    b = got["ms:q:row"]
+    assert b.category == "townhouse" and b.roof.shape != ROOF_FLAT
+    assert b.wall_style in dict(_TOWNHOUSE_WALLS) and b.wall_style.startswith(("brick", "stone"))
+    fronts = [d for d in b.doors if d.style.startswith("door_")]
+    assert len(fronts) == 5 and all(d.edge == b.front_edge for d in b.doors)
+    houses = [h for h in got.values() if h.category == "house"]
+    assert len(houses) == 26 and all(h.wall_style in dict(_TOWN_HOUSE_WALLS) for h in houses)
+    assert all(h.roof_style.startswith("shingle") for h in houses)
+    styles = {h.wall_style for h in houses}
+    assert not styles & {"board_white", "barn_red", "barn_grey", "steel_white", "shed_wood"}
+    # The same footprint in the country is one long house, not a row of units.
+    assert _place([row])["ms:q:row"].category == "house"
+
+
+def test_garages_wear_their_house_colours():
+    house = _fp("osm:w10", _rect(-6, 30, 12, 9))
+    garages = [
+        _fp(
+            f"osm:g{i}",
+            _rect(10 + 9 * (i % 2), 32 + 9 * (i // 2), 6, 7),
+            tags={"building": "garage"},
+        )
+        for i in range(6)
+    ]
+    got = _place([house, *garages])
+    assert all(got[g.id].wall_style == got["osm:w10"].wall_style for g in garages)
+
+
+def test_street_front_buildings_are_always_placed():
+    # A downtown block: shops 3 m from the road's edge (inside the 4 m wall corridor), and
+    # 200 more buildings behind them; a budget too small for even the street front.
+    road = _road(1200.0)
+    front = [_fp(f"osm:f{i:02d}", _rect(-300 + 15 * i, 7, 12, 12), tags={"building": "retail"})
+             for i in range(40)]  # fmt: skip
+    back = [_fp(f"osm:b{i:03d}", _rect(-300 + 12 * (i % 50), 80 + 25 * (i // 50), 8, 8))
+            for i in range(200)]  # fmt: skip
+    corridor = shapely.box(-600, -8, 600, 8)  # road (4 m) + 4 m verge each side
+    rep: dict = {}
+    opts = BuildingOptions(budget_bytes=1000, town_budget_bytes=1000)
+    got = place_buildings(front + back, PROJ, road, _flat, seed="t", corridor=corridor,
+                          options=opts, report=rep)  # fmt: skip
+    ids = {b.id for b in got}
+    assert all(f.id in ids for f in front)  # in the wall corridor and over budget: placed
+    assert not any(b.id in ids for b in back)  # beyond 60 m, over budget: dropped
+    assert rep["street_front"] == 40 and rep["placed"] == 40 and rep["budget"] == 200
+    assert rep["town"] == 240 and rep["corridor"] == 0
+    # In the country the wall corridor still keeps buildings away from the road.
+    lone = _fp("osm:lone", _rect(0, 7, 12, 12), tags={"building": "house"})
+    rep = {}
+    assert place_buildings([lone], PROJ, road, _flat, corridor=corridor, report=rep) == []
+    assert rep["corridor"] == 1
+    # A footprint over a side road (the network's paved surface) is dropped in town too.
+    paved = shapely.box(-306, 0, -294, 300)  # a side road through the first shop
+    got = place_buildings(front + back, PROJ, road, _flat, seed="t", corridor=corridor,
+                          options=opts, paved=paved)  # fmt: skip
+    assert "osm:f00" not in {b.id for b in got} and "osm:f01" in {b.id for b in got}
+
+
+def test_commercial_roofs_stay_flat_and_gables_keep_brick_proportions():
+
+    retail = {"building": "retail"}
+    tower = _one(_fp("burlington:9", _rect(-10, 30, 20, 15), "burlington", tags=retail,
+                     peak_m=34.0, eave_m=30.0))  # fmt: skip
+    assert tower.roof.shape == ROOF_FLAT and tower.eave_h == pytest.approx(30.0)  # clamp 30
+    shop = _one(_fp("burlington:8", _rect(-10, 30, 20, 15), "burlington", tags=retail,
+                    peak_m=5.0, eave_m=4.0))  # fmt: skip
+    assert shop.roof.shape == ROOF_FLAT and shop.eave_h == pytest.approx(4.6)  # + parapet
+    plaza = _one(_fp("burlington:7", _rect(-10, 30, 20, 15), "burlington", tags=retail,
+                     peak_m=7.5, eave_m=4.0))  # fmt: skip
+    assert plaza.roof.shape != ROOF_FLAT  # a low building with a real pitched roof
+    # In town a wide untyped building whose peak is 11 m above its eave (a garage's stair
+    # tower) is flat, not a barn-like 11 m gable; in the country it keeps its big roof.
+    big = _fp("burlington:11", _rect(-20, 40, 40, 20), "burlington", tags={}, peak_m=18.0,
+              eave_m=7.0)  # fmt: skip
+    got = _place([big, *_subdivision()])["burlington:11"]
+    assert got.roof.shape == ROOF_FLAT and got.eave_h == pytest.approx(7.6)
+    assert _place([big])["burlington:11"].roof.shape != ROOF_FLAT
+    # A 3 m gable end of a brick house is mapped 1:1 on the band's window-free end (u in the
+    # last 12 m), not on the 0.75 m strip stretched 4x into wood grain.
+    house = _one(_fp("burlington:10", _rect(-7, 30, 14, 8), "burlington", peak_m=8.0, eave_m=5.0))
+    house.wall_style = "brick_grey"
+    m = extrude_building(house, doors=False)
+    v0, v1 = band_v("brick_grey")
+    gable = (m.positions[:, 1] > house.eave_y + 0.5) & (np.abs(m.normals[:, 1]) < 1e-6)  # walls
+    assert gable.any()
+    ys, uv = m.positions[gable, 1], m.uvs[gable]
+    assert np.all((uv[:, 0] * ATLAS_U_M) % ATLAS_U_M >= WINDOW_ZONE_M - 1e-6)
+    v_per_m = (v1 - v0) / 3.0  # one storey of band per 3 m
+    top = np.argmax(ys)
+    assert uv[top, 1] == pytest.approx(v1 - (ys[top] - house.eave_y) * v_per_m, abs=1e-4)

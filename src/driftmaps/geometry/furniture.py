@@ -14,7 +14,11 @@ and the road markings tied to them (stop bars, crosswalks, arrows).
    measured pole line across unphotographed gaps. The junction control of the route's own
    approaches (`street_items.approach_stops`) is always applied: a stop sign where the route
    stops is never left out because a photo missed it, and the stop bar comes with it.
+   Street lights along urban stretches (rural chevrons and urban lights: notes below).
 4. Items other builders made (`items`, e.g. side-road stop signs, roundabout signs, mailboxes).
+5. Signals (`geometry.signals`, after the pole lines): every approach of each signalised route
+   junction gets its far-side corner pole, mast arm, heads per lane and pedestrian signals;
+   stop and yield signs on signalised approaches, or by any OSM signal node, are dropped.
 
 `dedupe` merges items of the same kind within `dedupe_m` on the same side of the road, keeping
 the best source (`PRIORITY`). `geometry.clearance` keeps every item off the drivable surface
@@ -33,9 +37,25 @@ once before the pole lines and once after them (their gap-filling poles; wires f
 - Chevrons: on the outside of curves whose advisory speed (v = sqrt(127 R (e + f)),
   e = 0.06, f = 0.16) is at least 20 km/h below the limit and that turn 30 degrees or more;
   spacing by advisory speed from the MUTCD 2009 Table 2C-6 metric equivalents (12/24/36/48 m).
+  Rule-made chevrons only on rural roads (`_Planner.rural_at`): a limit of 60 km/h or more
+  (untagged: 50 on residential and service streets, 80 elsewhere, the Highway Traffic Act
+  s.128 defaults), no sidewalk or `lit=yes` tag, and outside towns (`town_at`, from the
+  buildings' context). Curvy suburban streets get none (the user's Oakville check,
+  2026-10-16); photographed chevrons stay wherever they are.
 - Hydro poles: Ontario wood distribution poles, 11 m above ground, 2.4 m crossarm 0.3 m below
   the top, three pin insulators; spans 30-70 m (gaps filled at the run's median span);
   wires sag 2 % of the span.
+- Street lights (`_Planner.street_lights`), on urban stretches only (`lit=yes`, a sidewalk tag,
+  or in a town; never `lit=no`): Ontario cobra heads on 8.2 m galvanized poles 1 m behind the
+  road's edge, every 40 m on arterials (primary / secondary), 45 m on collectors (tertiary)
+  and 50 m on local streets (TAC Guide for the Design of Roadway Lighting, 2006: spacing
+  about 3.5-5 mounting heights for the usual staggered / one-sided layouts; ASSUMED within
+  that range, typical of Halton municipal standards). One side on roads narrower than 14 m
+  (the side with the hydro poles, whose poles then carry the lights, else the right), both
+  sides opposite on wider ones. None within 10 m of a junction's crossing road (corners: the
+  signal poles carry their own luminaires) or on a driveway (moved up to 6 m along the road,
+  else left out); a photographed or OSM light on that side within 0.6 spacings takes the
+  place of a rule-made one.
 
 **Meshes** (`furniture_meshes`): low-poly, merged per `cell_m` cell into at most four nodes:
 `furn_<cell>` (posts, poles, backs, lights; atlas, `lod_out_far_m`), `signs_<cell>` (sign faces,
@@ -49,7 +69,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -68,6 +88,7 @@ from driftmaps.geo.project import LocalProjection
 from driftmaps.geometry.clearance import CLEARANCE_M, DrivableSurface, clear_items
 from driftmaps.geometry.primitives import MeshData, merge, split
 from driftmaps.geometry.road import RoadModel
+from driftmaps.geometry.signals import SignalApproach, SignalPlan, draw_pole, plan_signals
 from driftmaps.geometry.street_items import (
     HYDRANT,
     LIGHT_STREET,
@@ -109,6 +130,18 @@ GroundFn = Callable[[np.ndarray], np.ndarray]
 # `street_items.SOURCE_PRIORITY` puts OSM first. OSM stop/give-way nodes sit on the road's
 # centreline, so a photographed sign gives the better position anyway.
 PRIORITY = ("municipal", "mapillary", "osm", "rule")
+# Streets that are urban without a `maxspeed` tag (50 km/h, HTA s.128), and the sidewalk tags
+# that make a road urban (chevrons: module notes).
+_URBAN_HIGHWAYS = frozenset({"residential", "living_street", "service", "pedestrian"})
+_SIDEWALK_KEYS = ("sidewalk", "sidewalk:both", "sidewalk:left", "sidewalk:right")
+_SIDEWALK_YES = frozenset({"both", "left", "right", "yes", "separate"})
+# Street lights (module notes): spacing by road class, both sides from this half width.
+_LIGHT_SPACING_M = {"motorway": 40.0, "trunk": 40.0, "primary": 40.0, "secondary": 40.0,
+                    "tertiary": 45.0}  # fmt: skip
+_LIGHT_SPACING_LOCAL_M = 50.0
+LIGHT_BOTH_SIDES_HALF_M = 7.0
+LIGHT_BEHIND_EDGE_M = 1.0
+LIGHT_CORNER_M = 10.0
 # A pole with no reliable position across the road stands this far beyond the gravel shoulder
 # (ASSUMED: rural Ontario pole lines run near the right-of-way limit, ~8 m from the centre of
 # a 7 m road with 1 m shoulders).
@@ -164,6 +197,9 @@ class FurniturePlan:
     # `geometry.clearance`: items moved off / dropped, signs re-faced, and what still stands
     # on the drivable surface ("on_surface", "near_surface": within CLEARANCE_M; both 0)
     clearance: dict[str, int] = field(default_factory=dict)
+    signals: SignalPlan = field(default_factory=SignalPlan)  # signalised junctions, poles
+    stops_under_signals: int = 0  # stop / yield signs dropped from signalised approaches
+    signal_stations: list[float] = field(default_factory=list)  # metres from the start (A)
 
 
 @dataclass
@@ -415,9 +451,10 @@ def _road_half(tags: Mapping[str, str] | None) -> float:
 
 class _Planner:
     def __init__(self, model, projection, route, s_range, ground, way_id, options, coverage,
-                 lanes=None, urban=None):  # fmt: skip
+                 lanes=None, urban=None, town_at=None):  # fmt: skip
         self.lanes = lanes  # geometry.lanes.RoadLanes of the route (None: halves of the road)
         self.urban = None if urban is None or len(urban) != len(model.s) else np.asarray(urban)
+        self.town_at = town_at  # XZ (2,) -> True in a town (subdivision, downtown)
         self.m = model
         self.proj = projection
         self.route = route
@@ -481,7 +518,8 @@ class _Planner:
         hi = hi - (0.2 if hi >= hw - 1e-6 else 0.25)
         return (lo, hi) if hi > lo else None
 
-    def urban_at(self, s: float) -> bool:
+    def urban_section_at(self, s: float) -> bool:
+        """The route has the urban cross-section (curbs, sidewalks) at station s."""
         return bool(self.urban[self.m.index_at(s)]) if self.urban is not None else False
 
     def arrows(self, s_bar: float, forward: bool) -> None:
@@ -505,10 +543,99 @@ class _Planner:
                 self.markings.append(Marking(kind, base, c - 0.5, c + 0.5, "osm", forward))
 
     def _speed_at(self, s: float) -> int | None:
+        return parse_speed(self._tags_at(s).get("maxspeed"))
+
+    def _tags_at(self, s: float) -> Mapping[str, str]:
         if len(self.way_id) != len(self.m.s):
-            return None
+            return {}
         wid = int(self.way_id[self.m.index_at(s)])
-        return parse_speed((self.route.ways.get(wid) or {}).get("maxspeed"))
+        return self.route.ways.get(wid) or {}
+
+    def rural_at(self, s: float) -> bool:
+        """A rural road at station s (module notes, "Chevrons")."""
+        tags = self._tags_at(s)
+        v = parse_speed(tags.get("maxspeed"))
+        if v is None:
+            v = 50 if tags.get("highway") in _URBAN_HIGHWAYS else 80
+        if v < 60 or tags.get("lit") == "yes":
+            return False
+        if any(tags.get(k) in _SIDEWALK_YES for k in _SIDEWALK_KEYS):
+            return False
+        return not (self.town_at is not None and self.town_at(self.frame.point(s, 0.0)))
+
+    def urban_at(self, s: float) -> bool:
+        """A lit (urban) stretch at station s (module notes, "Street lights")."""
+        tags = self._tags_at(s)
+        lit = str(tags.get("lit", ""))
+        if lit == "no":
+            return False
+        if lit == "yes" or any(tags.get(k) in _SIDEWALK_YES for k in _SIDEWALK_KEYS):
+            return True
+        if self.urban_section_at(s):  # built with curbs and sidewalks
+            return True
+        return self.town_at is not None and bool(self.town_at(self.frame.point(s, 0.0)))
+
+    # -- street lights ----------------------------------------------------------------------------
+
+    def street_lights(self, juncs: list[_Junction], surface: DrivableSurface | None) -> None:
+        """Rule-made street lights along the urban stretches (module notes)."""
+        f = self.frame
+        meas: dict[int, list[float]] = {-1: [], 1: []}
+        poles: dict[int, list[float]] = {-1: [], 1: []}
+        its = [it for it in self.items if it.kind in (LIGHT_STREET, POLE_UTILITY)]
+        if its:
+            st, off, inside = f.project(np.array([(it.position[0], it.position[2]) for it in its]))
+            for it, s_, o_, ins in zip(its, st, off, inside, strict=True):
+                if ins and abs(o_) <= 25.0:
+                    (meas if it.kind == LIGHT_STREET else poles)[1 if o_ > 0 else -1].append(
+                        float(s_)
+                    )
+        meas = {k: np.sort(v) for k, v in meas.items()}
+        poles = {k: np.sort(v) for k, v in poles.items()}
+        corners = [(j.s, max([_road_half(self.route.ways.get(w)) for w, _ in j.legs], default=3.5))
+                   for j in juncs]  # fmt: skip
+        last = {-1: -1e9, 1: -1e9}
+        s = f.s0
+        while s <= f.s1:
+            if not self.urban_at(s) or any(abs(s - js) < h + LIGHT_CORNER_M for js, h in corners):
+                s += 5.0
+                continue
+            hw = (self._tags_at(s).get("highway") or "").removesuffix("_link")
+            spacing = _LIGHT_SPACING_M.get(hw, _LIGHT_SPACING_LOCAL_M)
+            if f.half(s) >= LIGHT_BOTH_SIDES_HALF_M:
+                sides = (-1, 1)
+            else:
+                near = {k: int(np.sum(np.abs(v - s) < 100.0)) for k, v in poles.items()}
+                sides = (1,) if near[1] > near[-1] else (-1,)
+            for side in sides:
+                if s - last[side] < spacing:
+                    continue
+                m_ = meas[side]
+                if len(m_) and float(np.min(np.abs(m_ - s))) < 0.6 * spacing:
+                    last[side] = s  # a measured light stands here
+                    continue
+                at = s
+                p_ = poles[side]
+                if len(p_) and float(np.min(np.abs(p_ - s))) < 0.4 * spacing:
+                    at = float(p_[np.argmin(np.abs(p_ - s))])  # hung on the hydro pole
+                p = self._light_spot(at, side, surface)
+                if p is None:
+                    continue
+                facing = -side * f.at(at)[2]
+                self.items.append(_item(LIGHT_STREET, p, facing, self.ground, "rule"))
+                last[side] = at
+            s += 5.0
+
+    def _light_spot(self, s: float, side: int, surface: DrivableSurface | None):
+        """Where a light stands at station s (shifted up to 6 m off a driveway), or None."""
+        for ds in (0.0, 3.0, -3.0, 6.0, -6.0):
+            q = s + ds
+            if not self.frame.s0 <= q <= self.frame.s1:
+                continue
+            p = self.frame.point(q, side * (self.frame.edge(q) + LIGHT_BEHIND_EDGE_M))
+            if surface is None or float(surface.distance(p[None, :])[0]) >= 0.9:
+                return p
+        return None
 
     # -- measured items -----------------------------------------------------------------------
 
@@ -679,7 +806,7 @@ class _Planner:
                     mapped = mapped or "stop"
                 elif SIGN_YIELD in kinds:
                     mapped = mapped or "yield"
-                ctl = approach_stops(hw, others, mapped=mapped, urban=self.urban_at(j.s),
+                ctl = approach_stops(hw, others, mapped=mapped, urban=self.urban_section_at(j.s),
                                      crossing=sides)  # fmt: skip
                 self.plan.controls.append({"node": j.node, "s": round(j.s, 1), "forward": forward,
                                            "approach": hw, "others": others,
@@ -729,8 +856,6 @@ class _Planner:
                 if ctl in ("stop", "signal"):
                     l0, l1 = self.span(s_bar, forward)
                     self.markings.append(Marking("stop_bar", s_bar, l0, l1, "rule"))
-                if ctl == "signal":
-                    self._signal(s_bar, forward)
         # OSM stop / give-way nodes on the route away from any routed junction (a side road
         # the router does not know, a rail crossing): the node is the stop line; its
         # `direction` says who stops.
@@ -749,15 +874,36 @@ class _Planner:
             if ctl == "stop":
                 self.markings.append(Marking("stop_bar", s, sp[0], sp[1], "osm"))
 
-    def _signal(self, s_bar: float, forward: bool) -> None:
-        """A signal pole with a mast arm on the near right corner, and its luminaire."""
-        side = -1 if forward else 1
-        _, fwd, _ = self.frame.at(s_bar)
-        lat = side * (self.frame.edge(s_bar) + 1.0)
-        p = self.frame.point(s_bar, lat)
-        facing = -fwd if forward else fwd
-        self.items.append(_item(SIGNAL_TRAFFIC, p, facing, self.ground, "rule"))
-        self.items.append(_item(LIGHT_STREET, p, facing, self.ground, "rule"))
+    def signal_junctions(self, juncs: list[_Junction]):
+        """(node, centre XZ, legs) of every route junction for `signals.plan_signals`: the
+        route's two legs (widths from the built road, lanes from their ways and the
+        direction the route runs along them) and the side roads (widths from their tags)."""
+        path = self.route.node_path()
+        at = {node: k for k, node in enumerate(path)}
+        out = []
+        for j in juncs:
+            k = at.get(j.node)
+            if k is None or not 0 < k < len(path) - 1:
+                continue
+            e_in, e_out = self.route.edges[k - 1], self.route.edges[k]
+            _, fwd, _ = self.frame.at(j.s)
+            legs = []
+            for edge, d, s_leg, arrive_dir in ((e_in, -fwd, j.s - 15.0, 1),
+                                               (e_out, fwd, j.s + 15.0, -1)):  # fmt: skip
+                tags = self.route.ways.get(edge.way) or {}
+                toward = edge.dir * arrive_dir > 0  # arriving traffic moves along the way
+                ow = str(tags.get("oneway", ""))
+                oneway = 0
+                if ow in ("yes", "1", "true", "-1"):
+                    flows = toward if ow != "-1" else not toward
+                    oneway = -1 if flows else 1
+                legs.append(SignalApproach(np.asarray(d, float), self.frame.half(s_leg), tags,
+                                           toward, oneway, on_route=True))  # fmt: skip
+            for way, d in j.legs:
+                tags = self.route.ways.get(way) or {}
+                legs.append(SignalApproach(np.asarray(d, float), _road_half(tags), tags))
+            out.append((j.node, self.frame.point(j.s, 0.0), legs))
+        return out
 
     # -- speed limits ---------------------------------------------------------------------------
 
@@ -823,6 +969,8 @@ class _Planner:
             v = self._speed_at((s_a + s_b) / 2) or 80
             v_adv = math.sqrt(127.0 * r_min * (0.06 + 0.16))
             if defl < self.o.min_curve_deflection_deg or v_adv > v - self.o.chevron_speed_drop_kmh:
+                continue
+            if not (self.rural_at(s_a) and self.rural_at(s_b) and self.rural_at((s_a + s_b) / 2)):
                 continue
             spacing = (
                 12.0 if v_adv <= 25 else 24.0 if v_adv <= 50 else 36.0 if v_adv <= 70 else 48.0
@@ -1050,6 +1198,8 @@ def plan_furniture(
     options: FurnitureOptions | None = None,
     lanes=None,
     urban: np.ndarray | None = None,
+    town_at: Callable[[np.ndarray], bool] | None = None,
+    signal_nodes: Collection[int] = (),
 ) -> FurniturePlan:
     """Every street item for the track (see the module notes), de-duplicated, with the pole
     wires and the route's markings. `coverage` is Mapillary's photo positions (N, 2) lon/lat
@@ -1057,11 +1207,15 @@ def plan_furniture(
     `surface` the drivable surface items keep off (`geometry.clearance`; default: the route's
     asphalt and shoulders). `lanes` (`geometry.lanes.RoadLanes`) places the markings in the
     route's lanes (stop lines across the approach lanes only, turn arrows per lane); `urban`
-    (N,) lets town junctions of arterials be signalized (`street_items.approach_stops`)."""
+    (N,) lets town junctions of arterials be signalized (`street_items.approach_stops`);
+    `town_at(xz)` True in a town (no rule-made chevrons there); `signal_nodes` route nodes the
+    network knows to be signalised (besides OSM signal nodes and Mapillary traffic lights)."""
     o = options or FurnitureOptions()
     s_range = s_range or (float(model.s[0]), float(model.s[-1]))
     way_id = np.asarray(way_id if way_id is not None else np.zeros(0), np.int64)
-    pl = _Planner(model, projection, route, s_range, ground, way_id, o, coverage, lanes, urban)
+    pl = _Planner(
+        model, projection, route, s_range, ground, way_id, o, coverage, lanes, urban, town_at
+    )
     pl.plan.covered_fraction = float(pl.covered.mean()) if len(pl.covered) else 0.0
     pl.add_mapillary(list(mapillary))
     pl.add_osm(osm)
@@ -1094,7 +1248,9 @@ def plan_furniture(
 
     pl.items = dedupe(pl.items, o.dedupe_m, pole_radius_m=o.pole_dedupe_m, sides=sides(pl.items))
     pl.pole_lines()
+    pl.street_lights(juncs, surf)
     pl.items = dedupe(pl.items, o.dedupe_m, pole_radius_m=o.pole_dedupe_m, sides=sides(pl.items))
+    _signals(pl, juncs, osm, list(mapillary), surf, signal_nodes)
     stats += clear(first=False)  # what the pole lines put on a side road or junction
     pl.items = _attach_lights(pl.items)
     plan = pl.plan
@@ -1111,6 +1267,92 @@ def plan_furniture(
         plan.counts[key][mk.source] = plan.counts[key].get(mk.source, 0) + 1
     plan.osm_nodes = sorted(set(plan.osm_nodes))
     return plan
+
+
+_TRAFFIC_LIGHT = "object--traffic-light--"
+_UNDER_SIGNALS = (SIGN_STOP, SIGN_YIELD, SIGN_ALL_WAY)
+UNDER_SIGNAL_M = 25.0  # stop / yield signs this far beyond a signalised junction's poles go
+UNDER_SIGNAL_NODE_M = 35.0  # ... and rule / OSM ones this close to an OSM signal node
+SIGNAL_POLE_EDGE_M = 1.2  # signal poles stand at least this far off the drivable surface
+
+
+def _signals(
+    pl: _Planner, juncs: list[_Junction], osm, mapillary: Sequence,
+    surface: DrivableSurface | None = None,
+    signal_nodes: Collection[int] = (),
+) -> None:  # fmt: skip
+    """Ontario signals on every approach of each signalised route junction
+    (`geometry.signals`): corner poles (signal items, moved off the surface by the next
+    clearance pass) with a luminaire each; stop and yield signs on those approaches, and any
+    other signal item there, are dropped. So are rule-made and OSM stop and yield signs
+    within `UNDER_SIGNAL_NODE_M` of any OSM traffic signal node, also at junctions this layer
+    does not plan (beyond A and B, in the run-off: the Burlington check's wrongly facing stop
+    sign on a signalised side street). Poles planned on the real drivable `surface` (a big
+    junction's corners are wider than the roads' tags say) first move to the nearest spot
+    `SIGNAL_POLE_EDGE_M` off it (`_off_surface`), so the clearance pass does not drop them."""
+    nodes = [n for n in (osm.nodes if osm is not None else ()) if
+             n.tags.get("highway") == "traffic_signals"]  # fmt: skip
+    sig_xz = _xz_of(pl.proj, np.array([(n.lon, n.lat) for n in nodes])) if nodes else np.zeros(
+        (0, 2))  # fmt: skip
+    lights = [f for f in mapillary if f.value.startswith(_TRAFFIC_LIGHT)]
+    light_xz = (_xz_of(pl.proj, np.array([(f.lon, f.lat) for f in lights])) if lights
+                else np.zeros((0, 2)))  # fmt: skip
+    plan = plan_signals(pl.signal_junctions(juncs), sig_xz, light_xz, signal_nodes)
+    pl.plan.signals = plan
+    if len(sig_xz):
+        tree = cKDTree(sig_xz)
+        keep = []
+        for it in pl.items:
+            if it.kind in _UNDER_SIGNALS and it.source in ("rule", "osm"):
+                d, _ = tree.query([it.position[0], it.position[2]])
+                if d <= UNDER_SIGNAL_NODE_M:
+                    pl.plan.stops_under_signals += 1
+                    continue
+            keep.append(it)
+        pl.items = keep
+    if not plan.junctions:
+        return
+    st, _, _ = pl.frame.project(np.array([c for _, c, _ in plan.junctions]))
+    pl.plan.signal_stations = sorted(round(float(v) - pl.frame.s0, 1) for v in st)
+    nodes_sig = {f"junction:{node}" for node in plan.nodes}
+    keep = []
+    for it in pl.items:
+        xz = np.array([it.position[0], it.position[2]])
+        if it.kind in _UNDER_SIGNALS and (it.ref in nodes_sig or plan.near(xz, UNDER_SIGNAL_M)):
+            pl.plan.stops_under_signals += 1
+            continue
+        if it.kind == SIGNAL_TRAFFIC and plan.near(xz, 5.0):
+            continue  # our corner poles replace it
+        keep.append(it)
+    for pole in plan.poles:
+        if surface is not None:
+            pole.xz = _off_surface(pole.xz, pole.origin, surface)
+        facing = pole.axis if pole.axis is not None else np.array([1.0, 0.0])
+        keep.append(_item(SIGNAL_TRAFFIC, pole.xz, -facing, pl.ground, "rule", ref=pole.ref))
+        if not pole.post:  # Ontario signal poles carry the junction's luminaires
+            keep.append(_item(LIGHT_STREET, pole.xz, -facing, pl.ground, "rule"))
+    pl.items = keep
+
+
+def _off_surface(xz: np.ndarray, centre: np.ndarray, surface: DrivableSurface) -> np.ndarray:
+    """The nearest point to `xz` (within 20 m, not nearer the junction `centre`) that stands
+    SIGNAL_POLE_EDGE_M off the drivable surface: the corner the plan meant, where a big
+    junction's real pavement reaches farther than the roads' tags say. `xz` itself when it
+    already stands clear or nothing does."""
+    p = np.asarray(xz, np.float64)
+    if float(surface.distance(p[None, :])[0]) >= SIGNAL_POLE_EDGE_M:
+        return p
+    ang = np.linspace(0.0, 2.0 * np.pi, 24, endpoint=False)
+    rad = np.arange(0.5, 20.01, 0.5)
+    ring = np.stack([np.cos(ang), np.sin(ang)], axis=1)
+    cand = (p[None, None, :] + rad[:, None, None] * ring[None, :, :]).reshape(-1, 2)
+    c = np.asarray(centre, np.float64)
+    keep = np.hypot(*(cand - c).T) >= float(np.hypot(*(p - c))) - 1.0
+    cand = cand[keep]
+    ok = cand[surface.distance(cand) >= SIGNAL_POLE_EDGE_M]
+    if not len(ok):
+        return p
+    return ok[int(np.argmin(np.hypot(*(ok - p).T)))]
 
 
 def _on_surface(items: Sequence[StreetItem], surf: DrivableSurface) -> dict[str, int]:
@@ -1601,6 +1843,7 @@ def furniture_meshes(
 
     r = _Renderer(road_y, walls, frame, o, dict(names or {}))
     items = plan.items
+    sig_poles = {p.ref: p for p in plan.signals.poles}
     # Poles first: their wire attachment points depend on the line direction.
     poles = [it for it in items if it.kind == POLE_UTILITY]
     att: dict[int, list[np.ndarray]] = {}
@@ -1670,6 +1913,11 @@ def furniture_meshes(
                 else np.array(it.facing)
             )
             r.light(it, toward)
+        elif it.kind == SIGNAL_TRAFFIC and it.ref in sig_poles:
+            base = np.array(it.position, float)
+            draw_pole(r.cell(base[0], base[2]), sig_poles[it.ref], base, road_y, r.names, r.metal)
+            if o.collide:
+                r.collider(base, 0.2)
         elif it.kind == SIGNAL_TRAFFIC:
             st, off, _ = frame.project(np.array([[it.position[0], it.position[2]]]))
             over = max(2.5, abs(float(off[0])) - 1.75)
@@ -1699,9 +1947,12 @@ def furniture_meshes(
     return out
 
 
-def street_names(items: Sequence[StreetItem]) -> dict[str, int]:
-    """Atlas index per street name on the blades (the first MAX_NAMES names, sorted)."""
-    names = sorted({it.text for it in items if it.kind == SIGN_STREET_NAME and it.text})
+def street_names(items: Sequence[StreetItem], signals: SignalPlan | None = None) -> dict[str, int]:
+    """Atlas index per street name on the blades and the signal mast arms (the first
+    MAX_NAMES names, sorted)."""
+    names = {it.text for it in items if it.kind == SIGN_STREET_NAME and it.text}
+    names |= {p.name for p in (signals.poles if signals is not None else ()) if p.name}
+    names = sorted(names)
     return {n: k for k, n in enumerate(names[:MAX_NAMES])}
 
 
