@@ -153,6 +153,15 @@ code { font-family: var(--mono); font-size: 12px; word-break: break-all; }
 .ac-form label { display: block; margin-bottom: 4px; font-weight: 600; }
 .ac-form .row input { flex: 1; min-width: 0; font-family: var(--mono); font-size: 13px; }
 .ac-form .hint { margin: 6px 0 0; }
+.touge-box {
+  max-width: 920px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--warn) 25%, var(--border));
+}
+.touge-box .row .hint { flex: 1; margin: 0; }
+.touge-box .btn { flex: none; }
+.ok-text { color: var(--ok); font-weight: 550; }
 
 /* ---------- layout ---------- */
 
@@ -628,7 +637,25 @@ kbd {
   border-radius: 8px;
   background: var(--panel-2);
 }
+.track-item { flex-wrap: wrap; }
 .track-main { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.track-item .icon-btn[disabled] { opacity: 0.45; cursor: progress; }
+.track-share {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-basis: 100%;
+  min-width: 0;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12.5px;
+}
+.track-share.error { color: var(--bad); }
+.track-share .share-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.track-share .share-path { font: 11.5px/1.4 var(--mono); color: var(--text); }
+.track-share .btn, .track-share .spinner { flex: none; }
+.track-share .icon-btn { flex: none; width: 24px; height: 24px; }
 .track-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .track-meta { color: var(--muted); font-size: 12px; }
 .badge {
@@ -881,7 +908,7 @@ kbd {
 @media (max-width: 520px) {
   .topbar { flex-wrap: wrap; }
   .search { width: calc(100% - 64px); }
-  .ac-form .row { flex-wrap: wrap; }
+  .ac-form .row, .touge-box .row { flex-wrap: wrap; }
   .job-stats { grid-template-columns: repeat(2, auto); }
 }
 

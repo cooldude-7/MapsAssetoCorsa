@@ -9,6 +9,8 @@
 # What has to be bundled by hand (PyInstaller can't see it from the imports):
 # - every driftmaps module: the app imports the builder, router and elevation code lazily;
 # - driftmaps/app/static/** (the map page), read through importlib.resources;
+# - csp/new-modes/** (the Touge Battle CSP mode the app installs; driftmaps.csp_modes looks in
+#   <bundle>/csp/new-modes);
 # - rasterio's Cython modules import each other from C, and GDAL/PROJ need their data folders
 #   (rasterio/gdal_data, rasterio/proj_data, found next to rasterio's own files); on Windows the
 #   GDAL DLLs live in site-packages/rasterio.libs (a delvewheel folder);
@@ -155,6 +157,7 @@ hiddenimports += collect_submodules(
 hiddenimports += ["certifi"]
 
 datas = [(str(STATIC), "driftmaps/app/static")]
+datas += [(str(ROOT / "csp" / "new-modes"), "csp/new-modes")]
 datas += collect_data_files(
     "rasterio",
     excludes=["**/*.pyx", "**/*.pxd", "**/*.pxi", "**/*.h", "rio/**"],

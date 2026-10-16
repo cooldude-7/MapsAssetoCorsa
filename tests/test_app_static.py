@@ -40,6 +40,8 @@ API_PATHS = (
     "/api/build",
     "/api/jobs/",
     "/api/tracks",
+    "/api/open-folder",
+    "/api/install-touge",
 )
 
 NODE = shutil.which("node")
@@ -142,7 +144,7 @@ def test_script_follows_the_api_contract_and_map_sources():
     for field in (
         "route_id", "track_id", "install", "scenery_density", "reverse", "loop", "ac_root",
         "alternatives", "snapped", "far_pin", "tiles", "path", "start_t", "end_t",
-        "auto_guardrails", "build",
+        "auto_guardrails", "build", "zip_path", "size_mb",
     ):  # fmt: skip
         assert re.search(rf"\b{field}\b", js), f"app.js never sends/reads {field}"
 
@@ -179,6 +181,7 @@ HELPER_PROBE = r"""
 const ELL = [[0, 0], [0.01, 0], [0.01, 0.01]];
 const out = {
   len: [formatLength(850), formatLength(3421), formatLength(12345), formatLength(NaN)],
+  sizes: [formatSize(0.04), formatSize(3.21), formatSize(123.4), formatSize(NaN)],
   names: [
     defaultTrackName(["Snake Road"]), defaultTrackName([]), defaultTrackName(["A Rd", "B Rd"]),
     defaultTrackName(["A Rd", "B Rd", "C Rd"]), defaultTrackName([null, " Kerns Road "]),
@@ -262,6 +265,7 @@ def test_pure_helpers_under_node(tmp_path: Path):
     out = json.loads(proc.stdout)
 
     assert out["len"] == ["850 m", "3.42 km", "12.3 km", "–"]
+    assert out["sizes"] == ["under 0.1 MB", "3.2 MB", "123 MB", ""]
     assert out["names"] == ["Snake Road", "", "A Rd & B Rd", "A Rd to C Rd", "Kerns Road"]
     assert out["insertMid"] == 2
     assert out["insertFirst"] == 1

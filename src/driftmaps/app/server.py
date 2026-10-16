@@ -40,6 +40,13 @@ Binds 127.0.0.1 only. Endpoints (all JSON; errors are `{"error": "<plain English
 - `GET /api/tracks`, `DELETE /api/tracks/<id>`: tracks this app made (marker file or the
   "drift-maps" tag), in AC's `content/tracks` and the app's output folder. Other tracks are
   never listed or touched.
+- `POST /api/tracks/<id>/share` -> `{track_id, name, zip_path, folder, size_mb}`: zips one of
+  our tracks to `<app data>/shared/<id>.zip` for sending to a friend: the track folder at the
+  zip root (only its own files; symlinks are skipped) plus `HOW TO INSTALL.txt`.
+- `POST /api/open-folder {path}`: shows a folder (or a file's folder) in Explorer / the file
+  manager. Only paths inside the app data folder are opened, and never run.
+- `POST /api/install-touge`: installs the Touge Battle CSP New Mode (`driftmaps.csp_modes`) into
+  `<AC>/extension/lua/new-modes/acmg-touge/` (only that folder, and only over our own copy).
 
 Requests must come from this machine's own page: the Host header must name 127.0.0.1 or
 localhost (DNS-rebinding guard) and a POST/DELETE with an Origin header must come from it too
@@ -53,13 +60,16 @@ import importlib.resources
 import json
 import logging
 import math
+import os
 import re
+import subprocess
 import sys
 import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import zipfile
 from collections import OrderedDict
 from collections.abc import Callable
 from datetime import datetime
@@ -73,7 +83,7 @@ from driftmaps.ac.scene import (
     is_zip_time,
     marker_built_at,
 )
-from driftmaps.ac.track_files import validate_track_id
+from driftmaps.ac.track_files import KUNOS_NOTICE, validate_track_id
 from driftmaps.app.jobs import (
     NO_AC_MESSAGE,
     BuildRequest,
@@ -127,6 +137,7 @@ ROADS_GONE = (
 )
 MAX_PATH_NODES = 50_000
 CORRIDOR_BUFFER_M = 1500.0  # route_from_pins' corridor; cached tiles covering it skip Overpass
+SHARE_README = "HOW TO INSTALL.txt"
 
 _CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -369,6 +380,83 @@ def build_info() -> dict[str, str]:
     return out
 
 
+# -- sharing ------------------------------------------------------------------------------------
+
+
+def share_readme(name: str, track_id: str) -> str:
+    """`HOW TO INSTALL.txt` for a shared track zip (CRLF, for Notepad)."""
+    from driftmaps.geo.overpass import OSM_ATTRIBUTION
+
+    lines = [
+        name,
+        "",
+        "HOW TO INSTALL",
+        "1. Open your Assetto Corsa folder. In Steam: right-click Assetto Corsa, then Manage,",
+        "   then Browse local files.",
+        "2. Go into content\\tracks and extract this zip there, so you end up with",
+        f"   assettocorsa\\content\\tracks\\{track_id}\\",
+        f'3. Restart Content Manager (or Assetto Corsa) and pick "{name}" from the tracks.',
+        "",
+        "Made with Assetto Corsa Map Generator.",
+        "",
+        "DATA CREDITS",
+        f"{OSM_ATTRIBUTION}.",
+        f"Every data source and its licence is listed in {track_id}\\LICENSE-DATA.txt.",
+        "",
+        KUNOS_NOTICE,
+    ]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _skip_link(path: Path) -> bool:
+    return path.is_symlink() or path.is_junction()
+
+
+def share_files(folder: Path) -> list[tuple[str, Path]]:
+    """The track folder's own files as sorted `(zip name, path)`, zip names `<id>/...`.
+    Symlinks and junctions are skipped: they could point anywhere on the PC."""
+    out: list[tuple[str, Path]] = []
+    for dirpath, dirnames, filenames in os.walk(folder):  # never follows links
+        base = Path(dirpath)
+        dirnames[:] = [d for d in dirnames if not _skip_link(base / d)]
+        for name in filenames:
+            path = base / name
+            if not path.is_symlink() and path.is_file():
+                out.append((f"{folder.name}/{path.relative_to(folder).as_posix()}", path))
+    return sorted(out)
+
+
+def write_share_zip(folder: Path, zip_path: Path, readme: str) -> Path:
+    """Zip `folder` (at the zip root) and `HOW TO INSTALL.txt` to `zip_path`, atomically."""
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = zip_path.with_name(zip_path.name + ".tmp")
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            zf.writestr(SHARE_README, readme.encode("utf-8"))
+            for arcname, path in share_files(folder):
+                zf.write(path, arcname)
+        tmp.replace(zip_path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return zip_path
+
+
+def open_in_file_manager(folder: Path) -> None:
+    """Show `folder` in Explorer (Windows), Finder (macOS) or the desktop's file manager."""
+    if sys.platform == "win32":
+        os.startfile(str(folder))  # type: ignore[attr-defined]  # a folder: opens Explorer
+        return
+    cmd = "open" if sys.platform == "darwin" else "xdg-open"
+    subprocess.Popen(
+        [cmd, str(folder)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
 def _parse_path(value: object) -> list[int]:
     if not isinstance(value, list) or len(value) < 2:
         raise ApiError(400, "Send the route as path: a list of at least two road node ids.")
@@ -504,6 +592,7 @@ class App:
         self.jobs = JobQueue(BuildRunner(self.settings, build_fn))
         self._by_pins: OrderedDict[tuple, Route] = OrderedDict()
         self._lock = threading.Lock()
+        self._share_lock = threading.Lock()
         self._tiles: TileStore | None = None
 
     @property
@@ -900,7 +989,10 @@ class App:
                     entry["installed"] = True
         return sorted(found.values(), key=lambda t: str(t["built_at"]), reverse=True)
 
-    def delete_track(self, track_id: str) -> dict:
+    def _our_folders(self, track_id: str, refused: str) -> list[Path]:
+        """The folders (AC's, then the app's) holding our track `track_id`. Raises 400 for a
+        bad id, 409 while it builds, 403 if only someone else's folder has that name (with
+        "`track_id` wasn't made by this app, so it `refused`.") and 404 if there is none."""
         try:
             validate_track_id(track_id)
         except ValueError:
@@ -920,8 +1012,12 @@ class App:
                 foreign = True
         if not ours:
             if foreign:
-                raise ApiError(403, f"{track_id} wasn't made by this app, so it won't be deleted.")
+                raise ApiError(403, f"{track_id} wasn't made by this app, so it {refused}.")
             raise ApiError(404, f"There's no track called {track_id}.")
+        return ours
+
+    def delete_track(self, track_id: str) -> dict:
+        ours = self._our_folders(track_id, "won't be deleted")
         for folder in ours:
             try:
                 clear_track_folder(folder)
@@ -933,6 +1029,93 @@ class App:
                     "try again.",
                 ) from None
         return {"ok": True}
+
+    def share_track(self, track_id: str) -> dict:
+        """Zip our track to `<app data>/shared/<id>.zip` (newest copy if there are two)."""
+        ours = [
+            f for f in self._our_folders(track_id, "can't be shared here") if not _skip_link(f)
+        ]
+        if not ours:
+            raise ApiError(403, f"{track_id} is a link to another folder, so it can't be shared.")
+        folder = max(ours, key=lambda f: marker_built_at(f) or 0.0)  # ties: AC's copy
+        name = str(_track_info(folder)["name"])
+        zip_path = self.settings.data_dir / "shared" / f"{track_id}.zip"
+        with self._share_lock:
+            try:
+                write_share_zip(folder, zip_path, share_readme(name, track_id))
+                size = zip_path.stat().st_size
+            except OSError as exc:
+                log.warning("could not zip %s: %s", folder, exc)
+                raise ApiError(
+                    500,
+                    f"Couldn't make the zip: {exc}. Close Assetto Corsa and Content Manager and "
+                    "try again.",
+                ) from None
+        log.info("shared %s as %s (%d bytes)", folder, zip_path, size)
+        return {
+            "track_id": track_id,
+            "name": name,
+            "zip_path": str(zip_path),
+            "folder": str(zip_path.parent),
+            "size_mb": round(size / 1_048_576, 1),
+        }
+
+    def open_folder(self, body: dict) -> dict:
+        """Show a folder (or a file's folder) of the app data folder in the file manager."""
+        raw = body.get("path")
+        if not isinstance(raw, str) or not raw.strip():
+            raise ApiError(400, "Send the path of the folder to open.")
+        path = Path(raw.strip())
+        if not path.is_absolute():
+            raise ApiError(400, "Send the full path of the folder to open.")
+        try:
+            base = self.settings.data_dir.resolve()
+            real = path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise ApiError(404, "That folder isn't there any more.") from None
+        if not real.is_relative_to(base):
+            raise ApiError(403, "The app only opens its own folders.")
+        folder = real if real.is_dir() else real.parent
+        try:
+            open_in_file_manager(folder)
+        except OSError as exc:
+            raise ApiError(500, f"Couldn't open {folder}: {exc}") from None
+        return {"ok": True, "folder": str(folder)}
+
+    def install_touge(self) -> dict:
+        """Install the Touge Battle New Mode; writes only `<AC>/extension/lua/new-modes/
+        acmg-touge/` (via a temporary sibling folder), and never over a folder that isn't ours."""
+        from driftmaps import csp_modes
+
+        ac = self.settings.ac_root()
+        if ac is None:
+            raise ApiError(
+                409, "Tell the app where Assetto Corsa is first (the button at the top right)."
+            )
+        if not csp_modes.has_csp(ac):
+            raise ApiError(
+                409,
+                "Custom Shaders Patch isn't installed in this Assetto Corsa. Install CSP 0.2.11 "
+                "or newer first (Content Manager: Settings, then Custom Shaders Patch).",
+            )
+        dest = csp_modes.new_modes_dir(ac) / csp_modes.TOUGE_MODE_ID
+        if _skip_link(dest) or (dest.exists() and not csp_modes.is_ours(dest)):
+            raise ApiError(
+                409, f"{dest} is already there and wasn't put there by this app, so it was left."
+            )
+        try:
+            folders = csp_modes.install_touge(ac)
+        except csp_modes.ModeInstallError as exc:
+            raise ApiError(500, f"Couldn't install the touge mode: {exc}") from None
+        except OSError as exc:
+            log.warning("could not install the touge mode: %s", exc)
+            raise ApiError(
+                500,
+                f"Couldn't install the touge mode ({exc}). Close Assetto Corsa and Content "
+                "Manager and try again.",
+            ) from None
+        log.info("installed the touge mode in %s", folders[0])
+        return {"ok": True, "mode_id": csp_modes.TOUGE_MODE_ID, "folder": str(folders[0])}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1090,6 +1273,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, app.tracks())
         elif key == ("DELETE", "tracks", 2):
             self._json(200, app.delete_track(segs[1]))
+        elif key == ("POST", "tracks", 3) and segs[2] == "share":
+            self._json(200, app.share_track(segs[1]))
+        elif key == ("POST", "open-folder", 1):
+            self._json(200, app.open_folder(self._body()))
+        elif key == ("POST", "install-touge", 1):
+            self._json(200, app.install_touge())
         else:
             known = {
                 "status",
@@ -1101,6 +1290,8 @@ class _Handler(BaseHTTPRequestHandler):
                 "build",
                 "jobs",
                 "tracks",
+                "open-folder",
+                "install-touge",
             }
             if segs and segs[0] in known:
                 raise ApiError(405, "Not allowed.")

@@ -118,6 +118,9 @@ end
 local data = loadTrackData()
 local finishGate = data and gateFromData(data.finish_gate) or gateFromDummies('AC_AB_FINISH')
 local finishProgress = finishGate and ac.worldCoordinateToTrackProgress(finishGate.centre) or nil
+if finishProgress and finishProgress < 0 then
+  finishProgress = nil -- no AI spline: distances fall back to straight lines
+end
 
 -- ---------------------------------------------------------------------------------------------
 -- State
@@ -138,7 +141,7 @@ local resultGap = nil
 local score = { player = 0, ai = 0 }
 local initialPoses = nil
 local controls = nil
-local requestRun, requestRestart, requestEnd = false, false, false
+local requestRun, requestRestart, requestEnd, requestReinit = false, false, false, false
 local raceAgainButton = ac.ControlButton('acmg.touge/Race again', {
   keyboard = { key = ui.KeyIndex.R, shift = true },
 })
@@ -251,6 +254,9 @@ local function init()
     return -- try again next frame
   end
   initialPoses = { player = currentPose(PLAYER), ai = currentPose(AI) }
+  -- Leftovers of a previous run in this session (if the script was reloaded on a restart).
+  physics.disableCarCollisions(AI, false)
+  physics.setAINoInput(AI, false)
   log('track data: %s; B gate at (%.1f, %.1f, %.1f), reach %.1f m; B at spline %.4f of %.0f m',
     data and 'acmg_touge.json' or 'AC_AB_FINISH dummies', finishGate.centre.x, finishGate.centre.y,
     finishGate.centre.z, finishGate.reach, finishProgress or -1, sim.trackLengthM)
@@ -382,9 +388,27 @@ local function endSession()
   })
 end
 
+-- A restarted session (our "Restart session" button or AC's menu) starts over from AC's grid.
+ac.onSessionStart(function (sessionIndex, restarted)
+  requestReinit = true
+end)
+
 function script.update(dt)
   if sim.isReplayActive then return end
   dt = sim.dt -- 0 while paused
+  if requestReinit then
+    requestReinit = false
+    requestRun, requestRestart, requestEnd = false, false, false
+    if state ~= 'error' and state ~= 'init' then
+      log('session restarted')
+      physics.setAIStopCounter(AI, 0)
+      physics.lockUserControlsFor(0)
+      playerBrake(0)
+      resetRace()
+      score = { player = 0, ai = 0 }
+      setState('init')
+    end
+  end
   if state == 'init' then
     init()
     return

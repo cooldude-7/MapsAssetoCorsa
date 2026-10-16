@@ -275,6 +275,9 @@ def test_spec_references_exist() -> None:
     assert '"launcher.py"' in text and LAUNCHER.is_file()
     assert '"icon.ico"' in text and ICON.is_file()
     assert '"static"' in text and '"driftmaps/app/static"' in text
+    # The touge mode the app installs (driftmaps.csp_modes looks in <bundle>/csp/new-modes).
+    assert '"csp/new-modes"' in text
+    assert (ROOT / "csp" / "new-modes" / "acmg-touge" / "manifest.ini").is_file()
     for name in ("index.html", "app.js", "style.css"):
         assert (STATIC / name).is_file(), name
     assert (ROOT / "src" / "driftmaps" / "app" / "__init__.py").is_file()

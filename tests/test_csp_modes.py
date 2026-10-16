@@ -8,8 +8,8 @@
 - With `lupa` installed (`uv run --with lupa pytest tests/test_csp_modes.py`), mode.lua is
   compiled with LuaJIT and its state machine is driven through whole races against a stubbed
   CSP API on a straight 1 km road: AC's race start, the finish at B, braking both cars, the
-  result screen, reruns from our countdown, a chase start, a stuck AI, the gate-dummy fallback
-  and the error screens.
+  result screen, reruns from our countdown, a chase start, a session restart, a stuck AI, the
+  gate-dummy fallback and the error screens.
 """
 
 from __future__ import annotations
@@ -59,6 +59,7 @@ VERIFIED_0211_API = {
     "ac.getUI",
     "ac.lapTimeToString",
     "ac.log",
+    "ac.onSessionStart",
     "ac.overrideCarControls",
     "ac.setMessage",
     "ac.tryToRestartSession",
@@ -353,6 +354,7 @@ function ac.overrideCarControls(i)
   return H.controls
 end
 function ac.tryToRestartSession() rec('tryToRestartSession') return true end
+function ac.onSessionStart(callback) H.onSessionStart = callback end
 function ac.endSession(message, ok, results)
   H.ended = { message = message, ok = ok, results = results }
 end
@@ -552,6 +554,22 @@ def test_race_start_finish_and_reruns(lupa):
     assert mode.calls("setCarPosition")[-1] == (0, -2, 16)
 
     mode.run_until("result")
+    assert mode.car(1).parked
+    # Restart session: AC resets to its grid (the script may or may not be reloaded by CSP).
+    mode.click("Restart session")
+    assert mode.calls("tryToRestartSession")
+    mode.H.sim.isSessionStarted = False
+    vec3 = mode.lua.globals().vec3
+    mode.car(0).position, mode.car(1).position = vec3(2, 0, 6), vec3(-2, 0, 6)  # AC's grid
+    mode.H.onSessionStart(0, True)
+    mode.H.step()
+    mode.H.step()
+    assert mode.state == "grid" and not mode.car(1).parked
+    assert mode.calls("disableCarCollisions")[-1] == (1, False)
+    mode.H.sim.isSessionStarted = True
+    mode.drive(30, 28)
+    mode.run_until("result")
+    assert any("result: you won" in s and "score you 1, AI 0" in s for s in mode.logs())
     mode.click("End")
     assert mode.H.ended is not None and mode.H.ended.ok
 

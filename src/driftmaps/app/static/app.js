@@ -21,6 +21,8 @@ const API = {
   build: "/api/build",
   jobs: "/api/jobs/",
   tracks: "/api/tracks",
+  openFolder: "/api/open-folder",
+  installTouge: "/api/install-touge",
 };
 
 const MAP_STYLES = {
@@ -159,6 +161,13 @@ function formatLength(m) {
   if (!Number.isFinite(m)) return "–";
   if (m < 1000) return `${Math.round(m)} m`;
   return `${(m / 1000).toFixed(m < 10000 ? 2 : 1)} km`;
+}
+
+/** A zip size from the server's `size_mb`. */
+function formatSize(mb) {
+  if (!Number.isFinite(mb)) return "";
+  if (mb < 0.1) return "under 0.1 MB";
+  return `${mb < 100 ? mb.toFixed(1) : Math.round(mb)} MB`;
 }
 
 function formatInt(n) {
@@ -1081,6 +1090,8 @@ const state = {
   jobLogCount: -1,
   jobResumed: false, // polling a job started before this page loaded
   resultTrackId: null, // track shown as built in the build panel
+  tracks: [], // My tracks as last loaded (newest first)
+  shares: {}, // track_id -> {busy} | {zip_path, folder, size_mb} | {error}, shown under the track
   search: { items: [], active: -1, timer: 0, abort: null },
 };
 
@@ -1538,6 +1549,9 @@ const ICONS = {
   trash:
     '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
     '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>',
+  share:
+    '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M12 3v12M7 8l5-5 5 5M5 13v6a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-6"/></svg>',
 };
 
 /** A button showing one of the static ICONS (markup is constant, never user data). */
@@ -3522,7 +3536,7 @@ function applyStatus(st) {
   const b = (st && st.build) || {};
   label.title = b.commit ? `Version ${b.version || "dev"}, commit ${b.commit}${b.date ? `, built ${b.date}` : ""}` : "A development build";
   if (st && st.ac_found) {
-    setPill("ok", "Assetto Corsa found", `${st.ac_root || ""}\nClick to change the folder.`);
+    setPill("ok", "Assetto Corsa found", `${st.ac_root || ""}\nClick to change the folder or add the touge mode.`);
   } else {
     setPill("warn", "Assetto Corsa not found", "Click to tell the app where Assetto Corsa is.");
     openAcPanel(false);
@@ -3539,6 +3553,7 @@ function openAcPanel(byUser) {
   const input = $("ac-root");
   if (!input.value && st && st.ac_root) input.value = st.ac_root;
   $("ac-error").hidden = true;
+  $("touge-box").hidden = !found;
   $("ac-panel").hidden = false;
   $("ac-pill").setAttribute("aria-expanded", "true");
   if (byUser) input.focus();
@@ -3582,6 +3597,25 @@ async function saveAcRoot(e) {
   } finally {
     btn.disabled = false;
   }
+}
+
+/** Install the Touge Battle mode (a CSP New Mode) into the Assetto Corsa folder. */
+async function installTouge() {
+  const btn = $("btn-touge");
+  const msg = $("touge-msg");
+  btn.disabled = true;
+  msg.hidden = true;
+  try {
+    await api(API.installTouge, { method: "POST", body: {} });
+    msg.textContent =
+      "Installed. In Content Manager: Drive, Quick Drive, then pick Touge Battle (ACMG) in the mode list, an A to B track and 1 opponent.";
+    msg.className = "hint ok-text";
+  } catch (err) {
+    msg.textContent = err.message;
+    msg.className = "error-text";
+  }
+  msg.hidden = false;
+  btn.disabled = false;
 }
 
 /* ------------------------------------------------------------------------------------------
@@ -3854,6 +3888,7 @@ function builtAtValue(v) {
 function renderTracks(tracks) {
   const list = $("track-list");
   const sorted = tracks.slice().sort((a, b) => builtAtValue(b.built_at) - builtAtValue(a.built_at));
+  state.tracks = sorted;
   list.replaceChildren(
     ...sorted.map((t) => {
       const name = t.name || t.track_id;
@@ -3872,17 +3907,80 @@ function renderTracks(tracks) {
           { class: t.installed ? "badge ok" : "badge", title: t.installed ? "In your Assetto Corsa tracks folder" : "Only in the app's folder" },
           t.installed ? "Installed" : "Not installed",
         ),
+        iconButton("share", {
+          class: "icon-btn",
+          title: "Share: save it as a zip to send to a friend",
+          "aria-label": `Share ${name}`,
+          disabled: !!(state.shares[t.track_id] && state.shares[t.track_id].busy),
+          onclick: () => shareTrack(t),
+        }),
         iconButton("trash", {
           class: "icon-btn danger",
           title: "Delete",
           "aria-label": `Delete ${name}`,
           onclick: () => deleteTrack(t),
         }),
+        shareRow(t),
       );
     }),
   );
   $("tracks-empty").textContent = "Tracks you build show up here.";
   $("tracks-empty").hidden = sorted.length > 0;
+}
+
+/** The line under a track while it's zipped, then "Saved to <path>" with Open folder. */
+function shareRow(t) {
+  const share = state.shares[t.track_id];
+  if (!share) return null;
+  const dismiss = () => {
+    delete state.shares[t.track_id];
+    renderTracks(state.tracks || []);
+  };
+  if (share.busy) {
+    return h("div", { class: "track-share", role: "status" },
+      h("span", { class: "spinner", "aria-hidden": "true" }), "Making the zip…");
+  }
+  const close = iconButton("close", { class: "icon-btn", title: "Hide", "aria-label": "Hide", onclick: dismiss });
+  if (share.error) {
+    return h("div", { class: "track-share error", role: "alert" }, h("span", { class: "share-text" }, share.error), close);
+  }
+  const size = formatSize(Number(share.size_mb));
+  return h(
+    "div",
+    { class: "track-share", role: "status" },
+    h(
+      "span",
+      { class: "share-text" },
+      "Saved to ",
+      h("code", { class: "share-path", title: share.zip_path }, share.zip_path),
+      size ? ` (${size}). ` : ". ",
+      "Send the zip; it has install steps inside.",
+    ),
+    h("button", { type: "button", class: "btn small", onclick: () => openFolder(share.zip_path) }, "Open folder"),
+    close,
+  );
+}
+
+async function shareTrack(t) {
+  const id = t.track_id;
+  if (state.shares[id] && state.shares[id].busy) return;
+  state.shares[id] = { busy: true };
+  renderTracks(state.tracks || []);
+  try {
+    const res = await api(API.tracks + "/" + encodeURIComponent(id) + "/share", { method: "POST", body: {} });
+    state.shares[id] = res && typeof res.zip_path === "string" ? res : { error: "The app didn't say where it saved the zip." };
+  } catch (err) {
+    state.shares[id] = { error: err.message };
+  }
+  renderTracks(state.tracks || []);
+}
+
+async function openFolder(path) {
+  try {
+    await api(API.openFolder, { method: "POST", body: { path } });
+  } catch (err) {
+    toast(err.message, "error");
+  }
 }
 
 async function deleteTrack(t) {
@@ -3896,6 +3994,7 @@ async function deleteTrack(t) {
   try {
     await api(API.tracks + "/" + encodeURIComponent(t.track_id), { method: "DELETE" });
     toast(`Deleted ${name}.`, "ok");
+    delete state.shares[t.track_id];
     // Don't leave "Installed! Look for <name>" on screen for a track that's gone.
     if (state.jobId == null && state.resultTrackId === t.track_id) {
       $("job").hidden = true;
@@ -3962,6 +4061,7 @@ function bindUi() {
   $("btn-tracks-refresh").addEventListener("click", loadTracks);
   $("ac-pill").addEventListener("click", () => ($("ac-panel").hidden ? openAcPanel(true) : closeAcPanel()));
   $("ac-cancel").addEventListener("click", closeAcPanel);
+  $("btn-touge").addEventListener("click", installTouge);
   $("ac-form").addEventListener("submit", saveAcRoot);
   $("track-name").addEventListener("input", (e) => {
     state.nameTouched = e.target.value.trim() !== "";
