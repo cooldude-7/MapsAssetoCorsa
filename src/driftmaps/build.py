@@ -42,9 +42,15 @@ Pipeline (PLAN §5.1-§5.5, docs/research/geo.md §1-§3, ac_format.md §2, §3,
      approaches without a rule are invented, so only with `bridge_approach_rails`.
    - **Buildings** (`geo.buildings`, `geometry.buildings`): OSM + Microsoft footprints, lidar
      heights, outside the wall corridor.
+   - **Street furniture** (`geometry.furniture`, `furniture`): signs, hydro poles and wires,
+     street lights, signals, hydrants and mailboxes from Mapillary detections (with
+     `mapillary_token`), OSM nodes and power lines, Ontario rules where Mapillary has no
+     photos, and the route's junction control (`street_items.approach_stops`: stop signs and
+     stop bars where the route stops), plus every `StreetItem` other stages added to
+     `street_items`; de-duplicated and merged per 250 m cell on one procedural atlas.
    - **Trees** (`geometry.vegetation`): lidar tree tops (DSM - DTM) with NRCan land cover
      kinds, trunks kept outside the hidden walls (a car can never drive through a tree) and off
-     building footprints; `scenery_density` scales the tree budget.
+     building footprints and poles; `scenery_density` scales the tree budget.
    All of it goes into the one KN5 (tree and building atlases as DDS); the trees' and
    buildings' data sources are credited in LICENSE-DATA.txt.
 7. **Files** (`ac.track_files`): surfaces (ROAD, GRASS, GRAVEL, DIRT), map, cameras, UI, credits
@@ -91,6 +97,7 @@ from scipy.spatial import cKDTree
 from driftmaps.ac.ai_line import AiLine, build_ai_line
 from driftmaps.ac.building_textures import building_atlas_texture
 from driftmaps.ac.coords import WORLD_UP
+from driftmaps.ac.furniture_textures import furniture_atlas_texture
 from driftmaps.ac.kn5 import write_kn5
 from driftmaps.ac.model import Dummy, Kn5, Mesh, Texture
 from driftmaps.ac.scene import (
@@ -102,6 +109,7 @@ from driftmaps.ac.scene import (
     check_track_folder,
     clear_track_folder,
     gate_dummies,
+    ks_per_pixel,
     spawn_dummy,
     write_ai_files,
 )
@@ -167,9 +175,19 @@ from driftmaps.geo.buildings import (
     route_boxes,
     within_route,
 )
+from driftmaps.geo.mapillary import (
+    MAPILLARY_ATTRIBUTION,
+    MapFeature,
+    MapillaryError,
+    drop_stale,
+    fetch_image_points,
+    fetch_map_features,
+    token_from_env,
+)
 from driftmaps.geo.overpass import OSM_ATTRIBUTION, OverpassError
 from driftmaps.geo.project import LocalProjection
 from driftmaps.geo.router import Route
+from driftmaps.geo.street_features import StreetFeatures, fetch_street_features
 from driftmaps.geometry.barriers import (
     ScenePiece,
     barrier_pieces,
@@ -193,6 +211,16 @@ from driftmaps.geometry.buildings import (
     building_scene,
     place_buildings,
 )
+from driftmaps.geometry.furniture import (
+    FurnitureMesh,
+    FurnitureOptions,
+    FurniturePlan,
+    furniture_meshes,
+    marking_meshes,
+    parse_speed,
+    plan_furniture,
+    street_names,
+)
 from driftmaps.geometry.primitives import MeshData, split
 from driftmaps.geometry.road import (
     RoadMeshes,
@@ -205,6 +233,7 @@ from driftmaps.geometry.road import (
     simplify,
     smooth_centreline,
 )
+from driftmaps.geometry.street_items import POLE_UTILITY, StreetItem
 from driftmaps.geometry.terrain import (
     Terrain,
     TerrainOptions,
@@ -373,6 +402,12 @@ class BuildOptions:
     # cover the route. Burlington's terms are revocable and must travel with the track
     # (LICENSE-DATA.txt carries their URL); drop "burlington" to build without it.
     municipal_buildings: tuple[str, ...] = ("burlington", "milton", "oakville")
+    # Street furniture (geometry.furniture): signs, poles and wires, lights, signals, hydrants,
+    # mailboxes and the route's stop bars. Mapillary detections need a client token
+    # (None: $DRIFTMAPS_MAPILLARY_TOKEN; without one, OSM and the rules only).
+    furniture: bool = True
+    mapillary_token: str | None = field(default=None, repr=False)
+    furniture_options: FurnitureOptions = field(default_factory=FurnitureOptions)
     offline: bool = False  # scenery downloads (Overpass, Microsoft) come from the cache only
     bridge: BridgeOptions = field(default_factory=BridgeOptions)
     vegetation: VegetationOptions = field(default_factory=VegetationOptions)
@@ -383,6 +418,9 @@ class BuildOptions:
     osm_barriers: Sequence[OsmBarrier] | None = None
     roadside_features: RoadsideFeatures | None = None  # water, rock, driveways (warrants)
     building_footprints: Sequence[Footprint] | None = None
+    street_features: StreetFeatures | None = None  # OSM furniture nodes and power lines
+    mapillary_features: Sequence[MapFeature] | None = None
+    mapillary_coverage: np.ndarray | None = field(default=None, repr=False)  # photos (lon, lat)
     # Called at each major step with a short plain-English step name and the overall progress
     # (0..1), e.g. for the local app's progress bar. None: no reports.
     progress: Callable[[str, float], None] | None = field(default=None, repr=False)
@@ -445,6 +483,20 @@ class BuildResult:
                 f"guardrails.json spans: {sc['user_spans']}, automatic: "
                 f"{sc.get('warrant_spans', 0)} spans)"
             )
+            fu = sc.get("furniture") or {}
+            if fu:
+                by = fu["by_kind"]
+
+                def total(prefix: str, by=by) -> int:
+                    return sum(sum(v.values()) for k, v in by.items() if k.startswith(prefix))
+
+                lines.append(
+                    f"street   {total('sign:')} signs, {total('pole:')} poles "
+                    f"({fu['wire_spans']} wire spans), {total('light:')} lights, "
+                    f"{total('signal:')} signals, {total('marking:')} markings; Mapillary "
+                    f"{fu['mapillary_used']} items, photos on "
+                    f"{100 * fu['mapillary_photo_coverage']:.0f}% of the road"
+                )
             for b in sc["bridges"]:
                 lines.append(
                     f"bridge   {b['length_m']:.0f} m at {b['from_a_m']:.0f} m from A, deck up to "
@@ -1055,6 +1107,19 @@ def _atlas(name: str) -> Texture:
     return tree_atlas_texture(name) if name == TREE_ATLAS else building_atlas_texture(name)
 
 
+FURNITURE_ATLAS = "dm_furniture.dds"  # signs, poles, lights (BC1; street names drawn per track)
+
+
+def _furniture_material(name: str, texture: str, *, bright: bool, scene: Scene) -> int:
+    """Index of a furniture material on the atlas (sign faces `bright`: they are retro-
+    reflective in real life, so they never sink into shade)."""
+    for i, mat in enumerate(scene.materials):
+        if mat.name == name:
+            return i
+    scene.materials.append(ks_per_pixel(name, texture, bright=bright))
+    return len(scene.materials) - 1
+
+
 def _tiles(terrain: Terrain, select: np.ndarray, tile_m: float) -> list[np.ndarray]:
     keys = tile_keys(terrain, select, tile_m)
     idx = np.flatnonzero(select)
@@ -1174,6 +1239,17 @@ def _assemble_kn5(
             stats = building_scene(scene, scenery.buildings, texture_format="dds")
             counts["buildings"] = stats.vertices
             extra["buildings"] = stats
+        if scenery.furniture_meshes:
+            tex = FURNITURE_ATLAS
+            scene.textures.setdefault(tex, furniture_atlas_texture(tex, scenery.furniture_names))
+            fmats = {
+                "furniture": _furniture_material("dm_furniture", tex, bright=False, scene=scene),
+                "signs": _furniture_material("dm_signs", tex, bright=True, scene=scene),
+                "hidden": mats["wall_hidden"],
+            }
+            for fm in scenery.furniture_meshes:
+                key = "scenery_collision" if fm.material == "hidden" else "furniture"
+                _add_split(scene, fm.mesh, fm.name, fmats[fm.material], counts, key, **fm.flags)
         if scenery.trees is not None and len(scenery.trees) and ground is not None:
             scene.textures.setdefault(TREE_ATLAS, _atlas(TREE_ATLAS))
             stats = tree_scene(scene, scenery.trees, ground, texture_format="dds")
@@ -1220,6 +1296,10 @@ class _Scenery:
     deck_intrusion_m: float = 0.0
     terrain_clamped: int = 0
     ground: Callable[[np.ndarray], np.ndarray] | None = field(default=None, repr=False)
+    furniture: FurniturePlan | None = None
+    furniture_meshes: list[FurnitureMesh] = field(default_factory=list)
+    furniture_names: tuple[str, ...] = ()  # street name blades on the atlas
+    street_features: StreetFeatures | None = None  # OSM nodes / lines fetched (geojson)
 
 
 def _ground_fn(terrain: Terrain, road_height: Callable[[np.ndarray], np.ndarray]):
@@ -1546,6 +1626,74 @@ def _short(e: Exception) -> str:
     return text[0][:160] if text else type(e).__name__
 
 
+def _furniture(
+    geo: TrackGeometry,
+    ground: Callable[[np.ndarray], np.ndarray],
+    options: BuildOptions,
+    sc: _Scenery,
+    street_items: Sequence[StreetItem],
+) -> None:
+    """Street furniture (`geometry.furniture`): fetch OSM nodes and Mapillary detections
+    (each failing soft), plan every item with the other stages' `street_items`, and build the
+    meshes and the route's markings."""
+    ll = _route_lonlat(geo)
+    if options.street_features is not None:
+        osm: StreetFeatures | None = options.street_features
+    else:
+        try:
+            osm = fetch_street_features(ll, cache_dir=options.cache_dir, offline=options.offline)
+        except _DATA_ERRORS as e:
+            warnings.warn(f"OSM signs and poles unavailable ({_short(e)})", stacklevel=2)
+            osm = None
+    sc.street_features = osm
+    mly: list[MapFeature] = []
+    coverage = options.mapillary_coverage
+    if options.mapillary_features is not None:
+        mly = list(options.mapillary_features)
+    else:
+        token = options.mapillary_token or token_from_env()
+        try:
+            mly = drop_stale(
+                fetch_map_features(ll, token=token, cache_dir=options.cache_dir,
+                                   offline=options.offline or not token)
+            )  # fmt: skip
+            if coverage is None:
+                coverage = fetch_image_points(
+                    ll, token=token, cache_dir=options.cache_dir,
+                    offline=options.offline or not token,
+                )  # fmt: skip
+        except (MapillaryError, *_DATA_ERRORS) as e:
+            if token:  # without a token the layer is simply off
+                warnings.warn(f"Mapillary signs and poles unavailable ({_short(e)})", stacklevel=2)
+            mly, coverage = [], None
+    m = geo.model
+    plan = plan_furniture(
+        m, geo.projection, geo.route, ground, s_range=(geo.s_a, geo.s_b), way_id=geo.way_id,
+        items=street_items, osm=osm, mapillary=mly, coverage=coverage,
+        options=options.furniture_options,
+    )  # fmt: skip
+    sc.furniture = plan
+    names = street_names(plan.items)
+    sc.furniture_names = tuple(sorted(names, key=names.get))
+    way_id = geo.way_id if len(geo.way_id) == len(m) else None
+    tree = cKDTree(m.centre[:, [0, 2]])
+
+    def speed_at(xz: np.ndarray) -> int | None:
+        if way_id is None:
+            return None
+        wid = int(way_id[tree.query(np.asarray(xz, float).reshape(2))[1]])
+        return parse_speed((geo.route.ways.get(wid) or {}).get("maxspeed"))
+
+    sc.furniture_meshes = furniture_meshes(
+        plan, m, s_range=(geo.s_a, geo.s_b), verge_m=options.verge_m, names=names,
+        speed_at=speed_at, options=options.furniture_options,
+    )  # fmt: skip
+    for name, mesh in marking_meshes(plan.markings, m, options.furniture_options.cell_m):
+        sc.pieces.append(ScenePiece(name, "paint_white", mesh, dict(DECAL_FLAGS)))
+    if plan.mapillary_used and MAPILLARY_ATTRIBUTION not in sc.attributions:
+        sc.attributions.append(MAPILLARY_ATTRIBUTION)
+
+
 def _trees(
     geo: TrackGeometry,
     canopy: CanopyFn | None,
@@ -1604,6 +1752,9 @@ def _tree_exclusion(geo: TrackGeometry, sc: _Scenery) -> shapely.Geometry | None
     if sc.footprints is not None:
         polys += [_footprint_polygon(fp, geo.projection) for fp in sc.footprints.footprints]
     polys = [p for p in polys if p is not None and not p.is_empty]
+    if sc.furniture is not None:  # no tree through a hydro pole or its wires' first metres
+        polys += [shapely.Point(it.position[0], it.position[2]) for it in sc.furniture.items
+                  if it.kind == POLE_UTILITY]  # fmt: skip
     if not polys:
         return None
     return shapely.union_all(shapely.buffer(np.array(polys), TREE_BUILDING_BUFFER_M))
@@ -1673,6 +1824,24 @@ def _scenery_stats(sc: _Scenery, geo: TrackGeometry, extra: Mapping[str, object]
         "bridges": bridges,
         "deck_intrusion_m": sc.deck_intrusion_m,
         "terrain_points_clamped": sc.terrain_clamped,
+        "furniture": _furniture_stats(sc),
+    }
+
+
+def _furniture_stats(sc: _Scenery) -> dict:
+    plan = sc.furniture
+    if plan is None:
+        return {}
+    return {
+        "items": len(plan.items),
+        "by_kind": {k: dict(sorted(v.items())) for k, v in sorted(plan.counts.items())},
+        "wire_spans": len(plan.wires),
+        "markings": len(plan.markings),
+        "mapillary_used": plan.mapillary_used,
+        "mapillary_photo_coverage": round(plan.covered_fraction, 3),
+        "meshes": len(sc.furniture_meshes),
+        "route_controls": [c for c in plan.controls if c["control"]],
+        "mapillary_driveways": plan.driveways,
     }
 
 
@@ -1710,8 +1879,11 @@ def _licence(geo: TrackGeometry, sc: _Scenery | None = None) -> tuple[list[str],
             extra.append(f"Elevation ({info.title}): {info.attribution}")
     if sc is not None:
         extra += sc.attributions
-        if OSM_BUILDINGS_ATTRIBUTION in extra or sc.osm_barrier_ways:
-            # One OSM credit for the road, the buildings and the barriers.
+        osm_furniture = sc.furniture is not None and bool(
+            sc.furniture.osm_nodes or sc.furniture.osm_lines
+        )
+        if OSM_BUILDINGS_ATTRIBUTION in extra or sc.osm_barrier_ways or osm_furniture:
+            # One OSM credit for the road, the buildings, the barriers and the furniture.
             extra = [a for a in extra if a != OSM_BUILDINGS_ATTRIBUTION]
             keys[keys.index("osm")] = "osm_scenery"
     return keys, _merge_notices(extra)
@@ -1783,6 +1955,39 @@ def _scenery_features(sc: _Scenery) -> list[dict]:
                 },
             }
         )
+    plan, feats = sc.furniture, sc.street_features
+    if plan is not None and feats is not None:
+        used = set(plan.osm_nodes)
+        for n in feats.nodes:
+            if n.id in used:
+                features.append(
+                    {
+                        "type": "Feature",
+                        "geometry": {"type": "Point", "coordinates": _lonlat_list(
+                            np.array([[n.lon, n.lat]]))[0]},
+                        "properties": {
+                            "osm_node_id": n.id,
+                            "osm_url": f"https://www.openstreetmap.org/node/{n.id}",
+                            "use": "street furniture",
+                            "tags": dict(sorted(n.tags.items())),
+                        },
+                    }
+                )  # fmt: skip
+        lines = set(plan.osm_lines)
+        for w in feats.power_lines:
+            if w.id in lines:
+                features.append(
+                    {
+                        "type": "Feature",
+                        "geometry": {"type": "LineString", "coordinates": _lonlat_list(w.lonlat)},
+                        "properties": {
+                            "osm_way_id": w.id,
+                            "osm_url": f"https://www.openstreetmap.org/way/{w.id}",
+                            "use": "power line (poles)",
+                            "tags": dict(sorted(w.tags.items())),
+                        },
+                    }
+                )
     for b in sc.osm_barrier_ways:
         features.append(
             {
@@ -1857,6 +2062,7 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
         warnings.simplefilter("always")
         progress("Getting elevation and shaping the road", 0.0)
         geo = prepare_geometry(route, options)
+        street_items: list[StreetItem] = []  # signs, poles... (rendered by _furniture)
         m = geo.model
         progress("Building the road and terrain", 0.35)
         roads = build_road_meshes(m, chunk_m=options.chunk_m)
@@ -1889,6 +2095,9 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
         if options.buildings:
             progress("Placing buildings", 0.55)
             _buildings(geo, ground, corridor, canopy, options, track_id, sc)
+        if options.furniture:
+            progress("Adding signs, poles and lights", 0.62)
+            _furniture(geo, ground, options, sc, street_items)
         if options.trees:
             progress("Planting trees", 0.7)
             _trees(geo, canopy, options, track_id, sc)
@@ -1934,6 +2143,8 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
         scenery_text += " Trees placed from NRCan lidar."
     if sc.buildings:
         scenery_text += " Buildings from " + _building_credit(sc) + "."
+    if sc.furniture is not None and sc.furniture.mapillary_used:
+        scenery_text += " Signs and poles from Mapillary (mapillary.com), CC BY-SA 4.0."
     run = loop_direction(m.centre) if geo.closed else "A2B"
     what = (
         f"a {geo.length_m / 1000:.1f} km loop on real roads"
@@ -2113,6 +2324,11 @@ def render_debug_png(
     for k, plan in enumerate(sc.plans):
         bc = m.at(0.5 * (plan.s0 + plan.s1))[0][[0, 2]]
         views.append((path.with_name(f"{path.stem}_bridge{k}.png"), (bc - 100.0, bc + 100.0)))
+    if sc.furniture is not None:  # the first junctions where the route stops (signs, bars)
+        stops = sorted({c["s"] for c in sc.furniture.controls if c["control"]})[:4]
+        for k, s in enumerate(stops):
+            jc = m.at(float(s))[0][[0, 2]]
+            views.append((path.with_name(f"{path.stem}_junction{k}.png"), (jc - 45.0, jc + 45.0)))
     for target, (a, b) in views:
         scale = max(float(np.max(b - a)) / max_px, 0.15)
         w, h = (np.ceil((b - a) / scale).astype(int) + 1).tolist()
@@ -2242,6 +2458,47 @@ def _draw_scenery_over(dr, px, m: RoadModel, sc: _Scenery) -> None:
                  pos - w * left - 0.6 * fwd, pos - w * left + 0.6 * fwd]
             )  # fmt: skip
             dr.polygon(px(quad), fill=(15, 15, 15))
+    _draw_furniture(dr, px, sc)
+
+
+_FURNITURE_RGB = {
+    "sign:stop": (220, 20, 30),
+    "sign:yield": (255, 120, 120),
+    "sign:speed_limit": (255, 255, 255),
+    "sign:": (250, 210, 0),  # other signs (warning yellow)
+    "pole:": (120, 80, 40),
+    "light:": (255, 255, 160),
+    "signal:": (0, 220, 120),
+    "": (60, 160, 255),  # hydrants, mailboxes, ...
+}
+
+
+def _furniture_rgb(kind: str) -> tuple[int, int, int]:
+    for prefix, rgb in _FURNITURE_RGB.items():
+        if kind.startswith(prefix):
+            return rgb
+    return _FURNITURE_RGB[""]
+
+
+def _draw_furniture(dr, px, sc: _Scenery) -> None:
+    """Wires (thin dark lines), then every street item: a dot in its colour with a tick
+    towards where it faces, outlined black (rule items: grey outline)."""
+    plan = sc.furniture
+    if plan is None:
+        return
+    for a, b in plan.wires:
+        dr.line(px(np.stack([a, b])), fill=(40, 40, 40), width=1)
+    for mesh in (p.mesh for p in sc.pieces if p.name.startswith("marks_")):
+        for tri in mesh.triangles:
+            dr.polygon(px(mesh.positions[tri]), fill=(255, 255, 255))
+    for it in sorted(plan.items, key=lambda it: it.kind != "sign:all_way"):  # tabs below
+        p = np.array([[it.position[0], it.position[2]]])
+        (x, y) = px(p)[0]
+        (fx, fy) = px(p + 2.5 * np.array([it.facing]))[0]
+        r = 3 if it.kind.startswith("pole:") else 4
+        dr.line((x, y, fx, fy), fill=(0, 0, 0), width=1)
+        outline = (130, 130, 130) if it.source == "rule" else (0, 0, 0)
+        dr.ellipse((x - r, y - r, x + r, y + r), fill=_furniture_rgb(it.kind), outline=outline)
 
 
 def _legend(dr, sc: _Scenery) -> None:
@@ -2257,6 +2514,14 @@ def _legend(dr, sc: _Scenery) -> None:
         ("pier", (15, 15, 15)),
         ("hidden wall", (220, 30, 30)),
     ]
+    if sc.furniture is not None and sc.furniture.items:
+        items += [
+            ("stop sign", _FURNITURE_RGB["sign:stop"]),
+            ("speed limit", _FURNITURE_RGB["sign:speed_limit"]),
+            ("other sign", _FURNITURE_RGB["sign:"]),
+            ("hydro pole", _FURNITURE_RGB["pole:"]),
+            ("street light", _FURNITURE_RGB["light:"]),
+        ]
     dr.rectangle((4, 4, 140, 8 + 13 * len(items)), fill=(255, 255, 255), outline=(0, 0, 0))
     for k, (label, colour) in enumerate(items):
         y = 8 + 13 * k

@@ -34,9 +34,11 @@ from driftmaps.build import BuildOptions, BuildResult, _merge_notices, build_tra
 from driftmaps.elevation.sources import CogSource, SourceInfo
 from driftmaps.geo.barriers import OsmBarrier
 from driftmaps.geo.buildings import Footprint
+from driftmaps.geo.mapillary import MAPILLARY_ATTRIBUTION, MapFeature
 from driftmaps.geo.overpass import parse_overpass
 from driftmaps.geo.project import LocalProjection
 from driftmaps.geo.router import Route, route_from_pins
+from driftmaps.geo.street_features import OsmLine, OsmNode, StreetFeatures
 from driftmaps.geometry.bridges import terrain_through_deck
 from driftmaps.geometry.terrain import TerrainOptions, build_terrain, clamp_heights
 from driftmaps.geometry.walls import corridor_polygon
@@ -112,6 +114,36 @@ def forks_route() -> Route:
     return route_from_pins(FORKS_PINS, osm=osm)
 
 
+def furniture_data(route: Route) -> dict:
+    """Mapillary: hydro poles every 45 m, 8 m right of the road from 100 m to 595 m, and a
+    70 km/h sign at 300 m facing back at the drivers; photos over the first 650 m. OSM: a
+    hydrant 6 m right at 350 m and a power line 9 m left from 700 m to 900 m."""
+    poles = _offset_line(route, 100.0, 600.0, 8.0)
+    proj = _projection(route)
+    en = proj.to_xy(poles)
+    keep = [0]
+    for k in range(1, len(en)):
+        if np.linalg.norm(en[k] - en[keep[-1]]) >= 45.0:
+            keep.append(k)
+    feats = [MapFeature(f"p{k}", "object--support--utility-pole", *map(float, poles[k]))
+             for k in keep]  # fmt: skip
+    sign = _offset_line(route, 290.0, 310.0, 6.0)
+    d = proj.to_xy(sign[-1]) - proj.to_xy(sign[0])
+    heading = float(np.degrees(np.arctan2(-d[0], -d[1])) % 360.0)  # faces back along the road
+    mid = sign[len(sign) // 2]
+    feats.append(MapFeature("s1", "regulatory--maximum-speed-limit-70--g3", *map(float, mid),
+                            heading))  # fmt: skip
+    hyd = _offset_line(route, 340.0, 360.0, 6.0)
+    hydrant = hyd[len(hyd) // 2]
+    line = _offset_line(route, 700.0, 900.0, -9.0)[::10]
+    osm = StreetFeatures(
+        (OsmNode(77, float(hydrant[0]), float(hydrant[1]), {"emergency": "fire_hydrant"}),),
+        (OsmLine(88, line, {"power": "minor_line"}),),
+    )
+    photos = _offset_line(route, 0.0, 650.0, 0.0)
+    return dict(street_features=osm, mapillary_features=feats, mapillary_coverage=photos)
+
+
 def scenery_options(route: Route, root: Path, **kw) -> BuildOptions:
     spans = root / "guardrails.json"
     spans.parent.mkdir(parents=True, exist_ok=True)
@@ -147,6 +179,7 @@ def scenery_options(route: Route, root: Path, **kw) -> BuildOptions:
         building_footprints=[house, shed, barn],
         guardrails_file=spans,
         debug_png=True,
+        **furniture_data(route),
     )
     return BuildOptions(**(args | kw))
 
@@ -226,11 +259,13 @@ def test_summary_and_credits(built):
     # ODbL: the OSM ways used are listed with the route's, buildings and barriers too.
     geo = json.loads((built.track_dir / "route_osm.geojson").read_text(encoding="utf-8"))
     uses = {
-        (f["properties"]["use"], f["properties"]["osm_way_id"])
+        (f["properties"]["use"], f["properties"].get("osm_way_id", f["properties"].get(
+            "osm_node_id")))
         for f in geo["features"]
         if "use" in f["properties"]
-    }
-    assert uses == {("building", 1), ("tree mask", 2), ("tree mask", 3), ("barrier", 1)}
+    }  # fmt: skip
+    assert uses == {("building", 1), ("tree mask", 2), ("tree mask", 3), ("barrier", 1),
+                    ("street furniture", 77), ("power line (poles)", 88)}  # fmt: skip
     ui = json.loads((built.track_dir / "ui" / "ui_track.json").read_text())
     assert "Trees" in ui["description"] and "Buildings" in ui["description"]
     assert json.loads((built.track_dir / "guardrails.json").read_text()) == [USER_SPAN]
@@ -330,14 +365,50 @@ def test_terrain_under_the_deck_is_the_real_ground(built):
 # --------------------------------------------------------------------------------------------
 
 
+def test_street_furniture_from_mapillary_osm_and_rules(built, kn5):
+    plan = built.scenery.furniture
+    counts = built.stats["scenery"]["furniture"]["by_kind"]
+    assert counts["pole:utility"]["mapillary"] == 11
+    assert counts["pole:utility"]["osm"] >= 2  # the power line's vertices
+    assert counts["hydrant"] == {"osm": 1}
+    assert counts["sign:speed_limit"]["mapillary"] == 1
+    assert plan.mapillary_used == 12 and len(plan.wires) >= 10  # a line of 11 poles + OSM's
+    names = [n.name for n in kn5.root.children]
+    for prefix in ("furn_", "signs_", "wires_"):
+        assert any(n.startswith(prefix) for n in names), prefix
+    mats = {m.name: m for m in kn5.materials}
+    assert {"dm_furniture", "dm_signs"} <= mats.keys()
+    assert any(t.name == "dm_furniture.dds" for t in kn5.textures)
+    for mesh in meshes(kn5, r"^(furn|signs|wires)_"):
+        assert mesh.lod_out >= 300.0
+    # Credits: Mapillary (CC BY-SA, logo/link requirement), the OSM nodes in the geojson.
+    lic = (built.track_dir / "LICENSE-DATA.txt").read_text(encoding="utf-8")
+    assert MAPILLARY_ATTRIBUTION in lic and "street furniture" in lic
+    geo = json.loads((built.track_dir / "route_osm.geojson").read_text(encoding="utf-8"))
+    used = {f["properties"].get("osm_node_id") for f in geo["features"]}
+    assert 77 in used and 88 in {f["properties"].get("osm_way_id") for f in geo["features"]}
+    ui = json.loads((built.track_dir / "ui" / "ui_track.json").read_text(encoding="utf-8"))
+    assert "Mapillary" in ui["description"]
+    assert any(line.startswith("street ") for line in built.summary().splitlines())
+    # No tree within 2 m of a pole.
+    tr = built.scenery.trees
+    poles = np.array([(it.position[0], it.position[2]) for it in plan.items
+                      if it.kind == "pole:utility"])  # fmt: skip
+    if tr is not None and len(tr):
+        d, _ = cKDTree(poles).query(tr.xz)
+        assert d.min() >= 2.0
+
+
 def test_flags_turn_scenery_off_but_bridges_stay(forks_route, tmp_path):
     opts = scenery_options(
-        forks_route, tmp_path, trees=False, buildings=False, guardrails=False, debug_png=False
-    )
+        forks_route, tmp_path, trees=False, buildings=False, guardrails=False, debug_png=False,
+        furniture=False,
+    )  # fmt: skip
     res = build_track(forks_route, tmp_path / "out", opts)
     kn5 = read_kn5(res.track_dir / f"{TRACK_ID}.kn5")
     names = [n.name for n in kn5.root.children]
-    for prefix in ("trees_", "buildings_", "guardrail_", "1WALL_GR_", "1WALL_bld"):
+    for prefix in ("trees_", "buildings_", "guardrail_", "1WALL_GR_", "1WALL_bld", "furn_",
+                   "signs_", "marks_"):  # fmt: skip
         assert not any(n.startswith(prefix) for n in names), prefix
     assert any(n.startswith("bridge00_concrete") for n in names)
     assert any(n.startswith("1WALL_BRIDGE00_") for n in names)

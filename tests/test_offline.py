@@ -27,7 +27,11 @@ from offline_fixture import (
     MILL_ST,
     OSM_BASE,
     POLY,
+    POWER_LINE,
     ROADS,
+    STREET_NODE0,
+    _at,
+    node_tags,
     write_region,
 )
 
@@ -40,10 +44,12 @@ from driftmaps.geo import barriers as gbar
 from driftmaps.geo import buildings as gb
 from driftmaps.geo import offline
 from driftmaps.geo import overpass as gop
+from driftmaps.geo import street_features as gsf
 from driftmaps.geo.barriers import fetch_barriers, fetch_roadside, parse_barriers
 from driftmaps.geo.buildings import fetch_osm_buildings, parse_buildings
 from driftmaps.geo.overpass import OverpassError, fetch_corridor, parse_overpass
 from driftmaps.geo.router import route_from_pins
+from driftmaps.geo.street_features import fetch_street_features
 
 FORKS_PINS = [(43.80410, -79.99231), (43.81060, -79.98185), (43.83180, -79.95940)]
 TORONTO_PINS = [(43.6532, -79.3832), (43.6600, -79.3900)]  # outside the fixture region
@@ -107,7 +113,8 @@ def test_build_keeps_what_the_app_uses(region):
     assert region["pbf"].stat().st_size < 200_000 and region["osm"].stat().st_size < 200_000
     # 37 Forks roads + 3 Snake Rd ways + 3 Mill St ways + 1 driveway; 3 houses; 3 rails;
     # pond + river + the lake's member way; 1 cliff.
-    assert stats.counts == {"roads": 44, "buildings": 3, "barriers": 3, "water": 3, "rock": 1}
+    assert stats.counts == {"roads": 44, "buildings": 3, "barriers": 3, "water": 3, "rock": 1,
+                            "street_furniture": 5, "power_lines": 1}  # fmt: skip
     assert stats.osm_base == OSM_BASE
     db = offline.OfflineDB(stats.path)
     try:
@@ -332,6 +339,52 @@ def test_roadside_features_come_from_the_database(use_db, monkeypatch, tmp_path)
     mill = next(w for w in road if w.id == MILL_ST_WAYS[0])
     assert access[mill.id].nodes == mill.nodes
     assert feats.osm_base == OSM_BASE
+
+
+def test_street_furniture_comes_from_the_database(use_db, monkeypatch, tmp_path):
+    monkeypatch.setattr(gop, "post_query", no_network)
+    monkeypatch.setattr(gsf, "post_query", no_network)
+    feats = fetch_street_features(mill_street_line(), cache_dir=tmp_path)
+    want = {nid: t for nid, t in node_tags().items() if nid != STREET_NODE0 + 5}  # no bench
+    assert {n.id: dict(n.tags) for n in feats.nodes} == want
+    assert [(w.id, w.tags["power"]) for w in feats.power_lines] == [(POWER_LINE, "minor_line")]
+    assert len(feats.power_lines[0].lonlat) == 2 and feats.osm_base == OSM_BASE
+    stop = next(n for n in feats.nodes if n.id == STREET_NODE0)
+    assert (round(stop.lat, 7), round(stop.lon, 7)) == _at(-15.0, -4.0)
+
+
+def test_a_format_2_database_serves_roads_but_no_furniture(region, tmp_path, monkeypatch):
+    import shutil
+    import sqlite3
+
+    folder = tmp_path / "old"
+    folder.mkdir()
+    path = folder / "ontario.sqlite"
+    shutil.copy(region["stats"].path, path)
+    fresh = OfflineManager(folder).status("ontario")
+    assert fresh["state"] == "ready" and not fresh["outdated"]
+    offline.release(path)
+    con = sqlite3.connect(path)
+    con.execute("UPDATE meta SET value='2' WHERE key='format'")
+    con.commit()
+    con.close()
+    db = offline.OfflineDB(path)
+    try:
+        assert db.format == 2 and not db.has_street_furniture
+        assert db.corridor(FORKS_PINS, 1500.0) is not None
+        line = mill_street_line()[:, ::-1]
+        assert db.street_payload(line, 40.0) is None
+    finally:
+        db.close()
+    old = OfflineManager(folder).status("ontario")
+    assert old["state"] == "ready" and old["outdated"] and "signs" in old["update_adds"]
+    offline.release(path)
+    con = sqlite3.connect(path)
+    con.execute("UPDATE meta SET value='1' WHERE key='format'")
+    con.commit()
+    con.close()
+    with pytest.raises(ValueError, match="format"):
+        offline.OfflineDB(path)
 
 
 def test_roadside_outside_the_region_asks_overpass(use_db, monkeypatch, tmp_path):

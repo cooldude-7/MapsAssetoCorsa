@@ -294,6 +294,11 @@ def build(
         "data terms are revocable and must travel with the track: LICENSE-DATA.txt carries "
         "their URL. --no-burlington-buildings builds without them.",
     ),
+    furniture: bool = typer.Option(
+        True,
+        help="Signs, hydro poles, street lights and stop bars (OSM, Ontario rules, and "
+        "Mapillary with $DRIFTMAPS_MAPILLARY_TOKEN).",
+    ),
     guardrails: bool = typer.Option(
         True,
         help="Guardrails from guardrails.json and OSM, plus the automatic ones (bridges keep "
@@ -375,6 +380,7 @@ def build(
         buildings=buildings,
         nrcan_buildings=nrcan_buildings,
         municipal_buildings=_municipal(municipal_buildings, burlington_buildings),
+        furniture=furniture,
         guardrails=guardrails,
         auto_guardrails=auto_guardrails,
         bridge_approach_rails=bridge_approach_rails,

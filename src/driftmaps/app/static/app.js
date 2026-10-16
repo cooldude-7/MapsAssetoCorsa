@@ -3565,10 +3565,39 @@ function openAcPanel(byUser) {
   if (!input.value && st && st.ac_root) input.value = st.ac_root;
   $("ac-error").hidden = true;
   $("touge-box").hidden = !found;
+  renderMapillary(st);
   $("ac-panel").hidden = false;
   $("ac-pill").setAttribute("aria-expanded", "true");
   loadOffline();
   if (byUser) input.focus();
+}
+
+/** The Mapillary token row: only whether one is saved and its masked tail ever reach the page. */
+function renderMapillary(st) {
+  const set = !!(st && st.mapillary_token_set);
+  $("mly-state").textContent = set
+    ? `Token saved (${st.mapillary_token_hint || "hidden"}). New builds add Mapillary's signs and poles.`
+    : "No token saved.";
+  $("mly-clear").hidden = !set;
+}
+
+async function saveMapillaryToken(value) {
+  const errEl = $("mly-error");
+  errEl.hidden = true;
+  const btn = $("mly-save");
+  btn.disabled = true;
+  try {
+    const st = await api(API.settings, { method: "POST", body: { mapillary_token: value.trim() } });
+    state.status = { ...(state.status || {}), ...st };
+    $("mly-token").value = "";
+    renderMapillary(st);
+    toast(value.trim() ? "Mapillary token saved." : "Mapillary token forgotten.", "ok");
+  } catch (err) {
+    errEl.textContent = err.message;
+    errEl.hidden = false;
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function closeAcPanel() {
@@ -3677,8 +3706,12 @@ function renderOffline(st) {
   $("offline-ready").hidden = st.state !== "ready";
   const updated = offlineDate(st.updated);
   $("offline-ready-text").textContent = `${name} roads ready${updated ? ` - updated ${updated}` : ""}`;
+  $("btn-offline-update").textContent = st.outdated ? "Update (adds signs)" : "Update";
+  const adds = st.state === "ready" && st.outdated && st.update_adds
+    ? ` Update to add ${st.update_adds} to your tracks.`
+    : "";
   $("offline-text").textContent = ready
-    ? `Roads in ${name} load instantly from this PC${st.size_mb ? ` (${Math.round(st.size_mb)} MB)` : ""}. Elsewhere they still come from OpenStreetMap's servers.`
+    ? `Roads in ${name} load instantly from this PC${st.size_mb ? ` (${Math.round(st.size_mb)} MB)` : ""}. Elsewhere they still come from OpenStreetMap's servers.${adds}`
     : running
       ? "You can keep using the app meanwhile. Closing the app stops the download; it continues where it stopped next time."
       : `Roads come from OpenStreetMap's servers, which can take half a minute per area. Download ${name}'s roads once and they load instantly.${st.message && st.state === "none" ? ` ${st.message}` : ""}`;
@@ -4179,6 +4212,11 @@ function bindUi() {
   $("offline-tip-open").addEventListener("click", openOfflineSetup);
   $("offline-tip-close").addEventListener("click", () => ($("offline-tip").hidden = true));
   $("ac-form").addEventListener("submit", saveAcRoot);
+  $("mly-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    saveMapillaryToken($("mly-token").value);
+  });
+  $("mly-clear").addEventListener("click", () => saveMapillaryToken(""));
   $("track-name").addEventListener("input", (e) => {
     state.nameTouched = e.target.value.trim() !== "";
   });

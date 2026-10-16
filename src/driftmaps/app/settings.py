@@ -35,6 +35,7 @@ APP_NAME = "Assetto Corsa Map Generator"
 APP_DIR_NAME = "AssettoCorsaMapGenerator"
 ENV_APP_DIR = "DRIFTMAPS_APP_DIR"
 ENV_CACHE_DIR = "DRIFTMAPS_CACHE_DIR"
+ENV_MAPILLARY_TOKEN = "DRIFTMAPS_MAPILLARY_TOKEN"  # = geo.mapillary.ENV_TOKEN
 SETTINGS_FILE = "settings.json"
 
 
@@ -107,6 +108,7 @@ class Settings:
         self._found: Path | None = None
         self._searched = False
         self.ac_root_override: str | None = None
+        self._mapillary_token: str | None = None
         self._load()
 
     # -- folders ------------------------------------------------------------------------------
@@ -139,11 +141,15 @@ class Settings:
             return
         if isinstance(data, dict) and isinstance(data.get("ac_root"), str) and data["ac_root"]:
             self.ac_root_override = data["ac_root"]
+        if isinstance(data, dict) and isinstance(data.get("mapillary_token"), str):
+            self._mapillary_token = data["mapillary_token"].strip() or None
 
     def _save(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.config_path.with_suffix(".tmp")
         data = {"ac_root": self.ac_root_override}
+        if self._mapillary_token:
+            data["mapillary_token"] = self._mapillary_token
         tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         tmp.replace(self.config_path)
 
@@ -181,13 +187,46 @@ class Settings:
             self._save()
         return root
 
+    # -- Mapillary ------------------------------------------------------------------------------
+
+    def mapillary_token(self) -> str | None:
+        """The Mapillary client token for builds: the saved one, else $DRIFTMAPS_MAPILLARY_TOKEN.
+        Never sent back to the browser (see `status`)."""
+        with self._lock:
+            saved = self._mapillary_token
+        return saved or (self._env.get(ENV_MAPILLARY_TOKEN, "").strip() or None)
+
+    def set_mapillary_token(self, text: str | None) -> None:
+        """Save the user's Mapillary client token (empty/None forgets it)."""
+        token = (text or "").strip()
+        if token and (len(token) > 400 or not token.isprintable() or " " in token):
+            raise SettingsError(
+                "That doesn't look like a Mapillary token: copy the Client Token (it starts "
+                "with MLY|) from mapillary.com/dashboard/developers."
+            )
+        with self._lock:
+            self._mapillary_token = token or None
+            self._save()
+
     def status(self) -> dict[str, object]:
-        """The `/api/status` body."""
+        """The `/api/status` body. The Mapillary token appears only masked (its last 4
+        characters), never whole."""
         root = self.ac_root()
+        token = self.mapillary_token()
         return {
             "app": APP_NAME,
             "version": app_version(),
             "ac_found": root is not None,
             "ac_root": str(root) if root is not None else None,
             "tracks_dir": str(config.tracks_dir(root)) if root is not None else None,
+            "mapillary_token_set": token is not None,
+            "mapillary_token_hint": mask_token(token),
         }
+
+
+def mask_token(token: str | None) -> str | None:
+    """'MLY|…ab12' for a token: enough to recognise it, useless to anyone else."""
+    if not token:
+        return None
+    head = "MLY|" if token.startswith("MLY|") else ""
+    return f"{head}…{token[-4:]}" if len(token) > 8 else "…"

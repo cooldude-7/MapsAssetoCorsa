@@ -106,7 +106,33 @@ def region_elements() -> tuple[dict[int, tuple[float, float]], list[dict], list[
         {"id": LAKE_REL, "members": [("w", 9_200_000_001, "outer")],
          "tags": {"type": "multipolygon", "natural": "water", "name": "Test Lake"}},
     ]  # fmt: skip
+    # Street furniture (FORMAT 3): tagged nodes beside the road, a power line on two poles.
+    for k, (along, side, _) in enumerate(STREET_NODES):
+        nodes[STREET_NODE0 + k] = _at(along, side)
+    nodes[STREET_NODE0 + 10], nodes[STREET_NODE0 + 11] = _at(-30.0, -8.0), _at(30.0, -8.0)
+    ways.append(
+        {"id": POWER_LINE, "nodes": [STREET_NODE0 + 10, STREET_NODE0 + 11],
+         "tags": {"power": "minor_line"}}
+    )  # fmt: skip
     return nodes, ways, relations
+
+
+# (along, left, tags) of the made-up furniture nodes near Mill St, from STREET_NODE0 on; the last
+# one (a bench) is not furniture the builder reads and must not be stored.
+STREET_NODE0 = 9_300_000_000
+POWER_LINE = 9_200_000_010
+STREET_NODES = (
+    (-15.0, -4.0, {"highway": "stop", "direction": "forward"}),
+    (5.0, 6.0, {"highway": "street_lamp"}),
+    (10.0, -8.0, {"power": "pole"}),
+    (12.0, 5.0, {"emergency": "fire_hydrant"}),
+    (20.0, -5.0, {"traffic_sign": "CA:rb-1", "maxspeed": "50"}),
+    (25.0, 5.0, {"amenity": "bench"}),
+)
+
+
+def node_tags() -> dict[int, dict[str, str]]:
+    return {STREET_NODE0 + k: tags for k, (_, _, tags) in enumerate(STREET_NODES)}
 
 
 def osm_xml() -> str:
@@ -115,9 +141,16 @@ def osm_xml() -> str:
         "<?xml version='1.0' encoding='UTF-8'?>",
         f'<osm version="0.6" generator="driftmaps tests" timestamp="{OSM_BASE}">',
     ]
+    tagged = node_tags()
     for nid in sorted(nodes):
         lat, lon = nodes[nid]
-        lines.append(f'  <node id="{nid}" version="1" lat="{lat:.7f}" lon="{lon:.7f}"/>')
+        head = f'  <node id="{nid}" version="1" lat="{lat:.7f}" lon="{lon:.7f}"'
+        if nid not in tagged:
+            lines.append(head + "/>")
+            continue
+        lines.append(head + ">")
+        lines += [f"    <tag k={quoteattr(k)} v={quoteattr(v)}/>" for k, v in tagged[nid].items()]
+        lines.append("  </node>")
     for w in sorted(ways, key=lambda w: w["id"]):
         lines.append(f'  <way id="{w["id"]}" version="1">')
         lines += [f'    <nd ref="{n}"/>' for n in w["nodes"]]
