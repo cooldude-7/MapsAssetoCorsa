@@ -1128,7 +1128,7 @@ def plan_furniture(
     pl.pole_lines()
     pl.street_lights(juncs, surf)
     pl.items = dedupe(pl.items, o.dedupe_m, pole_radius_m=o.pole_dedupe_m, sides=sides(pl.items))
-    _signals(pl, juncs, osm, list(mapillary))
+    _signals(pl, juncs, osm, list(mapillary), surf)
     stats += clear(first=False)  # what the pole lines put on a side road or junction
     pl.items = _attach_lights(pl.items)
     plan = pl.plan
@@ -1151,16 +1151,22 @@ _TRAFFIC_LIGHT = "object--traffic-light--"
 _UNDER_SIGNALS = (SIGN_STOP, SIGN_YIELD, SIGN_ALL_WAY)
 UNDER_SIGNAL_M = 25.0  # stop / yield signs this far beyond a signalised junction's poles go
 UNDER_SIGNAL_NODE_M = 35.0  # ... and rule / OSM ones this close to an OSM signal node
+SIGNAL_POLE_EDGE_M = 1.2  # signal poles stand at least this far off the drivable surface
 
 
-def _signals(pl: _Planner, juncs: list[_Junction], osm, mapillary: Sequence) -> None:
+def _signals(
+    pl: _Planner, juncs: list[_Junction], osm, mapillary: Sequence,
+    surface: DrivableSurface | None = None,
+) -> None:  # fmt: skip
     """Ontario signals on every approach of each signalised route junction
     (`geometry.signals`): corner poles (signal items, moved off the surface by the next
     clearance pass) with a luminaire each; stop and yield signs on those approaches, and any
     other signal item there, are dropped. So are rule-made and OSM stop and yield signs
     within `UNDER_SIGNAL_NODE_M` of any OSM traffic signal node, also at junctions this layer
     does not plan (beyond A and B, in the run-off: the Burlington check's wrongly facing stop
-    sign on a signalised side street)."""
+    sign on a signalised side street). Poles planned on the real drivable `surface` (a big
+    junction's corners are wider than the roads' tags say) first move to the nearest spot
+    `SIGNAL_POLE_EDGE_M` off it (`_off_surface`), so the clearance pass does not drop them."""
     nodes = [n for n in (osm.nodes if osm is not None else ()) if
              n.tags.get("highway") == "traffic_signals"]  # fmt: skip
     sig_xz = _xz_of(pl.proj, np.array([(n.lon, n.lat) for n in nodes])) if nodes else np.zeros(
@@ -1196,11 +1202,34 @@ def _signals(pl: _Planner, juncs: list[_Junction], osm, mapillary: Sequence) -> 
             continue  # our corner poles replace it
         keep.append(it)
     for pole in plan.poles:
+        if surface is not None:
+            pole.xz = _off_surface(pole.xz, pole.origin, surface)
         facing = pole.axis if pole.axis is not None else np.array([1.0, 0.0])
         keep.append(_item(SIGNAL_TRAFFIC, pole.xz, -facing, pl.ground, "rule", ref=pole.ref))
         if not pole.post:  # Ontario signal poles carry the junction's luminaires
             keep.append(_item(LIGHT_STREET, pole.xz, -facing, pl.ground, "rule"))
     pl.items = keep
+
+
+def _off_surface(xz: np.ndarray, centre: np.ndarray, surface: DrivableSurface) -> np.ndarray:
+    """The nearest point to `xz` (within 20 m, not nearer the junction `centre`) that stands
+    SIGNAL_POLE_EDGE_M off the drivable surface: the corner the plan meant, where a big
+    junction's real pavement reaches farther than the roads' tags say. `xz` itself when it
+    already stands clear or nothing does."""
+    p = np.asarray(xz, np.float64)
+    if float(surface.distance(p[None, :])[0]) >= SIGNAL_POLE_EDGE_M:
+        return p
+    ang = np.linspace(0.0, 2.0 * np.pi, 24, endpoint=False)
+    rad = np.arange(0.5, 20.01, 0.5)
+    ring = np.stack([np.cos(ang), np.sin(ang)], axis=1)
+    cand = (p[None, None, :] + rad[:, None, None] * ring[None, :, :]).reshape(-1, 2)
+    c = np.asarray(centre, np.float64)
+    keep = np.hypot(*(cand - c).T) >= float(np.hypot(*(p - c))) - 1.0
+    cand = cand[keep]
+    ok = cand[surface.distance(cand) >= SIGNAL_POLE_EDGE_M]
+    if not len(ok):
+        return p
+    return ok[int(np.argmin(np.hypot(*(ok - p).T)))]
 
 
 def _on_surface(items: Sequence[StreetItem], surf: DrivableSurface) -> dict[str, int]:
