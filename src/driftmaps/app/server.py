@@ -656,8 +656,20 @@ class App:
         return {**self.settings.status(), "build": build_info()}
 
     def set_settings(self, body: dict) -> dict:
-        if "ac_root" not in body:
-            raise ApiError(400, "Nothing to change: send ac_root.")
+        if "ac_root" not in body and "mapillary_token" not in body:
+            raise ApiError(400, "Nothing to change: send ac_root or mapillary_token.")
+        if "mapillary_token" in body:
+            token = body["mapillary_token"]
+            if token is not None and not isinstance(token, str):
+                raise ApiError(400, "mapillary_token must be text.")
+            try:
+                self.settings.set_mapillary_token(token)
+            except SettingsError as exc:
+                raise ApiError(400, str(exc)) from None
+            except OSError as exc:
+                raise ApiError(500, f"Couldn't save the settings: {exc}") from None
+            if "ac_root" not in body:
+                return self.status()
         value = body["ac_root"]
         if value is not None and not isinstance(value, str):
             raise ApiError(400, "ac_root must be a folder path.")

@@ -231,6 +231,25 @@ def test_settings_validates_and_persists(env):
     assert status == 200 and Path(body["ac_root"]) == env.ac
 
 
+def test_mapillary_token_is_saved_but_never_sent_back(env):
+    token = "MLY|1234567890123|0123456789abcdef0123456789abcdef"
+    status, body = env.client.post("/api/settings", {"mapillary_token": f"  {token} "})
+    assert status == 200, body
+    assert body["mapillary_token_set"] is True and body["mapillary_token_hint"] == "MLY|…cdef"
+    assert token not in json.dumps(body)
+    status, body = env.client.get("/api/status")
+    assert body["mapillary_token_set"] and token not in json.dumps(body)
+    saved = json.loads(env.settings.config_path.read_text(encoding="utf-8"))
+    assert saved["mapillary_token"] == token and "ac_root" in saved
+    again = Settings(env.settings.data_dir, discover=lambda: None)
+    assert again.mapillary_token() == token
+    status, body = env.client.post("/api/settings", {"mapillary_token": "has spaces in it"})
+    assert status == 400 and "Mapillary" in body["error"]
+    status, body = env.client.post("/api/settings", {"mapillary_token": ""})
+    assert status == 200 and body["mapillary_token_set"] is False
+    assert "mapillary_token" not in json.loads(env.settings.config_path.read_text("utf-8"))
+
+
 # ---------------------------------------------------------------------------------------------
 # route / profile
 # ---------------------------------------------------------------------------------------------

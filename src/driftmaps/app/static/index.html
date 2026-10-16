@@ -67,6 +67,22 @@
       </div>
       <p id="offline-error" class="error-text" role="alert" hidden></p>
     </div>
+    <form id="mly-form" class="offline-box" autocomplete="off">
+      <h3 class="offline-title">Signs and poles from street photos (optional)</h3>
+      <p class="hint">With a free Mapillary token, tracks get the stop signs, speed limits,
+        hydro poles and street lights that Mapillary found in street-level photos. Get one at
+        <a href="https://www.mapillary.com/dashboard/developers" target="_blank" rel="noopener">mapillary.com/dashboard/developers</a>:
+        sign in, register an application, then copy its <strong>Client Token</strong> (it starts with MLY|).
+        Without one, tracks still get signs and poles from OpenStreetMap and Ontario's road rules.</p>
+      <label for="mly-token">Mapillary token</label>
+      <div class="row">
+        <input id="mly-token" type="password" spellcheck="false" placeholder="MLY|..." autocomplete="off">
+        <button id="mly-save" class="btn small" type="submit">Save</button>
+        <button id="mly-clear" class="btn small ghost" type="button" hidden>Forget</button>
+      </div>
+      <p id="mly-state" class="hint" role="status"></p>
+      <p id="mly-error" class="error-text" role="alert" hidden></p>
+    </form>
   </section>
 
   <main class="layout">
@@ -248,7 +264,9 @@
 
   <footer class="footer">
     Road data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap
-    contributors</a>. Not affiliated with Kunos Simulazioni.
+    contributors</a>. Signs and poles from
+    <a href="https://www.mapillary.com" target="_blank" rel="noopener">Mapillary</a> street-level
+    imagery (CC BY-SA 4.0), when a token is set. Not affiliated with Kunos Simulazioni.
   </footer>
 
   <dialog id="confirm-dialog" class="dialog">

@@ -3565,10 +3565,39 @@ function openAcPanel(byUser) {
   if (!input.value && st && st.ac_root) input.value = st.ac_root;
   $("ac-error").hidden = true;
   $("touge-box").hidden = !found;
+  renderMapillary(st);
   $("ac-panel").hidden = false;
   $("ac-pill").setAttribute("aria-expanded", "true");
   loadOffline();
   if (byUser) input.focus();
+}
+
+/** The Mapillary token row: only whether one is saved and its masked tail ever reach the page. */
+function renderMapillary(st) {
+  const set = !!(st && st.mapillary_token_set);
+  $("mly-state").textContent = set
+    ? `Token saved (${st.mapillary_token_hint || "hidden"}). New builds add Mapillary's signs and poles.`
+    : "No token saved.";
+  $("mly-clear").hidden = !set;
+}
+
+async function saveMapillaryToken(value) {
+  const errEl = $("mly-error");
+  errEl.hidden = true;
+  const btn = $("mly-save");
+  btn.disabled = true;
+  try {
+    const st = await api(API.settings, { method: "POST", body: { mapillary_token: value.trim() } });
+    state.status = { ...(state.status || {}), ...st };
+    $("mly-token").value = "";
+    renderMapillary(st);
+    toast(value.trim() ? "Mapillary token saved." : "Mapillary token forgotten.", "ok");
+  } catch (err) {
+    errEl.textContent = err.message;
+    errEl.hidden = false;
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function closeAcPanel() {
@@ -4182,6 +4211,11 @@ function bindUi() {
   $("offline-tip-open").addEventListener("click", openOfflineSetup);
   $("offline-tip-close").addEventListener("click", () => ($("offline-tip").hidden = true));
   $("ac-form").addEventListener("submit", saveAcRoot);
+  $("mly-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    saveMapillaryToken($("mly-token").value);
+  });
+  $("mly-clear").addEventListener("click", () => saveMapillaryToken(""));
   $("track-name").addEventListener("input", (e) => {
     state.nameTouched = e.target.value.trim() !== "";
   });

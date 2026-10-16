@@ -26,6 +26,7 @@ ALLOWED_HOSTS = {
     "unpkg.com",  # MapLibre GL JS, pinned version
     "tiles.openfreemap.org",  # map styles and tiles
     "photon.komoot.io",  # place search
+    "www.mapillary.com",  # links only: the token page and the credit (no requests from the page)
     "www.openstreetmap.org",  # the attribution link in the footer
     "www.w3.org",  # the SVG XML namespace, not a request
 }
