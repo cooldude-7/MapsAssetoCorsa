@@ -108,6 +108,52 @@ def find_ac() -> None:
     typer.echo(str(root))
 
 
+@app.command("install-touge")
+def install_touge(
+    ac_root: Path = typer.Option(
+        None, "--ac-root", help="Assetto Corsa folder (default: found automatically)."
+    ),
+    force: bool = typer.Option(
+        False,
+        help="Replace a same-named mode folder this tool did not install, or install without CSP.",
+    ),
+    trackday_variant: bool = typer.Option(
+        False,
+        "--trackday-variant",
+        help="Also install a Track Day based copy (to try if the Race based one misbehaves).",
+    ),
+    uninstall: bool = typer.Option(False, help="Remove the mode instead."),
+) -> None:
+    """Install the Touge Battle CSP New Mode: 1v1 against one AI car on an A to B track."""
+    from driftmaps.config import find_ac_root
+    from driftmaps.csp_modes import ModeInstallError, uninstall_touge
+    from driftmaps.csp_modes import install_touge as install_mode
+
+    root = ac_root if ac_root is not None else find_ac_root()
+    if root is None:
+        typer.echo("Assetto Corsa not found; pass --ac-root or set DRIFTMAPS_AC_ROOT.", err=True)
+        raise typer.Exit(1)
+    if uninstall:
+        removed = uninstall_touge(root)
+        for folder in removed:
+            typer.echo(f"removed  {folder}")
+        if not removed:
+            typer.echo("Touge Battle is not installed (nothing removed).")
+        return
+    try:
+        folders = install_mode(root, force=force, trackday_variant=trackday_variant)
+    except ModeInstallError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(1) from None
+    for folder in folders:
+        typer.echo(f"install  {folder}")
+    typer.echo(
+        "Next: in Content Manager pick an A to B track built by this tool, choose the "
+        '"Touge Battle (ACMG)" mode with one opponent, and drive. Steps and what to report: '
+        "docs/checklists/touge.md"
+    )
+
+
 # --------------------------------------------------------------------------------------------
 # M1: route + build
 # --------------------------------------------------------------------------------------------

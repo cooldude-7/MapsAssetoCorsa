@@ -51,6 +51,8 @@ Pipeline (PLAN §5.1-§5.5, docs/research/geo.md §1-§3, ac_format.md §2, §3,
    (`LICENSE-DATA.txt`, `route_osm.geojson` with the OSM road, building and barrier ways used,
    `route.json`, and `guardrails.json` if one was used: its bytes are read before the old
    track folder is cleared, so a file kept inside the track folder survives a rebuild).
+   A->B tracks are tagged "touge" and get `data/acmg_touge.json` (gates, grid and chase start
+   for the Touge Battle CSP New Mode in `csp/new-modes/acmg-touge`, see `driftmaps.csp_modes`).
 
 **Loops** (a closed `Route`, PLAN §5.5 circuits): the centreline is smoothed as a closed
 curve (`geometry.road.closed_centreline`, no seam at the join), the height profile is fitted
@@ -244,6 +246,10 @@ GRID_FIRST_M = 6.0
 GRID_ROW_M = 7.0
 GRID_GAP_M = 8.0
 GRID_TAIL_M = 8.0
+# Touge Battle mode data (csp/new-modes/acmg-touge reads data/<TOUGE_FILE>): the "chase" start
+# puts the chaser this far (centre to centre) behind the leader, one car length plus a gap.
+TOUGE_FILE = "acmg_touge.json"
+TOUGE_CHASE_GAP_M = 10.0
 MAX_SPLITS = 1  # A->B tracks: one AC_TIME split is verified; more are not
 # Loops (circuits): the hotlap start this far before the start/finish line (ASSUMED: enough to
 # be at speed over the line on a city block, short enough to stay on the lap's last straight),
@@ -821,6 +827,19 @@ class _Dummies:
     gates: dict[str, float]  # prefix -> s
 
 
+def _start_lanes(geo: TrackGeometry, offs: np.ndarray, s: float) -> tuple[float, float]:
+    """(driving lane, other lane) lateral offsets at `s` (`offs` = `lane_offset(geo)`); on a
+    one-way/one-lane stretch two cars still sit side by side, a quarter of the asphalt width
+    either side."""
+    m = geo.model
+    drive = m.interp(offs, s)
+    if abs(drive) < 0.25:
+        quarter = m.interp(m.half_width, s) / 2.0
+        sign = -1.0 if geo.driving_side == "right" else 1.0
+        return sign * quarter, -sign * quarter
+    return drive, -drive
+
+
 def _dummies(geo: TrackGeometry, options: BuildOptions) -> _Dummies:
     m = geo.model
     offs = lane_offset(geo)
@@ -834,14 +853,7 @@ def _dummies(geo: TrackGeometry, options: BuildOptions) -> _Dummies:
         spawns[name] = (s, lateral)
 
     def lanes_at(s: float) -> tuple[float, float]:
-        """(driving lane, other lane) lateral offsets; on a one-way/one-lane stretch the two
-        cars still sit side by side, a quarter of the asphalt width either side."""
-        drive = m.interp(offs, s)
-        if abs(drive) < 0.25:
-            quarter = m.interp(m.half_width, s) / 2.0
-            sign = -1.0 if geo.driving_side == "right" else 1.0
-            return sign * quarter, -sign * quarter
-        return drive, -drive
+        return _start_lanes(geo, offs, s)
 
     # Grid: a start slot per pit box (at least 2), side by side in rows every 7 m from 6 m
     # behind A (the first car of a row on the driving lane), the pits in pairs behind them and
@@ -886,6 +898,60 @@ def _dummies(geo: TrackGeometry, options: BuildOptions) -> _Dummies:
         reach = m.interp(m.half_width, s) + GATE_EXTRA_M
         nodes += gate_dummies(prefix, pos, fwd, left, reach, GATE_HEIGHT_M)
     return _Dummies(nodes, spawns, gates)
+
+
+def _touge_data(geo: TrackGeometry, dummies: _Dummies, track_id: str) -> dict:
+    """data/acmg_touge.json for the Touge Battle New Mode (A->B tracks only): the A and B
+    gates, the side-by-side grid (`AC_START_0` on the driving lane, `AC_START_1` beside it)
+    and the chase start (both on the driving lane, `TOUGE_CHASE_GAP_M` apart). Positions are
+    AC world coordinates (x east, y up, z south) in metres, spawns `SPAWN_HEIGHT_M` above the
+    road like the dummies."""
+    m = geo.model
+
+    def vec(v: np.ndarray, nd: int) -> list[float]:
+        return [round(float(x), nd) + 0.0 for x in v]  # + 0.0: no "-0.0" in the file
+
+    def pose(s: float, lateral: float) -> dict:
+        pos, fwd, left = m.at(s)
+        return {
+            "position": vec(pos + lateral * left + SPAWN_HEIGHT_M * WORLD_UP, 3),
+            "forward": vec(fwd, 5),
+        }
+
+    def gate(s: float) -> dict:
+        pos, fwd, left = m.at(s)
+        hw = m.interp(m.half_width, s)
+        return {
+            "centre": vec(pos, 3),
+            "forward": vec(fwd, 5),
+            "left": vec(left, 5),
+            "half_width_m": round(hw, 2),
+            "reach_m": round(hw + GATE_EXTRA_M, 2),
+        }
+
+    grid = []
+    for name in ("AC_START_0", "AC_START_1"):
+        s, lateral = dummies.spawns[name]
+        grid.append({"name": name} | pose(s, lateral))
+    s_lead = dummies.spawns["AC_START_0"][0]
+    s_chase = s_lead - TOUGE_CHASE_GAP_M
+    offs = lane_offset(geo)
+    return {
+        "format": 1,
+        "about": "Touge Battle mode data (Assetto Corsa Map Generator, csp/new-modes/"
+        "acmg-touge). AC world coordinates: x east, y up, z south, metres.",
+        "track_id": track_id,
+        "length_m": round(geo.length_m, 1),
+        "driving_side": geo.driving_side,
+        "start_gate": gate(geo.s_a),
+        "finish_gate": gate(geo.s_b),
+        "run_off_m": round(float(m.s[-1]) - geo.s_b, 1),
+        "grid": grid,
+        "chase": {
+            "leader": pose(s_lead, _start_lanes(geo, offs, s_lead)[0]),
+            "chaser": pose(s_chase, _start_lanes(geo, offs, s_chase)[0]),
+        },
+    }
 
 
 def _ai_line(geo: TrackGeometry, options: BuildOptions) -> tuple[AiLine, slice]:
@@ -1747,6 +1813,12 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
         run=run,
     )
     write_ui_track_json(ui_dir / "ui_track.json", ui)
+    if not geo.closed:  # the "touge" tag's New Mode reads its gates and starts from here
+        (data_dir / TOUGE_FILE).write_text(
+            json.dumps(_touge_data(geo, dummies, track_id), indent=1) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
     write_preview_png(ui_dir / "preview.png", [line], title=options.name)
     write_outline_png(ui_dir / "outline.png", [line])
     write_data_license(track_dir, keys, track_name=options.name, extra_notices=extra)

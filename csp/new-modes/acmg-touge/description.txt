@@ -1,0 +1,3 @@
+Touge battle against one AI car on an A to B road built by Assetto Corsa Map Generator (the track needs the "touge" tag and, ideally, its data/acmg_touge.json).
+
+Pick one opponent car. Both cars start side by side at A (or AI ahead and you one car length behind, or the other way round: see Start in the settings). The first car past the B gate wins; both cars are then braked to a stop before the end of the road and a result screen shows the winner and the gap. Press "Race again" (or Shift+R) for a rerun from A, with your AI level and aggression tweaks.
