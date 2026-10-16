@@ -119,6 +119,11 @@ def test_signals_on_every_approach_with_a_head_per_lane():
         assert p.name == "Brant Street"
     stats = sig.stats()
     assert stats["heads"] == 2 * 3 + 2 * 1 + 4  # overhead + one pole-mounted per approach
+    # The secondary head is on the FAR LEFT: each corner pole carries the one of the approach
+    # from its left, not its own approach's.
+    assert all(len(p.side) == 1 for p in arms)
+    assert all(float(p.side[0] @ -p.axis) < 0.5 for p in arms)
+    assert all(abs(float(p.side[0] @ p.axis)) < 0.1 for p in arms)  # a crossing approach
     assert stats["arrow_heads"] == 2 and stats["ped_heads"] == 8 and stats["push_buttons"] == 8
     items = [it for it in plan.items if it.kind == SIGNAL_TRAFFIC]
     assert len(items) == len(sig.poles)

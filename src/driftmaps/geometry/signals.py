@@ -11,30 +11,35 @@ signalised (the side streets too: the user's Burlington check, 2026-10-16, found
 route's two approaches only), and no stop or yield sign stands on any of them
 (`plan_furniture` drops them).
 
-**Layout** (Ontario Traffic Manual Book 12, Traffic Signals, 2012; numbers ASSUMED where the
-manual gives a range):
-- Heads are on the FAR side of the junction (OTM Book 12 §4: far-side primary and secondary
-  heads). Each approach gets a corner pole on its far-right corner with a mast arm reaching
-  left over its lanes: one 3-section 300 mm head (OTM Book 12: 300 mm lenses for vehicle
-  heads) centred over each through lane, a 3-section left-arrow head over each left-turn lane
-  (lane counts from `lanes`, `lanes:forward|backward`, `turn:lanes*`), and a secondary head
-  side-mounted on the pole itself. With four legs each corner pole serves one approach's arm
-  (its far right) and nothing else; on a T the straight side gets two poles.
+**Layout.** Numbers from docs/research/intersections.md §4 (the network builder's research:
+[TOR-SIG] City of Toronto TTR 801.320, Location of Traffic Signal Equipment, 2012, after the
+Highway Traffic Act s.124 and OTM Book 12), the rest ASSUMED:
+- At least two heads per approach (HTA s.124(20)). The primary heads are on the FAR right
+  ([TOR-SIG] §3.6.1, 12-55 m beyond the near stop line): each approach gets a corner pole on
+  its far-right corner with a mast arm reaching left over its lanes, one 3-section 300 mm
+  head (§3.4) centred over each through lane and a 3-section left-arrow head over each
+  left-turn lane (lane counts from `lanes`, `lanes:forward|backward`, `turn:lanes*`); the
+  secondary head is on the FAR LEFT (§3.6.2), side-mounted on the corner pole there (the far
+  right pole of the approach from the left), or on the far-right pole when there is none
+  (the open side of a T). With four legs each corner carries one arm.
 - Heads: black housing 0.36 x 1.10 m, black backplate 0.66 x 1.36 m with a 75 mm fluorescent
   yellow retroreflective border (as Ontario installs them). Overhead heads: housing bottom
-  `HEAD_CLEAR_M` (4.85 m) above the road (OTM Book 12: 4.5 m minimum clearance), the arm
-  `ARM_Y_M` (6.2 m) above it; side-mounted heads: housing bottom `SIDE_HEAD_M` (3.0 m) above
-  the ground (2.5 m minimum over a sidewalk).
-- Poles: galvanized steel, at the corner `POLE_SETBACK_M` behind both curb lines; the
-  furniture clearance (`geometry.clearance`) then moves them off the drivable surface (1 m
-  behind its edge). The arm keeps its direction (square to the approach) and its heads stay
-  over their lanes, wherever the pole ends up; it is at most `MAX_ARM_M` long.
+  `HEAD_CLEAR_M` (4.9 m, the standard; 4.5 m minimum) above the road, the arm `ARM_Y_M`
+  above it; side-mounted heads: bottom `SIDE_HEAD_M` (4.9 m standard; 2.75 m minimum).
+- Poles: galvanized steel, 9.1 m tall, at the corner `POLE_SETBACK_M` behind both curb
+  lines; the furniture clearance (`geometry.clearance`) then moves them off the drivable
+  surface (1 m behind its edge, §3.9: at least 1.0 m from the curb). The arm keeps its
+  direction (square to the approach) and its heads stay over their lanes wherever the pole
+  ends up; it is at most `MAX_ARM_M` (7.6 m, the longest standard arm, Tables 1-2) long, and
+  heads beyond its reach are left out.
 - A street name sign (white on green, the furniture atlas's blades) on each mast arm, naming
   the street the approach crosses.
-- Pedestrian signals: at both ends of a crosswalk across every leg, a countdown head
-  (`PED_HEAD_M` above the ground) facing across the street, on the corner pole when one stands
-  within `PED_SNAP_M`, else on a 3.5 m pedestrian post; each end also gets a push button at
-  `BUTTON_M` (1.05 m; AODA / OTM Book 12 accessible pedestrian signals: about 1.0-1.1 m).
+- Pedestrian signals: at both ends of a crosswalk across every leg (centred 2.5 m beyond the
+  crossing road's edge: a 3 m crosswalk 1 m out, intersections.md §3), a countdown head
+  (bottom `PED_HEAD_M`, 2.75 m, §3.6.4) facing across the street, on the corner pole when one
+  stands within `PED_SNAP_M` (3 m: push buttons within 3.0 m of the crosswalk, §3.9), else on
+  a 3.9 m pedestrian post; each end also gets a push button at `BUTTON_M` (1.05 m; AODA
+  accessible pedestrian signals: about 1.0-1.1 m, ASSUMED).
 - Signals cannot change in AC: heads on the route's approaches show green, the side streets'
   red, left arrows dark; pedestrian heads show the orange hand.
 """
@@ -66,12 +71,13 @@ __all__ = [
 SIGNAL_NODE_M = 40.0  # an OSM traffic_signals node this close to a route junction signals it
 MLY_LIGHT_M = 30.0  # a Mapillary traffic light this close does too
 POLE_SETBACK_M = 1.5  # corner poles stand this far behind both curb lines (before clearance)
-MAX_ARM_M = 15.0  # Ontario mast arms are up to ~12-15 m (ASSUMED)
-ARM_Y_M = 6.2  # mast arm above the road
-HEAD_CLEAR_M = 4.85  # bottom of an overhead head's housing above the road (OTM: >= 4.5 m)
-SIDE_HEAD_M = 3.0  # bottom of a pole-mounted head above the ground (OTM: >= 2.5 m)
-PED_HEAD_M = 2.2  # bottom of a pedestrian head above the ground (below the vehicle heads)
-PED_SNAP_M = 5.0  # a crosswalk end this close to a corner pole uses it
+MAX_ARM_M = 7.6  # the longest standard mast arm ([TOR-SIG] Tables 1-2)
+POLE_M = 9.1  # signal pole height above the ground (a 7.6 m arm's pole)
+HEAD_CLEAR_M = 4.9  # bottom of an overhead head's housing above the road (>= 4.5 m)
+ARM_Y_M = HEAD_CLEAR_M + 1.10 + 0.25  # the arm, above the road (head + hanger)
+SIDE_HEAD_M = 4.9  # bottom of a pole-mounted head above the ground (>= 2.75 m)
+PED_HEAD_M = 2.75  # bottom of a pedestrian head above the ground (>= 2.75 m)
+PED_SNAP_M = 3.0  # a crosswalk end this close to a corner pole uses it
 BUTTON_M = 1.05  # push button height
 CROSSWALK_SETBACK_M = 2.5  # crosswalk centre this far beyond the crossing road's curb line
 HEAD_W, HEAD_H, HEAD_D = 0.36, 1.10, 0.24  # 3-section 300 mm head housing
@@ -270,6 +276,7 @@ def plan_junction(
     if len(legs) < 3:
         return [], 0.0
     poles: list[SignalPole] = []
+    far_left: list[tuple[np.ndarray, np.ndarray]] = []  # per arm pole: far-left corner, t
     for k, leg in enumerate(legs):
         if not leg.arrives:
             continue
@@ -293,11 +300,17 @@ def plan_junction(
                 origin=c,
                 axis=t,
                 heads=heads,
-                side=[-t],
                 name=name,
                 go=leg.on_route,
             )
         )
+        far_left.append((c + t * a - r * ((far.across[1] if far is not None else leg.half)
+                                          + POLE_SETBACK_M), t))  # fmt: skip
+    # Secondary heads on the far-left corner's pole (on the far-right one when there is none).
+    for pole, (corner, t) in zip(poles, far_left, strict=True):
+        dist = [float(np.hypot(*(q.xz - corner))) for q in poles]
+        k = int(np.argmin(dist))
+        (poles[k] if dist[k] <= 6.0 and poles[k] is not pole else pole).side.append(-t)
     # Pedestrian signals and push buttons at both ends of a crosswalk across every leg.
     for k, leg in enumerate(legs):
         d = _unit(leg.direction)
@@ -515,7 +528,7 @@ def draw_pole(
     gy = float(base[1])
     pxz = base[[0, 2]]
     if pole.post:
-        cell.furn.prism(base + np.array([0.0, -0.4, 0.0]), 3.9, 0.07, 0.06, 8, metal)
+        cell.furn.prism(base + np.array([0.0, -0.4, 0.0]), 4.3, 0.07, 0.06, 8, metal)
         for k, f in enumerate(pole.ped):
             f3 = np.array([f[0], 0.0, f[1]])
             _ped_head(cell, np.array([base[0], gy + PED_HEAD_M + 0.23 + 0.5 * (k % 2), base[2]])
@@ -530,7 +543,7 @@ def draw_pole(
     hxz = [pxz - r * along for along, _ in lanes]
     ry = max([float(road_y(np.asarray(h)[None, :])[0]) for h in hxz] + [gy - 0.3])
     arm_y = ry + ARM_Y_M
-    top = arm_y + 0.9
+    top = max(arm_y + 0.9, gy + POLE_M)
     cell.furn.prism(base + np.array([0.0, -0.4, 0.0]), top - gy + 0.4, 0.17, 0.12, 8, metal)
     f2 = -t  # heads face the arriving drivers
     f3 = np.array([f2[0], 0.0, f2[1]])
