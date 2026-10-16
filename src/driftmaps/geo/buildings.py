@@ -184,8 +184,12 @@ def route_boxes(
         corners = proj.from_xy(np.array([[x0, y0], [x0, y1], [x1, y0], [x1, y1]]))
         w, so = corners.min(axis=0)
         e, n = corners.max(axis=0)
-        box = (math.floor(so * 1e5) / 1e5, math.floor(w * 1e5) / 1e5,
-               math.ceil(n * 1e5) / 1e5, math.ceil(e * 1e5) / 1e5)
+        box = (
+            math.floor(so * 1e5) / 1e5,
+            math.floor(w * 1e5) / 1e5,
+            math.ceil(n * 1e5) / 1e5,
+            math.ceil(e * 1e5) / 1e5,
+        )
         if box not in boxes:
             boxes.append(box)
     return boxes
@@ -290,12 +294,20 @@ def fetch_osm_buildings(
     """(OSM building footprints near the (N, 2) lon/lat route line, osm_base timestamp).
 
     One query for the union of `route_boxes` (each ~`piece_m` of line grown by `around_m` +
-    5 m); `fetch_buildings` then keeps footprints within `around_m` of the line. `offline=True`
-    never touches the network (OverpassError on a cache miss). Extra kwargs go to
-    `overpass.post_query`.
+    5 m); `fetch_buildings` then keeps footprints within `around_m` of the line. A downloaded
+    region database (`driftmaps.geo.offline`) covering the boxes answers first (not with
+    `refresh`). `offline=True` never touches the network (OverpassError on a cache miss).
+    Extra kwargs go to `overpass.post_query`.
     """
     ll = np.asarray(route_lonlat, dtype=np.float64).reshape(-1, 2)
-    query = build_buildings_query(route_boxes(ll, around_m + 5.0, piece_m))
+    boxes = route_boxes(ll, around_m + 5.0, piece_m)
+    if not refresh:  # the downloaded region database, when it covers the boxes
+        from driftmaps.geo import offline as region_db
+
+        found = region_db.buildings_payload(boxes)
+        if found is not None:
+            return parse_buildings(found), found["osm3s"]["timestamp_osm_base"]
+    query = build_buildings_query(boxes)
     key = query_cache_key(query)
     cache = Path(cache_dir) if cache_dir is not None else default_cache_dir()
     path = cache / "overpass" / f"{key}.json.gz"
@@ -340,9 +352,7 @@ def quadkeys_for_bbox(
     """Quadkeys of every tile the lon/lat bbox touches, sorted."""
     x0, y1 = _tile_xy(west, south, zoom)
     x1, y0 = _tile_xy(east, north, zoom)
-    return sorted(
-        quadkey(x, y, zoom) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)
-    )
+    return sorted(quadkey(x, y, zoom) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1))
 
 
 def _open_url(url: str) -> IO[bytes]:
@@ -402,8 +412,12 @@ def parse_ms_features(
             continue
         if bbox is not None:
             w, s, e, nn = bbox
-            if (ring[:, 0].max() < w or ring[:, 0].min() > e
-                    or ring[:, 1].max() < s or ring[:, 1].min() > nn):
+            if (
+                ring[:, 0].max() < w
+                or ring[:, 0].min() > e
+                or ring[:, 1].max() < s
+                or ring[:, 1].min() > nn
+            ):
                 continue
         if not np.allclose(ring[0], ring[-1]):
             ring = np.vstack([ring, ring[:1]])
@@ -413,8 +427,9 @@ def parse_ms_features(
         except (TypeError, ValueError):
             h = -1.0
         out.append(
-            Footprint(f"{id_prefix}:{n}", "microsoft", ring, {},
-                      h if math.isfinite(h) and h > 0 else None)
+            Footprint(
+                f"{id_prefix}:{n}", "microsoft", ring, {}, h if math.isfinite(h) and h > 0 else None
+            )
         )
     return out
 
@@ -424,8 +439,9 @@ def _footprint_json(f: Footprint) -> dict:
 
 
 def _footprint_from_json(d: Mapping) -> Footprint:
-    return Footprint(str(d["id"]), "microsoft", np.asarray(d["ring"], np.float64), {},
-                     d.get("height"))
+    return Footprint(
+        str(d["id"]), "microsoft", np.asarray(d["ring"], np.float64), {}, d.get("height")
+    )
 
 
 def fetch_ms_buildings(
@@ -444,8 +460,12 @@ def fetch_ms_buildings(
     """
     cache = Path(cache_dir) if cache_dir is not None else default_cache_dir()
     w, s, e, n = bbox
-    box = (math.floor(w * 1e3) / 1e3, math.floor(s * 1e3) / 1e3,
-           math.ceil(e * 1e3) / 1e3, math.ceil(n * 1e3) / 1e3)
+    box = (
+        math.floor(w * 1e3) / 1e3,
+        math.floor(s * 1e3) / 1e3,
+        math.ceil(e * 1e3) / 1e3,
+        math.ceil(n * 1e3) / 1e3,
+    )
     links = _links_csv(cache, opener, refresh, offline)
     out: list[Footprint] = []
     for qk, url in ms_tile_urls(links, quadkeys_for_bbox(*box)):
@@ -499,9 +519,7 @@ def merge_footprints(
         if area <= 0:
             continue
         hits = tree.query(poly, predicate="intersects")
-        covered = max(
-            (shapely.intersection(poly, p_osm[i]).area for i in hits), default=0.0
-        )
+        covered = max((shapely.intersection(poly, p_osm[i]).area for i in hits), default=0.0)
         if covered <= max_overlap * area:
             out.append(f)
     return out
@@ -540,8 +558,13 @@ def fetch_buildings(
     """
     ll = np.asarray(route_lonlat, dtype=np.float64).reshape(-1, 2)
     osm, osm_base = fetch_osm_buildings(
-        ll, cache_dir=cache_dir, around_m=around_m, mirrors=mirrors, refresh=refresh,
-        offline=offline, **post_kwargs,
+        ll,
+        cache_dir=cache_dir,
+        around_m=around_m,
+        mirrors=mirrors,
+        refresh=refresh,
+        offline=offline,
+        **post_kwargs,
     )
     osm = _within_route(osm, ll, around_m)
     result = BuildingFootprints(list(osm), osm_count=len(osm), osm_base=osm_base)
@@ -549,11 +572,16 @@ def fetch_buildings(
         return result
     dlat = around_m / 111_000.0 + 1e-4
     dlon = dlat / max(math.cos(math.radians(float(ll[:, 1].mean()))), 0.1)
-    bbox = (float(ll[:, 0].min() - dlon), float(ll[:, 1].min() - dlat),
-            float(ll[:, 0].max() + dlon), float(ll[:, 1].max() + dlat))
+    bbox = (
+        float(ll[:, 0].min() - dlon),
+        float(ll[:, 1].min() - dlat),
+        float(ll[:, 0].max() + dlon),
+        float(ll[:, 1].max() + dlat),
+    )
     try:
-        ms = fetch_ms_buildings(bbox, cache_dir=cache_dir, refresh=refresh, offline=offline,
-                                opener=ms_opener)
+        ms = fetch_ms_buildings(
+            bbox, cache_dir=cache_dir, refresh=refresh, offline=offline, opener=ms_opener
+        )
     except (OSError, urllib.error.URLError, EOFError, ValueError) as exc:
         msg = f"Microsoft building footprints unavailable, using OSM only: {exc}"
         log.warning(msg)

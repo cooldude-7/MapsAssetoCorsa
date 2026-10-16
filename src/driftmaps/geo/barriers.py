@@ -220,12 +220,20 @@ def fetch_barriers(
 
     The line is simplified by `simplify_m` to keep the query short, and the search radius
     grows by the same amount, so nothing within `around_m` of the real line is missed.
-    `offline=True` never touches the network (an OverpassError on a cache miss).
+    A downloaded region database (`driftmaps.geo.offline`) covering the route answers first
+    (not with `refresh`). `offline=True` never touches the network (an OverpassError on a
+    cache miss).
     """
     ll = np.asarray(route_lonlat, dtype=np.float64).reshape(-1, 2)
-    query = build_barrier_query(
-        _simplified_latlon(ll, simplify_m), around_m + max(simplify_m, 0.0), kinds
-    )
+    line = _simplified_latlon(ll, simplify_m)
+    radius = around_m + max(simplify_m, 0.0)
+    if not refresh:  # the downloaded region database, when it covers the route
+        from driftmaps.geo import offline as region_db
+
+        found = region_db.barrier_ways(line, radius, kinds)
+        if found is not None:
+            return parse_barriers(found, kinds)
+    query = build_barrier_query(line, radius, kinds)
     key = query_cache_key(query)
     cache = Path(cache_dir) if cache_dir is not None else default_cache_dir()
     if not refresh:
@@ -444,10 +452,18 @@ def fetch_roadside(
     **post_kwargs,
 ) -> RoadsideFeatures:
     """Deep water, rock and joining ways near the route line (N, 2) (lon, lat), from the
-    cache or Overpass (same cache layout and policy as `fetch_barriers`)."""
+    region database, the cache or Overpass (same order and policy as `fetch_barriers`)."""
     ll = np.asarray(route_lonlat, dtype=np.float64).reshape(-1, 2)
     pad = max(simplify_m, 0.0)
-    query = build_roadside_query(_simplified_latlon(ll, simplify_m), around_m + pad, access_m + pad)
+    line = _simplified_latlon(ll, simplify_m)
+    if not refresh:  # the downloaded region database, when it covers the route
+        from driftmaps.geo import offline as region_db
+
+        clip = _bbox(line, around_m + pad + 100.0)
+        found = region_db.roadside_payload(line, around_m + pad, access_m + pad, clip)
+        if found is not None:
+            return parse_roadside(found)
+    query = build_roadside_query(line, around_m + pad, access_m + pad)
     key = query_cache_key(query)
     cache = Path(cache_dir) if cache_dir is not None else default_cache_dir()
     path = _cache_path(cache, key)

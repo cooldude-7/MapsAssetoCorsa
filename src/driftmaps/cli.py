@@ -370,3 +370,104 @@ def build(
         check_zip_size(zip_path)
     if ac_tracks is not None:
         typer.echo(f"install  {install_track(result.track_dir, ac_tracks, force=force)}")
+
+
+# ---------------------------------------------------------------------------------------------
+# Offline road data
+# ---------------------------------------------------------------------------------------------
+
+offline_app = typer.Typer(
+    help="Offline road data: download a region's roads once (e.g. Ontario, ~1 GB) so road "
+    "tiles, routes and builds there never wait for Overpass.",
+    no_args_is_help=True,
+)
+app.add_typer(offline_app, name="offline")
+
+
+def _offline_manager(data_dir: Path | None):
+    from driftmaps.app.offline import OfflineManager
+    from driftmaps.app.settings import Settings
+    from driftmaps.geo import offline as region_db
+
+    folder = Settings(data_dir).data_dir / "offline" if data_dir else region_db.offline_dir()
+    return OfflineManager(folder)
+
+
+def _region(region: str) -> str:
+    from driftmaps.app.offline import REGIONS
+
+    if region not in REGIONS:
+        raise typer.BadParameter(f"unknown region {region!r}; known: {', '.join(REGIONS)}")
+    return region
+
+
+@offline_app.command("download")
+def offline_download(
+    region: str = typer.Option("ontario", help="Region to download."),
+    source_file: Path = typer.Option(
+        None, exists=True, dir_okay=False, help="Use this .osm.pbf instead of downloading."
+    ),
+    poly_file: Path = typer.Option(
+        None, exists=True, dir_okay=False, help="With --source-file: its boundary (.poly)."
+    ),
+    data_dir: Path = typer.Option(None, help="App data folder (default: the app's)."),
+) -> None:
+    """Download a region's OSM extract (resumable) and build its offline road database."""
+    import time
+
+    from driftmaps.app.offline import Cancelled, DownloadError
+
+    manager = _offline_manager(data_dir)
+    shown = {"key": None}
+    t0 = time.monotonic()
+
+    def progress(state: str, fraction: float, text: str) -> None:
+        key = (state, int(fraction * 20))
+        if key != shown["key"]:
+            shown["key"] = key
+            typer.echo(
+                f"{time.monotonic() - t0:7.0f} s  {state:<11} {fraction * 100:5.1f}%  {text}"
+            )
+
+    try:
+        stats = manager.run(
+            _region(region), progress=progress, source_file=source_file, poly_file=poly_file
+        )
+    except (DownloadError, Cancelled) as exc:
+        typer.echo(f"error: {exc or 'cancelled'}", err=True)
+        raise typer.Exit(1) from None
+    counts = ", ".join(f"{v} {k}" for k, v in stats.counts.items())
+    typer.echo(
+        f"ready    {stats.path} ({stats.size_bytes / 1e6:.0f} MB, {counts}; "
+        f"processed in {stats.seconds:.0f} s; data from {stats.osm_base or 'unknown date'})"
+    )
+
+
+@offline_app.command("status")
+def offline_status(
+    region: str = typer.Option("ontario", help="Region."),
+    data_dir: Path = typer.Option(None, help="App data folder (default: the app's)."),
+) -> None:
+    """Show whether a region's offline road data is ready."""
+    manager = _offline_manager(data_dir)
+    st = manager.status(_region(region))
+    typer.echo(f"folder   {manager.dir}")
+    if st["state"] == "ready":
+        counts = ", ".join(f"{v} {k}" for k, v in (st.get("counts") or {}).items())
+        typer.echo(
+            f"ready    {st['region_name']}: {st['size_mb']} MB, data from {st['updated']} "
+            f"({counts})"
+        )
+    else:
+        typer.echo(f"{st['state']:<8} {st['region_name']}: {st['message'] or 'not downloaded'}")
+
+
+@offline_app.command("delete")
+def offline_delete(
+    region: str = typer.Option("ontario", help="Region."),
+    data_dir: Path = typer.Option(None, help="App data folder (default: the app's)."),
+) -> None:
+    """Delete a region's offline road data (and any unfinished download)."""
+    manager = _offline_manager(data_dir)
+    manager.delete(_region(region))
+    typer.echo(f"deleted  {region} offline road data from {manager.dir}")

@@ -388,9 +388,17 @@ def fetch_corridor(
 ) -> OsmData:
     """Drivable ways near the (lat, lon) pin chain, from the cache or Overpass.
 
-    offline=True never touches the network (raises OverpassError on a cache miss);
-    refresh=True ignores an existing cache entry. Extra kwargs go to `post_query`.
+    A downloaded region database (`driftmaps.geo.offline`) that covers the corridor answers
+    first. offline=True never touches the network (raises OverpassError on a cache miss);
+    refresh=True ignores the region database and an existing cache entry. Extra kwargs go to
+    `post_query`.
     """
+    if not refresh:  # the downloaded region database, when it covers the corridor
+        from driftmaps.geo import offline as region_db
+
+        found = region_db.corridor(pins, buffer_m, include_tracks)
+        if found is not None:
+            return found
     cache = Path(cache_dir) if cache_dir is not None else default_cache_dir()
     query = build_query(pins, buffer_m, include_tracks)
     key = query_cache_key(query)

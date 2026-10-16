@@ -45,6 +45,14 @@ Binds 127.0.0.1 only. Endpoints (all JSON; errors are `{"error": "<plain English
   zip root (only its own files; symlinks are skipped) plus `HOW TO INSTALL.txt`.
 - `POST /api/open-folder {path}`: shows a folder (or a file's folder) in Explorer / the file
   manager. Only paths inside the app data folder are opened, and never run.
+- `GET /api/offline`: the downloaded offline road data ("Download Ontario roads", see
+  `driftmaps.app.offline`): `{state: none|downloading|processing|ready|error, region,
+  region_name, size_mb, download_mb, updated, progress (0..1 of the current step), message}`.
+  `POST /api/offline/download {region}` starts the download + processing in the background
+  (one at a time; 409 while one runs), `POST /api/offline/cancel` stops it (a download resumes
+  later), `POST /api/offline/delete {region}` removes the data. Only known regions
+  ("ontario") are accepted; nothing else names a file. `/api/roads` answers `offline_hint`
+  (the region) when a slow Overpass download fetched tiles inside a region not downloaded yet.
 - `POST /api/install-touge`: installs the Touge Battle CSP New Mode (`driftmaps.csp_modes`) into
   `<AC>/extension/lua/new-modes/acmg-touge/` (only that folder, and only over our own copy).
 
@@ -120,6 +128,7 @@ ROUTE_MEMORY = 64  # routes (and profiles) kept in memory; all routes also go to
 ROUTE_FILES_KEPT = 200
 _ROUTE_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+_OFFLINE_ACTIONS = ("download", "cancel", "delete")
 
 MAP_SERVERS_MESSAGE = "Couldn't reach the map servers - check your internet and try again."
 STALE_MAP_WARNING = (
@@ -137,6 +146,7 @@ ROADS_GONE = (
 )
 MAX_PATH_NODES = 50_000
 CORRIDOR_BUFFER_M = 1500.0  # route_from_pins' corridor; cached tiles covering it skip Overpass
+SLOW_ROADS_S = 5.0  # an Overpass tile download this slow suggests the offline road data
 SHARE_README = "HOW TO INSTALL.txt"
 
 _CONTENT_TYPES = {
@@ -594,6 +604,12 @@ class App:
         self._lock = threading.Lock()
         self._share_lock = threading.Lock()
         self._tiles: TileStore | None = None
+        from driftmaps.app.offline import OfflineManager
+        from driftmaps.geo import offline as region_db
+
+        offline_dir = self.settings.data_dir / "offline"
+        region_db.configure(offline_dir)  # the builder and router look there too
+        self.offline = OfflineManager(offline_dir)
 
     @property
     def tiles(self) -> TileStore:
@@ -607,6 +623,32 @@ class App:
 
     def close(self) -> None:
         self.jobs.close(timeout=0)
+        self.offline.cancel()
+
+    # -- offline road data ---------------------------------------------------------------------
+
+    def offline_status(self) -> dict:
+        return self.offline.status()
+
+    def offline_action(self, action: str, body: dict) -> dict:
+        from driftmaps.app.offline import DEFAULT_REGION, REGIONS
+
+        region = body.get("region", DEFAULT_REGION)
+        if not isinstance(region, str) or region not in REGIONS:
+            raise ApiError(400, "Unknown region: only Ontario's roads can be downloaded.")
+        if action == "cancel":
+            self.offline.cancel()
+            return self.offline.status(region)
+        try:
+            if action == "download":
+                return self.offline.start(region)
+            return self.offline.delete(region)
+        except RuntimeError:
+            raise ApiError(
+                409, "The road data is downloading right now - cancel it first."
+            ) from None
+        except OSError as exc:
+            raise ApiError(500, f"Couldn't delete the road data: {exc}") from None
 
     # -- status and settings ------------------------------------------------------------------
 
@@ -765,13 +807,21 @@ class App:
             tiles = list(dict.fromkeys(parse_tile(t) for t in raw))
         except ValueError as exc:
             raise ApiError(400, str(exc)) from None
-        found, error = self.tiles.get(tiles)
+        stats: dict = {}
+        found, error = self.tiles.get(tiles, stats=stats)
         nodes, ways = self.tiles.api_payload(found[t] for t in tiles if t in found)
+        hint = None
+        if stats.get("download_s", 0.0) >= SLOW_ROADS_S:
+            from driftmaps.app.tiles import tile_bounds
+
+            s_, w, n, e = tile_bounds(*tiles[0])
+            hint = self.offline.hint((s_ + n) / 2, (w + e) / 2)
         return {
             "tiles": {tile_key(t): "ok" if t in found else "error" for t in tiles},
             "nodes": nodes,
             "ways": ways,
             "error": MAP_SERVERS_MESSAGE if error else None,
+            "offline_hint": hint,
         }
 
     def route_path(self, body: dict) -> dict:
@@ -1277,6 +1327,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, app.open_folder(self._body()))
         elif key == ("POST", "install-touge", 1):
             self._json(200, app.install_touge())
+        elif key == ("GET", "offline", 1):
+            self._json(200, app.offline_status())
+        elif key[:2] == ("POST", "offline") and key[2] == 2 and segs[1] in _OFFLINE_ACTIONS:
+            self._json(200, app.offline_action(segs[1], self._body()))
         else:
             known = {
                 "status",
@@ -1290,6 +1344,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "tracks",
                 "open-folder",
                 "install-touge",
+                "offline",
             }
             if segs and segs[0] in known:
                 raise ApiError(405, "Not allowed.")

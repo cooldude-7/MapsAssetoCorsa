@@ -2,10 +2,12 @@
 
 Tiles are standard slippy-map tiles ("14/x/y", Web Mercator). Each tile holds every drivable
 way that crosses it, whole (the same road classes as the router's corridor query), cached
-gzip'd on disk under `<cache_dir>/tiles/14/<x>/<y>.json.gz` and in memory. A cached tile
-answers instantly; the tiles a request is missing are fetched in ONE Overpass query (the bbox
-of those tiles, or a union of their boxes when they are scattered). Requests for different
-tiles download side by side; one that needs a tile already being downloaded waits for it.
+gzip'd on disk under `<cache_dir>/tiles/14/<x>/<y>.json.gz` and in memory. When the player
+has downloaded a region's roads (`driftmaps.geo.offline`, e.g. Ontario), tiles inside it come
+from that database (a few ms, never Overpass). A cached tile answers instantly; the tiles a
+request is missing are fetched in ONE Overpass query (the bbox of those tiles, or a union of
+their boxes when they are scattered). Requests for different tiles download side by side; one
+that needs a tile already being downloaded waits for it.
 
 The same data serves `POST /api/route-path` (a route along an explicit node path, built from
 the tiles in memory) and lets `/api/route` skip Overpass when cached tiles cover its corridor.
@@ -21,12 +23,14 @@ import logging
 import math
 import re
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 
 import numpy as np
 
+from driftmaps.geo import offline as region_db
 from driftmaps.geo.attributes import is_oneway
 from driftmaps.geo.overpass import (
     OsmData,
@@ -207,8 +211,10 @@ class TileStore:
         post: Poster | None = None,
         include_tracks: str = "paved",
         memory: int = MEMORY_TILES,
+        use_region_db: bool = True,
     ) -> None:
         self.dir = Path(cache_dir) / "tiles"
+        self.use_region_db = use_region_db
         self.post = post
         self.include_tracks = include_tracks
         self.memory = memory
@@ -232,12 +238,15 @@ class TileStore:
                 self._mem.popitem(last=False)
 
     def cached(self, tile: Tile) -> _TileData | None:
-        """The tile from memory or disk, or None."""
+        """The tile from memory, the downloaded region database or disk, or None."""
         with self._lock:
             data = self._mem.get(tile)
             if data is not None:
                 self._mem.move_to_end(tile)
                 return data
+        data = self._from_region(tile)
+        if data is not None:
+            return data
         path = self._path(tile)
         try:
             data = _TileData.from_json(gzip.decompress(path.read_bytes()))
@@ -246,6 +255,21 @@ class TileStore:
         except (OSError, ValueError, KeyError, TypeError, EOFError) as exc:
             log.warning("ignoring a broken tile cache file %s: %s", path, exc)
             return None
+        self._remember(tile, data)
+        return data
+
+    def _from_region(self, tile: Tile) -> _TileData | None:
+        """The tile from the downloaded region database (`geo.offline`), if one covers it."""
+        if not self.use_region_db or tile[0] != TILE_ZOOM:
+            return None
+        try:
+            found = region_db.tile_ways(tile[1], tile[2], self.include_tracks)
+        except Exception as exc:  # the database is only a shortcut
+            log.warning("offline road data failed for tile %s: %s", tile_key(tile), exc)
+            return None
+        if found is None:
+            return None
+        data = _TileData(*found)
         self._remember(tile, data)
         return data
 
@@ -289,11 +313,14 @@ class TileStore:
         for t in tiles:
             self._save(t, _TileData(per_tile[t], osm.osm_base))
 
-    def get(self, tiles: Sequence[Tile]) -> tuple[dict[Tile, _TileData], str | None]:
+    def get(
+        self, tiles: Sequence[Tile], stats: dict | None = None
+    ) -> tuple[dict[Tile, _TileData], str | None]:
         """The tiles, from the caches or one Overpass query for the missing ones.
 
         Returns (tile -> data for every tile that is available, error text or None). Tiles
-        the download failed for are missing from the result.
+        the download failed for are missing from the result. `stats`, if given, gets
+        "download_s": how long this request's Overpass download took (0 without one).
         """
         out: dict[Tile, _TileData] = {}
         missing: list[Tile] = []
@@ -315,11 +342,14 @@ class TileStore:
         try:
             still = [t for t in mine if self.cached(t) is None]  # saved in the meantime?
             if still:
+                t0 = time.monotonic()
                 try:
                     self._download(still)
                 except (OverpassError, OSError, ValueError) as exc:
                     log.warning("road tiles download failed: %s", exc)
                     error = str(exc)
+                if stats is not None:
+                    stats["download_s"] = time.monotonic() - t0
         finally:
             with self._lock:
                 for t in mine:

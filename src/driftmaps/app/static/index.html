@@ -48,6 +48,25 @@
       </div>
       <p id="touge-msg" class="hint" role="status" hidden></p>
     </div>
+    <div id="offline-box" class="offline-box">
+      <h3 class="offline-title">Offline roads</h3>
+      <p id="offline-text" class="hint">Roads come from OpenStreetMap's servers, which can take
+        half a minute per area. Download Ontario's roads once and they load instantly.</p>
+      <div id="offline-progress" class="offline-progress" hidden>
+        <div class="offline-track"><div id="offline-bar" class="offline-bar"></div></div>
+        <span id="offline-step" class="offline-step" role="status" aria-live="polite"></span>
+      </div>
+      <div class="row offline-actions">
+        <button id="btn-offline-download" class="btn small primary" type="button">Download Ontario roads</button>
+        <button id="btn-offline-cancel" class="btn small ghost" type="button" hidden>Cancel</button>
+        <span id="offline-ready" class="offline-ready" hidden>
+          <span id="offline-ready-text"></span> ·
+          <button id="btn-offline-update" class="linkish" type="button">Update</button> ·
+          <button id="btn-offline-delete" class="linkish" type="button">Delete</button>
+        </span>
+      </div>
+      <p id="offline-error" class="error-text" role="alert" hidden></p>
+    </div>
   </section>
 
   <main class="layout">
@@ -205,6 +224,11 @@
         <div id="map-busy" class="map-busy" hidden><span class="spinner" aria-hidden="true"></span>Finding the road…</div>
         <div id="roads-chip" class="map-chip" role="status" aria-live="polite" hidden>
           <span id="roads-spinner" class="spinner" aria-hidden="true"></span><span id="roads-chip-text"></span></div>
+        <div id="offline-tip" class="map-tip" role="status" hidden>
+          <span>Tip: download Ontario roads once to make this instant.</span>
+          <button id="offline-tip-open" class="linkish" type="button">Set it up</button>
+          <button id="offline-tip-close" class="linkish" type="button" aria-label="Dismiss the tip">✕</button>
+        </div>
         <div id="map-error" class="map-error" role="alert" hidden></div>
       </div>
       <section class="profile" aria-labelledby="profile-title">

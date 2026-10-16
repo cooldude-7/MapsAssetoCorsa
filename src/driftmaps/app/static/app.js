@@ -23,6 +23,7 @@ const API = {
   tracks: "/api/tracks",
   openFolder: "/api/open-folder",
   installTouge: "/api/install-touge",
+  offline: "/api/offline",
 };
 
 const MAP_STYLES = {
@@ -44,6 +45,7 @@ const STORE_KEYS = {
   options: "acmg.options",
   mode: "acmg.mode",
   tbt: "acmg.tbt",
+  offlineTip: "acmg.offlineTip",
 };
 const EMPTY_FC = { type: "FeatureCollection", features: [] };
 const EARTH_RADIUS_M = 6371008.8;
@@ -1058,6 +1060,7 @@ const state = {
   styleKey: "light",
   mode: "tbt", // "tbt" (turn by turn) or "quick" (A to B points)
   tbt: null, // turn-by-turn state (see tbtNew)
+  offline: null, // the last GET /api/offline answer
   pins: [], // [{lngLat: [lon, lat], marker, el}] in driving order: A, B, C, ... (click order)
   reversed: false, // drive the routed road backwards (sent as `reverse` to /api/route)
   loop: false, // "Back to start": the route comes back to A (sent as `loop` to /api/route)
@@ -2075,6 +2078,7 @@ const TBT_PICK_PX = 14; // a click this close (screen pixels) to a road picks it
 const TBT_ARROW_PX = 58; // the arrows sit this far from the junction
 const TBT_STUB_M = 80; // the start of each road out of a junction, drawn under its arrow
 const TILE_RETRY_MS = 20000; // a tile that failed to load is asked for again after this
+const CHIP_DELAY_MS = 600; // "Loading roads" shows only for loads slower than this (offline data is instant)
 
 function tbtNew() {
   return {
@@ -2862,6 +2866,7 @@ async function tbtPump() {
       }
     }
     if (res && res.error) problem = String(res.error);
+    if (res && res.offline_hint) showOfflineTip();
   } catch (err) {
     for (const k of keys) {
       t.tiles.set(k, "error");
@@ -2897,6 +2902,12 @@ function tbtRenderChip() {
   if (state.mode !== "tbt" || !state.map) {
     chip.hidden = true;
     stop();
+    return;
+  }
+  if (t.loading && Date.now() - t.loading.since < CHIP_DELAY_MS) {
+    // Most loads (cached tiles, offline road data) finish before the chip would flash up.
+    chip.hidden = true;
+    if (!t.chipTimer) t.chipTimer = setInterval(tbtRenderChip, 200);
     return;
   }
   if (t.loading) {
@@ -3556,6 +3567,7 @@ function openAcPanel(byUser) {
   $("touge-box").hidden = !found;
   $("ac-panel").hidden = false;
   $("ac-pill").setAttribute("aria-expanded", "true");
+  loadOffline();
   if (byUser) input.focus();
 }
 
@@ -3616,6 +3628,103 @@ async function installTouge() {
   }
   msg.hidden = false;
   btn.disabled = false;
+}
+
+/* ------------------------------------------------------------------------------------------
+ * Offline roads: download a region's roads once (GET/POST /api/offline)
+ * ---------------------------------------------------------------------------------------- */
+
+const OFFLINE_POLL_MS = 1000;
+let offlineTimer = 0;
+
+async function loadOffline() {
+  try {
+    renderOffline(await api(API.offline));
+  } catch {
+    /* an older app or no connection: the section keeps its default text */
+  }
+}
+
+/** "2026-10-15" -> "Oct 15, 2026" (as given if it doesn't parse). */
+function offlineDate(text) {
+  if (!text) return "";
+  const d = new Date(`${text}T12:00:00Z`);
+  return Number.isNaN(d.getTime()) ? text : d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+}
+
+/** The step line under the bar, e.g. "Downloading 45%…" or "Processing roads 60%…". */
+function offlineStepText(st) {
+  const pct = Math.floor(Math.max(0, Math.min(1, Number(st.progress) || 0)) * 100);
+  if (st.state === "downloading") return `Downloading ${pct}%… ${st.message && st.message.startsWith("Downloading") ? st.message.replace(/^Downloading\s*/, "(") + ")" : ""}`.trim();
+  if (st.state === "processing") return `${st.message && !/^Processing roads/.test(st.message) ? st.message : "Processing roads"} ${pct}%…`;
+  return st.message || "";
+}
+
+function renderOffline(st) {
+  if (!st || typeof st !== "object") return;
+  state.offline = st;
+  const name = st.region_name || "Ontario";
+  const mb = Math.round(Number(st.download_mb) || 0);
+  const running = st.state === "downloading" || st.state === "processing";
+  const ready = st.state === "ready" || (running && st.ready);
+  const dl = $("btn-offline-download");
+  dl.textContent = st.state === "error" ? "Try again" : `Download ${name} roads${mb ? ` (~${mb.toLocaleString()} MB, one time)` : ""}`;
+  dl.hidden = running || st.state === "ready";
+  $("btn-offline-cancel").hidden = !running;
+  $("offline-progress").hidden = !running;
+  $("offline-bar").style.width = `${Math.round((Number(st.progress) || 0) * 100)}%`;
+  $("offline-step").textContent = running ? (st.message === "Cancelling" ? "Cancelling…" : offlineStepText(st)) : "";
+  $("offline-ready").hidden = st.state !== "ready";
+  const updated = offlineDate(st.updated);
+  $("offline-ready-text").textContent = `${name} roads ready${updated ? ` - updated ${updated}` : ""}`;
+  $("offline-text").textContent = ready
+    ? `Roads in ${name} load instantly from this PC${st.size_mb ? ` (${Math.round(st.size_mb)} MB)` : ""}. Elsewhere they still come from OpenStreetMap's servers.`
+    : running
+      ? "You can keep using the app meanwhile. Closing the app stops the download; it continues where it stopped next time."
+      : `Roads come from OpenStreetMap's servers, which can take half a minute per area. Download ${name}'s roads once and they load instantly.${st.message && st.state === "none" ? ` ${st.message}` : ""}`;
+  const errEl = $("offline-error");
+  errEl.textContent = st.state === "error" ? st.message || "The download failed." : "";
+  errEl.hidden = st.state !== "error";
+  clearTimeout(offlineTimer);
+  if (running) offlineTimer = setTimeout(loadOffline, OFFLINE_POLL_MS);
+  if (st.state === "ready") $("offline-tip").hidden = true;
+}
+
+async function offlineAction(action) {
+  const region = (state.offline && state.offline.region) || "ontario";
+  if (action === "delete") {
+    const ok = await confirmDialog(
+      "Delete the offline roads?",
+      "Roads will come from OpenStreetMap's servers again (slower). You can download them again any time.",
+      "Delete",
+    );
+    if (!ok) return;
+  }
+  try {
+    renderOffline(await api(`${API.offline}/${action}`, { method: "POST", body: { region } }));
+    if (action === "delete") toast("Offline roads deleted.", "ok");
+  } catch (err) {
+    toast(err.message, "error");
+    loadOffline();
+  }
+}
+
+/** The one-time tip after a slow road load in a region that can be downloaded. */
+function showOfflineTip() {
+  if (store.get(STORE_KEYS.offlineTip)) return;
+  const st = state.offline;
+  if (st && (st.state === "ready" || st.state === "downloading" || st.state === "processing")) return;
+  store.set(STORE_KEYS.offlineTip, true);
+  $("offline-tip").hidden = false;
+}
+
+function openOfflineSetup() {
+  $("offline-tip").hidden = true;
+  openAcPanel(false);
+  loadOffline();
+  const box = $("offline-box");
+  if (box.scrollIntoView) box.scrollIntoView({ block: "nearest" });
+  $("btn-offline-download").focus();
 }
 
 /* ------------------------------------------------------------------------------------------
@@ -4062,6 +4171,12 @@ function bindUi() {
   $("ac-pill").addEventListener("click", () => ($("ac-panel").hidden ? openAcPanel(true) : closeAcPanel()));
   $("ac-cancel").addEventListener("click", closeAcPanel);
   $("btn-touge").addEventListener("click", installTouge);
+  $("btn-offline-download").addEventListener("click", () => offlineAction("download"));
+  $("btn-offline-update").addEventListener("click", () => offlineAction("download"));
+  $("btn-offline-cancel").addEventListener("click", () => offlineAction("cancel"));
+  $("btn-offline-delete").addEventListener("click", () => offlineAction("delete"));
+  $("offline-tip-open").addEventListener("click", openOfflineSetup);
+  $("offline-tip-close").addEventListener("click", () => ($("offline-tip").hidden = true));
   $("ac-form").addEventListener("submit", saveAcRoot);
   $("track-name").addEventListener("input", (e) => {
     state.nameTouched = e.target.value.trim() !== "";
@@ -4134,6 +4249,7 @@ function boot() {
   resetProfile();
   enterMode();
   loadStatus();
+  loadOffline();
   loadTracks();
   resumeJob();
 }

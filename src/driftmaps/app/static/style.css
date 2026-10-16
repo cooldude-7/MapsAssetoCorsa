@@ -162,6 +162,38 @@ code { font-family: var(--mono); font-size: 12px; word-break: break-all; }
 .touge-box .row .hint { flex: 1; margin: 0; }
 .touge-box .btn { flex: none; }
 .touge-box .ok-text { color: var(--ok); font-weight: 550; }
+.offline-box {
+  max-width: 920px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--warn) 25%, var(--border));
+}
+.offline-title { margin: 0 0 2px; font-size: 14px; }
+.offline-box .hint { margin: 0 0 8px; }
+.offline-actions { flex-wrap: wrap; }
+.offline-ready { color: var(--muted); font-size: 13px; }
+.offline-ready > span:first-child { color: var(--ok); font-weight: 550; }
+.offline-progress { display: flex; align-items: center; gap: 10px; margin: 0 0 8px; }
+.offline-track {
+  flex: 0 1 320px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.offline-bar { width: 0; height: 100%; background: var(--accent); transition: width 0.4s ease; }
+.offline-step { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.linkish {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+.linkish:hover { text-decoration: underline; }
+.linkish:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* ---------- layout ---------- */
 
@@ -748,6 +780,25 @@ kbd {
   pointer-events: none;
 }
 .map-chip[data-kind="zoom"] { background: var(--pin-via); border-color: transparent; color: #2a1a00; }
+.map-tip {
+  position: absolute;
+  bottom: 84px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100% - 32px);
+  padding: 7px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  font-size: 13px;
+}
+.map-tip .linkish { font-weight: 600; white-space: nowrap; }
 
 /* turn by turn: the arrows round a junction (MapLibre positions the button: never transform it) */
 .tbt-arrow {
