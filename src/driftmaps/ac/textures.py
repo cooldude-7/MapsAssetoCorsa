@@ -128,13 +128,19 @@ def _rng(seed: int) -> np.random.Generator:
 
 
 def _spectral_noise(
-    shape: tuple[int, int], rng: np.random.Generator, beta: float, cutoff: float = 0.5
+    shape: tuple[int, int],
+    rng: np.random.Generator,
+    beta: float,
+    cutoff: float = 0.5,
+    min_cycles: float = 0.0,
 ) -> np.ndarray:
     """Tileable noise with a 1/f^beta power spectrum, zero mean and unit standard deviation.
 
     Filtering white noise in the frequency domain keeps it periodic, so the texture tiles with
     no seam. `beta` 0 = white grain, 2 = cloudy, 3+ = large soft patches. `cutoff` (cycles per
-    pixel) softly removes detail finer than that.
+    pixel) softly removes detail finer than that. `min_cycles` drops the components with fewer
+    cycles per tile than that: with a steep `beta` the one-cycle waves dominate, and whichever
+    way they happen to run shows as stripes once the tile repeats across a whole terrain.
     """
     h, w = shape
     white = rng.standard_normal((h, w))
@@ -144,6 +150,8 @@ def _spectral_noise(
     f[0, 0] = 1.0
     amp = f ** (-beta / 2.0) * np.exp(-((f / cutoff) ** 2))
     amp[0, 0] = 0.0
+    if min_cycles > 0:
+        amp[np.sqrt((fx * w) ** 2 + (fy * h) ** 2) < min_cycles] = 0.0
     out = np.fft.ifft2(np.fft.fft2(white) * amp).real
     out -= out.mean()
     std = out.std()
@@ -215,8 +223,9 @@ def grass_texture(size: int = 512, seed: int = 2) -> Image.Image:
     _check_size(size)
     rng = _rng(seed)
     shape = (size, size)
-    patches = _spectral_noise(shape, rng, beta=3.2)
-    mid = _spectral_noise(shape, rng, beta=2.0)
+    # No one-cycle-per-tile waves: tiled every 8 m they read as stripes from the air.
+    patches = _spectral_noise(shape, rng, beta=3.2, min_cycles=1.5)
+    mid = _spectral_noise(shape, rng, beta=2.0, min_cycles=1.5)
     blades = _spectral_noise(shape, rng, beta=0.4)
     base = np.array([58.0, 92.0, 36.0], dtype=np.float32)
     rgb = (

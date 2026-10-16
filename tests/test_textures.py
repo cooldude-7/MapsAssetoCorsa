@@ -336,3 +336,11 @@ def test_kn5_texture():
         tx.kn5_texture("asphalt.jpg", img)
     with pytest.raises(ValueError):
         tx.kn5_texture("asphält.png", img)
+
+
+def test_grass_has_no_tile_scale_stripes():
+    # Rows and columns vary about equally: no one-cycle wave running one way (seen from the
+    # air as 8 m stripes when the tile repeats over the terrain).
+    g = np.asarray(tx.grass_texture(256), float).mean(axis=2)
+    rows, cols = g.mean(axis=1).std(), g.mean(axis=0).std()
+    assert max(rows, cols) < 1.6 * min(rows, cols) + 0.5
