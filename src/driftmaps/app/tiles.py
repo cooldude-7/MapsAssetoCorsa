@@ -468,6 +468,56 @@ class TileStore:
                     hits.setdefault(id(data), data)
         return self.osm_data(hits.values(), want), want - found.keys()
 
+    def along(
+        self,
+        route_lonlat: np.ndarray,
+        around_m: float,
+        *,
+        offline: bool = False,
+        max_tiles: int = 256,
+    ) -> tuple[OsmData, str | None]:
+        """The roads in every tile within `around_m` of the route line (N, 2) (lon, lat):
+        cached tiles at once, the missing ones downloaded (`get`, MAX_TILES * 2 per query;
+        `offline=True` never downloads). Returns (the ways, error text or None); the ways
+        cover only the tiles that could be had."""
+        ll = np.asarray(route_lonlat, np.float64).reshape(-1, 2)
+        if len(ll) == 0:
+            return OsmData((), None, "tiles-z14"), "no route"
+        lat0 = float(np.radians(ll[:, 1].mean()))
+        pad_lat = around_m / 111_320.0
+        pad_lon = around_m / (111_320.0 * max(math.cos(lat0), 0.2))
+        wanted: dict[Tile, None] = {}
+        for k in range(0, len(ll), 50):  # a box round every stretch of the line
+            part = ll[k : k + 51]
+            for t in tiles_for_box(
+                float(part[:, 1].min() - pad_lat),
+                float(part[:, 0].min() - pad_lon),
+                float(part[:, 1].max() + pad_lat),
+                float(part[:, 0].max() + pad_lon),
+            ):
+                wanted[t] = None
+        tiles = list(wanted)
+        if len(tiles) > max_tiles:
+            return OsmData((), None, "tiles-z14"), f"the route needs {len(tiles)} map tiles"
+        datas: dict[Tile, _TileData] = {}
+        missing = []
+        for t in tiles:
+            data = self.cached(t)
+            if data is None:
+                missing.append(t)
+            else:
+                datas[t] = data
+        error = None
+        if missing and offline:
+            error = f"{len(missing)} map tiles are not cached (offline)"
+        elif missing:
+            step = 2 * MAX_TILES
+            for k in range(0, len(missing), step):
+                got, err = self.get(missing[k : k + step])
+                datas.update(got)
+                error = error or err
+        return self.osm_data(datas.values()), error
+
     def covering(
         self, south: float, west: float, north: float, east: float, max_tiles: int = 48
     ) -> OsmData | None:

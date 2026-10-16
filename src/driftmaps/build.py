@@ -465,6 +465,9 @@ class BuildResult:
     geometry: TrackGeometry | None = field(default=None, repr=False)
     debug_images: list[Path] = field(default_factory=list)
     scenery: _Scenery | None = field(default=None, repr=False)  # trees, buildings, rails, bridges
+    # The warnings the player must see (the app lists them with the result), e.g. a road
+    # network that could not be had; all of them are in `warnings` too.
+    alerts: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         s = self.stats
@@ -1421,9 +1424,46 @@ def _route_lonlat(geo: TrackGeometry, step: int = 5) -> np.ndarray:
 # --------------------------------------------------------------------------------------------
 
 
+NETWORK_MISSING_WARNING = (
+    "No side roads, junctions, roundabouts or cul-de-sacs: the road data around the route "
+    "could not be downloaded ({reason}). Check the internet connection (or download the "
+    "region's roads in the app) and build again."
+)
+_ALERT_PREFIXES = (NETWORK_MISSING_WARNING[:40],)
+TILE_NETWORK_PAD_M = 40.0  # tiles are taken this much beyond the network radius
+
+
+def _network_from_tiles(route: Route, options: BuildOptions) -> tuple[NetworkData | None, str]:
+    """The roads around the route from the app's z14 road tiles (`app.tiles`): the cached
+    ones, the rest downloaded by the tile store (its own small Overpass queries, mirrors
+    raced). Tagged nodes are unknown then: rules decide turning circles and stops.
+    Returns (the network or None, what went wrong)."""
+    from driftmaps.app.tiles import TileStore
+
+    line = route.polyline(step_m=5.0).lonlat
+    radius = options.network_options.radius_m + TILE_NETWORK_PAD_M
+    store = TileStore(Path(options.cache_dir or default_cache_dir()))
+    try:
+        osm, error = store.along(line, radius, offline=options.offline)
+    except (*_DATA_ERRORS, ValueError) as e:
+        return None, _short(e)
+    if not osm.ways:
+        return None, error or "no roads in the map tiles"
+    proj = LocalProjection(float(line[0, 1]), float(line[0, 0]))
+    path = shapely.LineString(proj.to_xy(line)) if len(line) >= 2 else shapely.Point(0, 0)
+    lines = [shapely.LineString(proj.to_xy(w.lonlat)) for w in osm.ways]
+    near = shapely.dwithin(path, lines, radius)
+    ways = tuple(w for w, k in zip(osm.ways, near.tolist(), strict=True) if k)
+    if error:  # some tiles missing: the network is partial, but better than none
+        warnings.warn(f"part of the road network is missing ({error})", stacklevel=3)
+    return NetworkData(ways, (), osm.osm_base, nodes_known=False), ""
+
+
 def _fetch_network(route: Route, options: BuildOptions) -> NetworkData | None:
     """The OSM highways and tagged highway nodes around the route: `options.osm_network`, else
-    the region database / cache / Overpass, else the route's own cached routing corridor."""
+    the region database / cache / Overpass, else the app's z14 road tiles (cached or fetched
+    tile by tile), else the route's own cached routing corridor. Never silently None: a
+    missing network is a warning (`NETWORK_MISSING_WARNING`) the app shows."""
     if options.osm_network is not None:
         return options.osm_network
     try:
@@ -1435,11 +1475,19 @@ def _fetch_network(route: Route, options: BuildOptions) -> NetworkData | None:
         )
     except _DATA_ERRORS as e:
         reason = _short(e)
-    if route.cache_key:
+    net, why = _network_from_tiles(route, options)
+    if net is not None:
+        warnings.warn(
+            f"road network from the map tiles (Overpass: {reason}); stop signs and "
+            "cul-de-sacs follow the rules",
+            stacklevel=2,
+        )
+        return net
+    if route.cache_key and not route.cache_key.startswith("tiles-"):
         cached = load_cached(Path(options.cache_dir or default_cache_dir()), route.cache_key)
         if cached is not None:
             return NetworkData(cached.ways, (), cached.osm_base, nodes_known=False)
-    warnings.warn(f"road network unavailable ({reason}); no side roads", stacklevel=2)
+    warnings.warn(NETWORK_MISSING_WARNING.format(reason=f"{reason}; {why}"), stacklevel=2)
     return None
 
 
@@ -2523,7 +2571,8 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
     if route.repeated_nodes():
         notes.append("the route passes the same junction twice (it crosses itself)")
     progress("Track built", 1.0)
-    return BuildResult(track_dir, track_id, stats, notes, geo, images, sc)
+    alerts = [n for n in notes if n.startswith(_ALERT_PREFIXES)]
+    return BuildResult(track_dir, track_id, stats, notes, geo, images, sc, alerts)
 
 
 # --------------------------------------------------------------------------------------------

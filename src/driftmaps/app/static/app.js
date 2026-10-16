@@ -3987,6 +3987,8 @@ function renderJobResult(job) {
       ),
     );
     if (r.installed_to) el.append(h("p", { class: "muted" }, "Folder: ", h("code", {}, r.installed_to)));
+    const warnings = Array.isArray(r.warnings) ? r.warnings.filter(Boolean) : [];
+    if (warnings.length) el.append(h("ul", { class: "warnings" }, ...warnings.map((w) => h("li", {}, w))));
   } else if (job.state === "error") {
     el.classList.add("bad");
     el.append(h("p", {}, job.error || "The build failed. Open the log below for details."));
