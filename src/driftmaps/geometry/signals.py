@@ -41,6 +41,7 @@ manual gives a range):
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -147,7 +148,10 @@ class SignalApproach:
     """One leg of a junction: `direction` points away from the junction along it; traffic
     arriving on it travels -direction. `half` is its half width (two-way: centreline to edge;
     one-way: half the carriageway); `oneway` +1 traffic leaves the junction only, -1 arrives
-    only, 0 both; `on_route` True for the route's own two legs."""
+    only, 0 both; `on_route` True for the route's own two legs. A divided road's two
+    carriageways merged into one leg (`_merge`) carry `extent`, the paved span across the leg
+    (offsets right of the arriving traffic, from the junction centre's axis), and `span`, the
+    arriving lanes' part of it."""
 
     direction: np.ndarray
     half: float
@@ -155,6 +159,8 @@ class SignalApproach:
     toward: bool | None = None  # arriving traffic moves in the OSM way's direction
     oneway: int = 0
     on_route: bool = False
+    extent: tuple[float, float] | None = None
+    span: tuple[float, float] | None = None
 
     @property
     def name(self) -> str:
@@ -163,6 +169,17 @@ class SignalApproach:
     @property
     def arrives(self) -> bool:
         return self.oneway <= 0
+
+    @property
+    def across(self) -> tuple[float, float]:
+        """(lo, hi): the paved span right of the arriving traffic's axis."""
+        return self.extent if self.extent is not None else (-self.half, self.half)
+
+    @property
+    def lanes_span(self) -> tuple[float, float]:
+        if self.span is not None:
+            return self.span
+        return (0.0, self.half) if self.oneway == 0 else (-self.half, self.half)
 
 
 @dataclass
@@ -191,6 +208,7 @@ class SignalPlan:
     poles: list[SignalPole] = field(default_factory=list)
     junctions: list[tuple[int, np.ndarray, float]] = field(default_factory=list)  # node, xz, r
     approaches: int = 0
+    nodes: set[int] = field(default_factory=set)  # every route node of a signalised junction
 
     def stats(self) -> dict[str, int]:
         arms = [p for p in self.poles if not p.post]
@@ -237,12 +255,8 @@ def _lane_offsets(leg: SignalApproach) -> list[tuple[float, str]]:
     overhead head: left-turn lanes nearest the centre line, then the through lanes."""
     through, left = approach_lanes(leg.tags, leg.toward)
     n = through + left
-    if leg.oneway == 0:
-        w = float(np.clip(leg.half / n, *LANE_W))
-        start = 0.0
-    else:
-        w = float(np.clip(2.0 * leg.half / n, *LANE_W))
-        start = -leg.half
+    start, end = leg.lanes_span
+    w = float(np.clip((end - start) / n, *LANE_W))
     kinds = ["left"] * left + ["through"] * through
     return [(start + (i + 0.5) * w, k) for i, k in enumerate(kinds)]
 
@@ -264,10 +278,12 @@ def plan_junction(
         across = [m for m in legs if m is not leg and abs(float(_unit(m.direction) @ t)) < 0.6]
         if not across:
             continue
-        a = max(m.half for m in across) + POLE_SETBACK_M
+        # The far curb of the crossing roads (along t), and the far leg's edge on our right
+        # (the far leg's arriving traffic runs the other way: its "left" is our right).
+        a = max(_reach(m, t) for m in across) + POLE_SETBACK_M
         ahead = [m for m in legs if float(_unit(m.direction) @ t) > 0.7]
-        far = max(ahead, key=lambda m: float(_unit(m.direction) @ t)) if ahead else leg
-        b = far.half + POLE_SETBACK_M
+        far = max(ahead, key=lambda m: float(_unit(m.direction) @ t)) if ahead else None
+        b = (-far.across[0] if far is not None else leg.across[1]) + POLE_SETBACK_M
         heads = _lane_offsets(leg)
         name = max(across, key=lambda m: abs(float(_right(t) @ _unit(m.direction)))).name
         poles.append(
@@ -287,8 +303,9 @@ def plan_junction(
         d = _unit(leg.direction)
         n = _right(d)
         others = [m for m in legs if m is not leg and abs(float(_unit(m.direction) @ d)) < 0.6]
-        cdist = (max(m.half for m in others) if others else 6.0) + CROSSWALK_SETBACK_M
-        ends = [c + d * cdist + n * o for o in (-leg.half - 1.0, leg.half + 1.0)]
+        cdist = (max(_reach(m, d) for m in others) if others else 6.0) + CROSSWALK_SETBACK_M
+        lo, hi = leg.across  # right of the arriving traffic = left of d
+        ends = [c + d * cdist - n * o for o in (lo - 1.0, hi + 1.0)]
         for e, other in ((ends[0], ends[1]), (ends[1], ends[0])):
             facing = _unit(other - e)
             arms = [p for p in poles if not p.post]
@@ -304,22 +321,115 @@ def plan_junction(
     return poles, reach
 
 
+def _reach(m: SignalApproach, t: np.ndarray) -> float:
+    """How far leg m's paved span reaches from the junction centre along direction t (m runs
+    across t)."""
+    r_m = _right(-_unit(m.direction))  # right of m's arriving traffic
+    lo, hi = m.across
+    return hi if float(r_m @ t) > 0 else -lo
+
+
+CLUSTER_M = 30.0  # route junctions this close are one intersection (a divided road's two)
+_PARALLEL = math.cos(math.radians(25.0))
+
+
+def _merge(members: Sequence[tuple[int, np.ndarray, Sequence[SignalApproach]]]):
+    """One intersection from route junctions a few metres apart (the two carriageways of a
+    divided road): legs that lead to another member are dropped, parallel legs (the two
+    carriageways leaving the same way) become one with the carriageways' joint `extent` and
+    the arriving one's lanes as `span`. Returns (node, centre, legs)."""
+    if len(members) == 1:
+        return members[0]
+    centres = np.array([np.asarray(c, np.float64) for _, c, _ in members])
+    centre = centres.mean(axis=0)
+    legs: list[tuple[SignalApproach, np.ndarray]] = []
+    for i, (_, c, ls) in enumerate(members):
+        for leg in ls:
+            d = _unit(leg.direction)
+            inner = False
+            for j, oc in enumerate(centres):
+                v = oc - np.asarray(c, np.float64)
+                dist = float(np.hypot(*v))
+                if j != i and 0.5 < dist <= CLUSTER_M and float(d @ v) > 0.85 * dist:
+                    inner = True
+            if not inner:
+                legs.append((leg, np.asarray(c, np.float64)))
+    groups: list[list[tuple[SignalApproach, np.ndarray]]] = []
+    for leg, c in legs:
+        for g in groups:
+            if float(_unit(g[0][0].direction) @ _unit(leg.direction)) > _PARALLEL:
+                g.append((leg, c))
+                break
+        else:
+            groups.append([(leg, c)])
+    out: list[SignalApproach] = []
+    for g in groups:
+        d = _unit(np.sum([_unit(leg.direction) for leg, _ in g], axis=0))
+        r = _right(-d)  # right of the arriving traffic
+        spans = []
+        for leg, c in g:
+            o = float((c - centre) @ r)
+            lo, hi = leg.across
+            spans.append((o + lo, o + hi, leg))
+        lo = min(x[0] for x in spans)
+        hi = max(x[1] for x in spans)
+        if len(g) == 1:
+            leg, c = g[0]
+            o = float((c - centre) @ r)
+            s0, s1 = leg.lanes_span
+            out.append(SignalApproach(d, max(-lo, hi), leg.tags, leg.toward, leg.oneway,
+                                      leg.on_route, (lo, hi), (o + s0, o + s1)))  # fmt: skip
+            continue
+        # The arriving carriageway keeps right: the one farthest right.
+        a_lo, a_hi, arriving = max(spans, key=lambda x: x[0] + x[1])
+        out.append(SignalApproach(d, max(-lo, hi), arriving.tags, None, 0,
+                                  any(leg.on_route for leg, _ in g), (lo, hi),
+                                  (a_lo, a_hi)))  # fmt: skip
+    node = min(int(n) for n, _, _ in members)
+    return node, centre, out
+
+
+def _clusters(centres: np.ndarray) -> list[list[int]]:
+    """Indices of junctions grouped by chains of centres within CLUSTER_M."""
+    n = len(centres)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if float(np.hypot(*(centres[i] - centres[j]))) <= CLUSTER_M:
+                parent[find(i)] = find(j)
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    return list(groups.values())
+
+
 def plan_signals(
     junctions: Sequence[tuple[int, np.ndarray, Sequence[SignalApproach]]],
     signal_xz: np.ndarray,
     light_xz: np.ndarray,
 ) -> SignalPlan:
     """Poles for every signalised junction among `junctions` ((node, centre XZ, legs)):
-    `signal_xz` are the OSM traffic signal nodes, `light_xz` Mapillary traffic lights (XZ)."""
+    `signal_xz` are the OSM traffic signal nodes, `light_xz` Mapillary traffic lights (XZ).
+    Route junctions within CLUSTER_M of each other (a divided road's two carriageways) are
+    one intersection, signalised when any of them is."""
     plan = SignalPlan()
-    centres = np.array([j[1] for j in junctions]).reshape(-1, 2)
-    for i, (node, centre, legs) in enumerate(junctions):
-        others = np.delete(centres, i, axis=0)
-        if not signalised(centre, signal_xz, light_xz, others):
+    centres = np.array([np.asarray(j[1], np.float64) for j in junctions]).reshape(-1, 2)
+    for group in _clusters(centres):
+        others = np.delete(centres, group, axis=0)
+        if not any(signalised(centres[i], signal_xz, light_xz, others) for i in group):
             continue
+        node, centre, legs = _merge([junctions[i] for i in group])
         poles, reach = plan_junction(node, centre, legs)
         if not poles:
             continue
+        plan.nodes.update(int(junctions[i][0]) for i in group)
         plan.poles += poles
         plan.junctions.append((int(node), np.asarray(centre, np.float64), reach))
         plan.approaches += sum(1 for p in poles if not p.post)

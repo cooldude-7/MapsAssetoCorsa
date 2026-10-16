@@ -199,3 +199,33 @@ def test_t_junction_gets_poles_for_all_three_approaches():
     assert all(p.ped for p in poles)
     with pytest.raises(StopIteration):
         next(p for p in arms if p.axis[1] > 0.5)  # nobody arrives from the missing leg
+
+
+def test_a_divided_road_crossing_is_one_intersection():
+    # The route (+X) crosses a divided road: its southbound carriageway at x = 492, the
+    # northbound one at x = 508, one OSM signal node between them.
+    sb = {"highway": "primary", "oneway": "yes", "lanes": "2", "name": "Dundas Street"}
+    route = FakeRoute(
+        {1: (0, 0), 2: (492, 0), 3: (508, 0), 4: (1000, 0), 5: (492, -100), 6: (492, 100),
+         7: (508, -100), 8: (508, 100)},
+        [Edge(11, 1, 2), Edge(11, 2, 3), Edge(11, 3, 4)],
+        {11: SIDE | {"name": "Caroline Street"}, 21: sb, 22: sb},
+        [(2, 21, 5), (2, 21, 6), (3, 22, 7), (3, 22, 8)],
+    )  # fmt: skip
+    m = _model()
+    feats = StreetFeatures((SIGNAL,), ())
+    plan = fu.plan_furniture(m, PROJ, route, ground, s_range=(0.0, 1000.0),
+                             way_id=np.full(len(m), 11), osm=feats)  # fmt: skip
+    sig = plan.signals
+    assert len(sig.junctions) == 1 and sig.nodes == {2, 3}
+    arms = [p for p in sig.poles if not p.post]
+    assert len(arms) == 4  # EB, WB on the route; NB, SB on the divided road
+    for p in arms:
+        if abs(p.axis[1]) < 0.5:
+            continue
+        r = np.array([-p.axis[1], p.axis[0]])
+        xs = [float((p.origin + r * off)[0]) for off, _ in p.heads]
+        # Southbound (+Z) traffic keeps right, on the west carriageway; northbound on the east.
+        want = 492.0 if p.axis[1] > 0 else 508.0
+        assert len(xs) == 2 and all(abs(x - want) <= 3.6 for x in xs)
+        assert p.name == "Caroline Street"

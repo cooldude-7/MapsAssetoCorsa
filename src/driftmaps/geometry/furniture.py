@@ -1166,7 +1166,7 @@ def _signals(pl: _Planner, juncs: list[_Junction], osm, mapillary: Sequence) -> 
         return
     st, _, _ = pl.frame.project(np.array([c for _, c, _ in plan.junctions]))
     pl.plan.signal_stations = sorted(round(float(v) - pl.frame.s0, 1) for v in st)
-    nodes_sig = {f"junction:{node}" for node, _, _ in plan.junctions}
+    nodes_sig = {f"junction:{node}" for node in plan.nodes}
     keep = []
     for it in pl.items:
         xz = np.array([it.position[0], it.position[2]])
