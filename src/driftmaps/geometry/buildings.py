@@ -15,9 +15,16 @@ builders' buildings.md (2026-10-16: sources, conflation, heights, typical Ontari
 2. Ground: the built terrain (`ground(xz)`, not the raw DTM: cut/fill changed it) under the
    ring and a 3 m interior lattice. The walls start `sink_m` (0.5 m) below its LOWEST point;
    heights are measured from its median.
-3. Category: house, garage, shed, barn or commercial, from the type (OSM `building`, the
-   municipal type) or, untyped, the size (buildings.md §5: sheds < 25 m2, garages < 70 m2,
-   barns >= 450 m2 unless flat).
+3. Context and category. A footprint is in a **town** (`_town_context`) when at least 12
+   other footprints stand within 100 m (a subdivision has 40-80), in the **country** with at
+   most 6 unless the NRCan land cover around it is urban, and between the two in the country
+   only on cropland or pasture. Category: house, townhouse, garage, shed, barn or
+   commercial, from the type (OSM `building`, the municipal type) or, untyped, the size
+   (buildings.md §5: sheds < 25 m2, garages < 70 m2, barns >= 450 m2 unless flat). Barns
+   only stand in the country (the user's Oakville check, 2026-10-16: town houses and rows
+   drawn as barns): in a town a long, house-deep footprint (>= 18 m by 7-16 m, >= 180 m2)
+   is a townhouse row, a big one a house, or commercial when its roof is flat; only an
+   OSM-tagged barn stays a barn.
 4. Heights, the first that applies (buildings.md §4):
    - **measured**: municipal eave + peak (Burlington EAVEHGT / PEAKHGT, Milton): the roof
      exactly; a municipal or NRCan lidar peak (`heightmax`, median +0.24 m against Burlington)
@@ -40,13 +47,17 @@ builders' buildings.md (2026-10-16: sources, conflation, heights, typical Ontari
    lidar spreads < `flat_lidar_spread_m`; otherwise pitched: hipped for some near-square
    houses (deterministic), gabled for the rest. The ridge runs along the long axis of the
    footprint's minimum rotated rectangle.
-6. Look: wall and roof styles from `ac.building_textures` by category (brick, vinyl siding and
-   stone houses with asphalt shingles; red / grey board or white steel barns with metal
-   roofs), chosen by a hash of (seed, building id), so a rebuild gives the same street; a
-   garage or shed next to a house usually matches it. The FRONT wall faces the nearest road
-   (`roads`, the route by default): houses get a front door there (and, if wide, an attached
-   garage's door at one end), garages their garage doors, barns a sliding or steel door,
-   sheds a door. House walls show whole windows, centred per wall; garage walls are blank.
+6. Look: wall and roof styles from `ac.building_textures` by category and context, chosen
+   by a hash of (seed, building id), so a rebuild gives the same street. Country houses:
+   brick, vinyl siding and stone with asphalt shingles or some metal roofs; barns: red /
+   grey boards or white steel with metal roofs. Town houses: mostly brick (grey-white, pale
+   red, buff, brown, red), some stone and stucco, a little vinyl, shingle roofs; townhouse
+   rows brick or stone. A garage within 35 m of a house wears its colours, a shed usually.
+   The FRONT wall faces the nearest road (`roads`, the route by default): houses get a front
+   door there (and, if wide, an attached garage's door at one end), each townhouse unit a
+   front door and usually a single garage door, garages their garage doors, barns a sliding
+   or steel door, sheds a door. House walls show whole windows, centred per wall; garage
+   walls are blank.
 7. Budget: buildings in order of how far they are from the road, relative to their size (a
    big barn 200 m away comes before a shed at 100 m), until `budget_bytes` of mesh
    (44 B a vertex + 6 B a triangle in the KN5).
@@ -141,11 +152,12 @@ log = logging.getLogger(__name__)
 
 GroundFn = Callable[[np.ndarray], np.ndarray]  # XZ (N, 2) -> terrain Y (N,), NaN where none
 CanopyFn = Callable[[np.ndarray], np.ndarray]  # XZ (N, 2) -> DSM - DTM metres, NaN where none
+LandcoverFn = Callable[[np.ndarray], np.ndarray]  # XZ (N, 2) -> NRCan 2020 class, 0 = unknown
 
 ROOF_FLAT = "flat"
 ROOF_GABLED = "gabled"
 ROOF_HIPPED = "hipped"
-CATEGORIES = ("house", "garage", "shed", "barn", "commercial")
+CATEGORIES = ("house", "townhouse", "garage", "shed", "barn", "commercial")
 
 # OSM roof:shape values -> our three shapes.
 _ROOF_TAGS = {
@@ -251,7 +263,7 @@ _HOUSE_WALLS = (
     ("siding_grey", 10),
     ("siding_tan", 6),
     ("siding_blue", 5),
-    ("siding_sage", 3),
+    ("brick_grey", 3),
     ("siding_brown", 3),
     ("board_white", 2),
     ("stucco", 2),
@@ -266,10 +278,9 @@ _HOUSE_ROOFS = (
     ("metal_green", 2),
 )
 _BARN_WALLS = (
-    ("barn_red", 35),
+    ("barn_red", 40),
     ("barn_grey", 25),
     ("steel_white", 25),
-    ("steel_red", 5),
     ("shed_wood", 10),
 )
 _BARN_ROOFS = (
@@ -297,9 +308,51 @@ _SHED_ROOFS = (
 )
 _COMMERCIAL_WALLS = (("commercial", 60), ("brick_red", 15), ("brick_buff", 15),
                      ("steel_white", 10))  # fmt: skip
-_DEFAULT_PEAK_M = {"shed": 3.2, "garage": 4.0, "house": 6.0, "barn": 8.5, "commercial": 6.0}
-_MIN_EAVE_M = {"shed": 2.0, "garage": 2.3, "house": 2.4, "barn": 3.0, "commercial": 3.0}
-_MAX_RISE_M = {"shed": 2.5, "garage": 3.5, "house": 6.0, "barn": 9.0, "commercial": 4.0}
+# In towns (subdivisions, downtowns: `_town_context`) houses wear what GTA builders have used
+# since the 1970s: mostly clay brick (grey-white and pale red blends above all in newer
+# Oakville / Burlington subdivisions, buff, brown, red), some stone and stucco fronts, and
+# vinyl siding mostly on older or rural houses (the user's Oakville check, 2026-10-16;
+# weights ASSUMED, no cladding statistics exist). No board-and-batten, no metal roofs.
+_TOWN_HOUSE_WALLS = (
+    ("brick_grey", 16),
+    ("brick_pale_red", 14),
+    ("brick_buff", 12),
+    ("brick_brown", 12),
+    ("brick_red", 9),
+    ("brick_charcoal", 4),
+    ("stone", 9),
+    ("stucco", 4),
+    ("siding_white", 5),
+    ("siding_grey", 5),
+    ("siding_cream", 4),
+    ("siding_tan", 3),
+    ("siding_blue", 3),
+)
+_TOWNHOUSE_WALLS = (
+    ("brick_grey", 30),
+    ("brick_pale_red", 25),
+    ("brick_buff", 15),
+    ("brick_brown", 15),
+    ("brick_red", 8),
+    ("stone", 7),
+)
+_TOWN_HOUSE_ROOFS = (
+    ("shingle_charcoal", 45),
+    ("shingle_black", 25),
+    ("shingle_grey", 15),
+    ("shingle_brown", 15),
+)
+_TOWN_COMMERCIAL_WALLS = (("commercial", 45), ("brick_red", 15), ("brick_buff", 15),
+                          ("brick_brown", 10), ("brick_grey", 10), ("stucco", 5))  # fmt: skip
+_DEFAULT_PEAK_M = {"shed": 3.2, "garage": 4.0, "house": 6.0, "townhouse": 9.5, "barn": 8.5,
+                   "commercial": 6.0}  # fmt: skip
+_MIN_EAVE_M = {"shed": 2.0, "garage": 2.3, "house": 2.4, "townhouse": 2.4, "barn": 3.0,
+               "commercial": 3.0}  # fmt: skip
+_MAX_RISE_M = {"shed": 2.5, "garage": 3.5, "house": 6.0, "townhouse": 4.0, "barn": 9.0,
+               "commercial": 4.0}  # fmt: skip
+# NRCan Land Cover 2020 classes (geometry.vegetation.sample_landcover).
+_LC_FARM = (10, 15, 16)  # temperate grassland (pasture, hay), cropland, barren
+_LC_URBAN = 17
 
 # Ontario roof pitch (degrees): quantiles of the implied pitch of Burlington's houses
 # (buildings.md §5: p10 14.8, median 22.5, p90 33.7), tails ASSUMED.
@@ -325,6 +378,19 @@ class BuildingOptions:
     min_area_m2: float = 10.0
     max_area_m2: float = 20_000.0
     max_buildings: int = 6000  # hard cap (nearest first); the byte budget usually binds first
+    # Context (`_town_context`): a footprint with at least `town_neighbours` others within
+    # `context_radius_m` stands in a town (subdivision, downtown); with at most
+    # `rural_neighbours` it is rural unless the land cover around it is built-up; between,
+    # rural only on agricultural land cover. Barns only stand in the country.
+    context_radius_m: float = 100.0
+    town_neighbours: int = 12
+    rural_neighbours: int = 6
+    # Townhouse rows (in towns; untyped, residential or terrace footprints): the minimum
+    # rectangle at least this long and this deep, and this big.
+    row_min_length_m: float = 18.0
+    row_depth_m: tuple[float, float] = (7.0, 16.0)
+    row_min_area_m2: float = 180.0
+    row_unit_m: float = 6.5  # one unit (front door, garage door) per this much frontage
     budget_bytes: int = 5_000_000  # mesh bytes in the KN5 (44 B / vertex + 6 B / triangle)
     # Height (see module docstring).
     erode_m: float = 1.0
@@ -536,6 +602,7 @@ class Building:
     collide: bool = False
     u_offset: float = 0.0
     category: str = "house"
+    town: bool = False  # in a town (subdivision, downtown), not the country: `_town_context`
     front_edge: int | None = None
     doors: tuple[Door, ...] = ()
     wall_u0: tuple[float, ...] | None = None
@@ -611,27 +678,83 @@ def choose_height(
     return "default", float(np.clip(o.default_height_m, lo, hi)), None, None
 
 
-def _category(fp: Footprint, area: float) -> str:
-    """house / garage / shed / barn / commercial (module docstring, step 3); a big untyped
-    footprint is a barn here and may become commercial once its roof is known to be flat."""
+def _category(
+    fp: Footprint, area: float, town: bool = False, length_m: float = 0.0, depth_m: float = 0.0,
+    o: BuildingOptions | None = None,
+) -> str:  # fmt: skip
+    """house / townhouse / garage / shed / barn / commercial (module docstring, step 3).
+
+    In the country a big untyped footprint is a barn here and may become commercial once its
+    roof is known to be flat. In a town (`town`) nothing untyped is a barn: a long, house-deep
+    footprint (`length_m` x `depth_m`, the minimum rectangle) is a townhouse row, a big one a
+    house (it becomes commercial when its roof is flat), and only OSM-tagged barns stay barns.
+    """
+    o = o or BuildingOptions()
     kind = fp.kind
     if kind in _FLAT_KINDS:
         return "commercial"
     if kind in _BARN_KINDS:
         return "barn"
     if kind in _GARAGE_KINDS:
-        return "garage" if area < 150.0 else "barn"
+        return "garage" if area < 150.0 or town else "barn"
     if kind in _SHED_KINDS:
         return "shed" if area < 30.0 else "garage"
+    lo, hi = o.row_depth_m
+    row = (
+        town
+        and kind in ("yes", "residential", "terrace", "house", "townhouse")
+        and area >= o.row_min_area_m2
+        and length_m >= o.row_min_length_m
+        and lo <= depth_m <= hi
+        and length_m >= 1.6 * depth_m
+    )
+    if kind in ("terrace", "townhouse") or row:
+        return "townhouse"
     if kind in _HOUSE_KINDS:
         return "house"
     if area < 25.0:
         return "shed"
     if area < 70.0:
         return "garage"
-    if area >= 450.0:
+    if area >= 450.0 and not town:
         return "barn"
     return "house"
+
+
+def _town_context(
+    polys: Sequence[shapely.Polygon], cand: Sequence[int], landcover: LandcoverFn | None,
+    o: BuildingOptions,
+) -> np.ndarray:  # fmt: skip
+    """Per candidate (indices into `polys`, every footprint found): True in a town.
+
+    Built-up: at least `town_neighbours` other footprints within `context_radius_m` (a
+    subdivision has 40-80 houses in 100 m; a farm a house, a garage and a few barns). With
+    at most `rural_neighbours` the building is rural, unless most of the land cover around
+    it (its centre and 8 points 75 m out) is urban (a lone school in a town park); between the
+    two, rural only where the land cover is mostly cropland or pasture. Without land cover
+    the middle band counts as a town.
+    """
+    if not len(cand):
+        return np.zeros(0, bool)
+    cents = np.array([[c.x, c.y] for c in (p.centroid for p in polys)])
+    n = cKDTree(cents).query_ball_point(cents[cand], o.context_radius_m, return_length=True) - 1
+    town = n >= o.town_neighbours
+    rural = n <= o.rural_neighbours
+    if landcover is None:
+        return town | ~rural
+    ang = np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False)
+    ring = np.vstack([[0.0, 0.0], 75.0 * np.stack([np.cos(ang), np.sin(ang)], axis=1)])
+    pts = (cents[cand][:, None, :] + ring[None, :, :]).reshape(-1, 2)
+    try:
+        lc = np.asarray(landcover(pts)).reshape(len(cand), len(ring))
+    except (OSError, RuntimeError, ValueError) as exc:  # SourceUnavailable: RuntimeError
+        log.warning("land cover unavailable for the building context: %s", exc)
+        return town | ~rural
+    known = (lc > 0).sum(axis=1)
+    urban = (lc == _LC_URBAN).sum(axis=1) > 0.5 * known
+    farm = np.isin(lc, _LC_FARM).sum(axis=1) >= 0.5 * np.maximum(known, 1)
+    farm &= known > 0
+    return town | (rural & urban & (known > 0)) | (~town & ~rural & ~farm)
 
 
 def _measured(fp: Footprint) -> tuple[float | None, float | None, str]:
@@ -658,14 +781,17 @@ def _roof_shape(
         return ROOF_FLAT
     if spread is not None and spread < o.flat_lidar_spread_m:
         return ROOF_FLAT
-    if area >= o.flat_roof_area_m2 and fp.kind not in _BARN_KINDS and spread is None:
+    if (area >= o.flat_roof_area_m2 and fp.kind not in _BARN_KINDS and spread is None
+            and cat != "townhouse"):  # fmt: skip
         return ROOF_FLAT
     if aspect < 1.4 and cat == "house" and _u01(seed, fp.id, "hip") < o.hipped_share:
         return ROOF_HIPPED
     return ROOF_GABLED
 
 
-def _styles(fp: Footprint, cat: str, area: float, roof: str, seed: object) -> tuple[str, str]:
+def _styles(
+    fp: Footprint, cat: str, area: float, roof: str, seed: object, town: bool = False
+) -> tuple[str, str]:
     uw, ur = _u01(seed, fp.id, "wall"), _u01(seed, fp.id, "roofstyle")
     walls, roofs = {
         "commercial": (_COMMERCIAL_WALLS, None),
@@ -673,7 +799,12 @@ def _styles(fp: Footprint, cat: str, area: float, roof: str, seed: object) -> tu
         "shed": (_SHED_WALLS, _SHED_ROOFS),
         "garage": (_HOUSE_WALLS, _HOUSE_ROOFS),
         "house": (_HOUSE_WALLS, _HOUSE_ROOFS),
+        "townhouse": (_TOWNHOUSE_WALLS, _TOWN_HOUSE_ROOFS),
     }[cat]
+    if town and cat in ("house", "garage"):
+        walls, roofs = _TOWN_HOUSE_WALLS, _TOWN_HOUSE_ROOFS
+    elif town and cat == "commercial":
+        walls = _TOWN_COMMERCIAL_WALLS
     wall_style = _pick(walls, uw)
     if roof == ROOF_FLAT:
         roof_style = "flat_membrane" if area >= 60.0 else "metal_grey"
@@ -856,6 +987,27 @@ def _door_spans(
             mid = 0.5 * (free[0] + free[1])
             jitter = (_u01(seed, b.id, "dpos") - 0.5) * 0.3 * (free[1] - free[0] - w)
             out.append((door, mid + jitter, w, DOORS[door].height_m))
+    elif cat == "townhouse":
+        # One unit per `row_unit_m` of frontage: a single garage door and a front door each,
+        # mirrored in pairs as builders lay them out.
+        n = max(2, int(round(length / o.row_unit_m)))
+        unit = length / n
+        gd = DOORS["garage1_white" if _u01(seed, b.id, "gcol") < 0.75 else "garage1_almond"]
+        door = _pick((("door_white", 40), ("door_dark", 45), ("door_red", 15)),
+                     _u01(seed, b.id, "dcol"))  # fmt: skip
+        dw = DOORS[door].width_m
+        garages = unit >= gd.width_m + dw + 1.4 and _u01(seed, b.id, "rowgarage") < 0.8
+        for k in range(n):
+            x0 = k * unit
+            flip = k % 2 == 1
+            if garages:
+                g = x0 + (unit - 0.5 - 0.5 * gd.width_m if flip else 0.5 + 0.5 * gd.width_m)
+                d = x0 + (0.4 + 0.5 * dw + 0.3 if flip else unit - 0.4 - 0.5 * dw - 0.3)
+                out.append((gd.name, g, gd.width_m, gd.height_m))
+            else:
+                d = x0 + 0.5 * unit
+            if unit >= dw + 0.8:
+                out.append((door, d, dw, DOORS[door].height_m))
     elif cat == "garage":
         for name in ("garage2_white", "garage1_white"):
             d = DOORS[name]
@@ -919,7 +1071,7 @@ def _wall_starts(b: Building, seed: object) -> tuple[float, ...] | None:
     garages and sheds in a windowed style; None (continuous) for the other bands."""
     if b.wall_style not in WINDOWED:
         return None
-    windows = b.category in ("house", "commercial")
+    windows = b.category in ("house", "townhouse", "commercial")
     ring = b.ring
     seg = np.linalg.norm(np.roll(ring, -1, axis=0) - ring, axis=1)
     return tuple(
@@ -929,7 +1081,7 @@ def _wall_starts(b: Building, seed: object) -> tuple[float, ...] | None:
 
 
 def _match_outbuildings(buildings: Sequence[Building], seed: object) -> None:
-    """Garages and sheds within 35 m of a house usually wear the house's colours."""
+    """Garages within 35 m of a house wear the house's colours; sheds usually do."""
     houses = [b for b in buildings if b.category == "house"]
     if not houses:
         return
@@ -938,7 +1090,7 @@ def _match_outbuildings(buildings: Sequence[Building], seed: object) -> None:
         if b.category not in ("garage", "shed"):
             continue
         d, j = tree.query(b.centroid)
-        if d <= 35.0 and _u01(seed, b.id, "match") < 0.75:
+        if d <= 35.0 and (b.category == "garage" or _u01(seed, b.id, "match") < 0.75):
             h = houses[int(j)]
             b.wall_style = h.wall_style
             if b.roof.shape != ROOF_FLAT:
@@ -961,6 +1113,7 @@ def place_buildings(
     options: BuildingOptions | None = None,
     seed: int | str = 0,
     roads: Sequence[np.ndarray] | None = None,
+    landcover: LandcoverFn | None = None,
 ) -> list[Building]:
     """Turn footprints into `Building`s (module docstring, steps 1-7), sorted by id.
 
@@ -970,15 +1123,20 @@ def place_buildings(
     NaN means no lidar, and the measured / tag / default heights are used. `roads` are extra
     XZ polylines (side roads) a front wall may face; the route always counts. `seed` should be
     the track id. Each building's mesh is made here (for the byte budget) and kept in `mesh`.
+    `landcover(xz)` (NRCan 2020 classes, e.g. `vegetation.LandcoverSampler`) tells farmland
+    from town where the building density alone does not (`_town_context`).
     """
     o = options or BuildingOptions()
     if not footprints:
         return []
     line, tree, outer = _road_frame(model)
     keep_out = corridor.buffer(o.clearance_m) if corridor is not None else None
-    cand: list[tuple[float, Footprint, shapely.Polygon]] = []
+    cand: list[tuple[float, Footprint, shapely.Polygon, int]] = []
+    every: list[shapely.Polygon] = []  # every footprint found, for the building density
     for fp in footprints:
         poly = _to_polygon(fp, projection)
+        if poly is not None:
+            every.append(poly)
         if poly is None or not (o.min_area_m2 <= poly.area <= o.max_area_m2):
             continue
         d_centre = float(poly.distance(line))
@@ -993,7 +1151,7 @@ def place_buildings(
             continue
         if keep_out is not None and poly.intersects(keep_out):
             continue
-        cand.append((d_edge, fp, poly))
+        cand.append((d_edge, fp, poly, len(every) - 1))
     cand.sort(key=lambda t: (t[0], t[1].id))
     if len(cand) > o.max_buildings:
         log.info("building cap: keeping the %d nearest of %d", o.max_buildings, len(cand))
@@ -1003,7 +1161,7 @@ def place_buildings(
 
     # Ground under every footprint, one batched call.
     g_pts, g_owner = [], []
-    for k, (_, _, poly) in enumerate(cand):
+    for k, (_, _, poly, _) in enumerate(cand):
         pts = np.concatenate([np.asarray(poly.exterior.coords)[:-1], _lattice(poly, 3.0)])
         g_pts.append(pts)
         g_owner.append(np.full(len(pts), k))
@@ -1016,7 +1174,7 @@ def place_buildings(
     eroded = np.zeros(len(cand))  # how far inside the outline the lidar was sampled
     if canopy is not None:
         c_pts, c_owner = [], []
-        for k, (_, fp, poly) in enumerate(cand):
+        for k, (_, fp, poly, _) in enumerate(cand):
             if _measured(fp)[1] is not None:  # eave and peak measured: nothing to learn
                 continue
             inner = poly.buffer(-o.erode_m)
@@ -1045,15 +1203,17 @@ def place_buildings(
     road_lines = [line] + [shapely.LineString(r) for r in (roads or []) if len(r) >= 2]
     road_tree = shapely.STRtree(road_lines)
 
+    towns = _town_context(every, [c[3] for c in cand], landcover, o)
     out: list[Building] = []
-    for k, (d_edge, fp, poly) in enumerate(cand):
+    for k, (d_edge, fp, poly, _) in enumerate(cand):
+        town = bool(towns[k])
         g = g_all[g_owner_all == k]
         g = g[np.isfinite(g)]
         if g.size == 0:
             continue
         ground_y, base_y = float(np.median(g)), float(g.min()) - o.sink_m
         centre, L, S, hl, hw = _min_rect(poly)
-        cat = _category(fp, poly.area)
+        cat = _category(fp, poly.area, town, 2.0 * hl, 2.0 * hw, o)
         small = poly.area < o.small_area_m2 and fp.kind in _SMALL_CAPPED_KINDS
         src_l, _, med, p90 = choose_height(
             lidar[k], max_lidar_m=o.small_max_lidar_m if small else None, options=o
@@ -1062,7 +1222,9 @@ def place_buildings(
         src, eave, rise, shape, cat = _heights(
             fp, cat, poly.area, poly.length, hw, hl / max(hw, 1e-9), lid, eroded[k], o, seed
         )
-        wall_style, roof_style = _styles(fp, cat, poly.area, shape, seed)
+        if town and cat == "house" and shape == ROOF_FLAT and poly.area >= 400.0:
+            cat = "commercial"  # a big flat-roofed building in town: shops, offices, a school
+        wall_style, roof_style = _styles(fp, cat, poly.area, shape, seed, town)
         roof = Roof(shape, centre, L, S, hl, hw, rise if shape != ROOF_FLAT else 0.0)
         ring = np.asarray(poly.exterior.coords)[:-1].copy()
         cpt = poly.centroid
@@ -1087,6 +1249,7 @@ def place_buildings(
                 collide=o.collide_within_m >= 0 and d_edge <= o.collide_within_m,
                 u_offset=round(_u01(seed, fp.id, "u") * ATLAS_U_M, 3),
                 category=cat,
+                town=town,
                 front_edge=_front_edge(ring, towards / nt) if nt > 1e-6 else None,
             )
         )

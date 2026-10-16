@@ -6,7 +6,9 @@ Pillow, one BC1 atlas") and the builders' buildings.md §7 ("keep procedural for
 shingles and vinyl siding"). Every pixel is generated here from seeded noise with numpy, so we
 own the texture outright and the same size + seed gives the same bytes. Colours are ASSUMED
 typical Ontario finishes (no cladding statistics exist): vinyl in white, almond, grey, clay,
-blue-grey and sage; red, brown, buff, orange and charcoal brick; fieldstone; red and grey barn
+blue-grey and brown; red, brown, buff, orange and charcoal brick, and the grey-white and pale
+red brick of GTA subdivisions and townhouses (the user's Oakville check, 2026-10-16: "a
+greyish white brick and pale red brick"), laid with grey mortar; fieldstone; red and grey barn
 boards; white ribbed steel for drive sheds; charcoal, grey, weathered-wood and black asphalt
 shingles; galvanised, green, red and charcoal steel roofs.
 
@@ -96,7 +98,7 @@ _STYLE_NAMES: tuple[tuple[str, Surface], ...] = (
     ("siding_cream", "wall"),  # almond / beige vinyl
     ("siding_grey", "wall"),
     ("siding_blue", "wall"),  # blue-grey vinyl
-    ("siding_sage", "wall"),
+    ("brick_grey", "wall"),  # grey-white brick (GTA subdivisions, 1990s-2020s)
     ("siding_tan", "wall"),  # clay vinyl
     ("siding_brown", "wall"),  # dark brown vinyl / stained wood
     ("board_white", "wall"),  # white vertical board-and-batten (farmhouse)
@@ -111,7 +113,7 @@ _STYLE_NAMES: tuple[tuple[str, Surface], ...] = (
     ("barn_grey", "wall"),  # weathered grey boards
     ("shed_wood", "wall"),  # brown stained boards, no windows
     ("steel_white", "wall"),  # ribbed steel cladding: drive sheds, pole barns
-    ("steel_red", "wall"),
+    ("brick_pale_red", "wall"),  # pale red / rose brick (GTA subdivisions, townhouses)
     ("commercial", "wall"),
     ("shingle_charcoal", "roof"),
     ("shingle_grey", "roof"),  # weathered grey
@@ -130,9 +132,9 @@ STYLES: tuple[BuildingStyle, ...] = tuple(
 )
 _BY_NAME = {s.name: s for s in STYLES}
 WINDOWED = frozenset({
-    "siding_white", "siding_cream", "siding_grey", "siding_blue", "siding_sage", "siding_tan",
-    "siding_brown", "board_white", "brick_red", "brick_brown", "brick_buff", "brick_orange",
-    "brick_charcoal", "stone", "stucco",
+    "siding_white", "siding_cream", "siding_grey", "siding_blue", "siding_tan", "siding_brown",
+    "board_white", "brick_red", "brick_brown", "brick_buff", "brick_orange", "brick_charcoal",
+    "brick_grey", "brick_pale_red", "stone", "stucco",
 })  # fmt: skip
 
 
@@ -337,7 +339,15 @@ def _board_batten(shape, rng, colour: np.ndarray, px_per_m: float) -> np.ndarray
     return rgb
 
 
-def _brick(shape, rng, colour: np.ndarray, px_per_m: float, *, spread: float = 0.07):
+def _brick(
+    shape,
+    rng,
+    colour: np.ndarray,
+    px_per_m: float,
+    *,
+    spread: float = 0.07,
+    joint_rgb: np.ndarray | None = None,
+):
     """Running-bond brick with light mortar; per-brick tone jitter. Bricks are only ~2 px tall
     at the default size, so the pattern is painted at 4x and box-filtered down (no aliasing)."""
     h, w = shape
@@ -357,7 +367,8 @@ def _brick(shape, rng, colour: np.ndarray, px_per_m: float, *, spread: float = 0
     lum = lum_hi.reshape(h, ss, w, ss).mean(axis=(1, 3))
     m = mix.reshape(h, ss, w, ss).mean(axis=(1, 3))
     lum = lum + 0.03 * _noise(shape, rng, 1.0)
-    rgb = _shade(colour, lum) * (1.0 - m[..., None]) + _rgb(176, 170, 160) * m[..., None]
+    joint = _rgb(176, 170, 160) if joint_rgb is None else joint_rgb
+    rgb = _shade(colour, lum) * (1.0 - m[..., None]) + joint * m[..., None]
     _paint_windows(rgb, rng, px_per_m, _house_window_spans(px_per_m), trim=_rgb(225, 222, 212))
     return rgb
 
@@ -572,7 +583,6 @@ _SIDING = {
     "siding_cream": _rgb(216, 204, 174),
     "siding_grey": _rgb(158, 160, 157),
     "siding_blue": _rgb(126, 140, 152),
-    "siding_sage": _rgb(146, 156, 132),
     "siding_tan": _rgb(182, 164, 136),
     "siding_brown": _rgb(104, 84, 66),
 }
@@ -582,7 +592,12 @@ _BRICK = {
     "brick_buff": _rgb(198, 170, 122),
     "brick_orange": _rgb(170, 88, 56),
     "brick_charcoal": _rgb(92, 84, 82),
+    "brick_grey": _rgb(196, 192, 184),
+    "brick_pale_red": _rgb(170, 106, 88),
 }
+# Light bricks are laid with grey mortar, darker than the brick; blends vary more per brick.
+_BRICK_MORTAR = {"brick_grey": _rgb(150, 148, 142), "brick_buff": _rgb(168, 160, 146)}
+_BRICK_SPREAD = {"brick_grey": 0.06, "brick_pale_red": 0.09}
 _SHINGLE = {
     "shingle_charcoal": _rgb(62, 62, 64),
     "shingle_grey": _rgb(108, 108, 106),
@@ -607,7 +622,14 @@ def _paint_band(s: BuildingStyle, shape: tuple[int, int], rng: np.random.Generat
     if n == "board_white":
         return _board_batten(shape, rng, _rgb(232, 232, 228), px_per_m)
     if n in _BRICK:
-        return _brick(shape, rng, _BRICK[n], px_per_m)
+        return _brick(
+            shape,
+            rng,
+            _BRICK[n],
+            px_per_m,
+            spread=_BRICK_SPREAD.get(n, 0.07),
+            joint_rgb=_BRICK_MORTAR.get(n),
+        )
     if n == "stone":
         return _stone(shape, rng, px_per_m)
     if n == "stucco":
@@ -620,8 +642,6 @@ def _paint_band(s: BuildingStyle, shape: tuple[int, int], rng: np.random.Generat
         return _boards(shape, rng, _rgb(120, 96, 72), px_per_m, windows=False)
     if n == "steel_white":
         return _steel_wall(shape, rng, _rgb(226, 226, 222), px_per_m)
-    if n == "steel_red":
-        return _steel_wall(shape, rng, _rgb(130, 40, 34), px_per_m)
     if n == "commercial":
         return _commercial(shape, rng, px_per_m)
     if n in _SHINGLE:

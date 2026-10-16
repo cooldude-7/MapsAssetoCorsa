@@ -146,3 +146,73 @@ def test_budget_lod_batches_and_distance():
     lods = {m.flags.get("lod_out") for m in meshes if not m.collision}
     assert lods == {BuildingOptions().lod_out_m, BuildingOptions().detail_lod_out_m}
     assert math.isclose(sum(m.building_count for m in meshes if not m.collision), len(allb))
+
+
+def _subdivision(n_rows=2) -> list:
+    """Rows of 11 detached houses (12 x 9 m, 20 m apart) at z = 20 and z = 110."""
+    return [
+        _fp(f"osm:h{r}{i:02d}", _rect(-106 + 20 * i, 20 + 90 * r, 12, 9), tags={})
+        for r in range(n_rows)
+        for i in range(11)
+    ]
+
+
+def _place(fps, **kw):
+    return {b.id: b for b in place_buildings(fps, PROJ, _road(), _flat, seed="t", **kw)}
+
+
+def _cover(cls):
+    return lambda xz: np.full(len(xz), cls, np.uint8)
+
+
+def test_barns_only_in_the_country():
+    big = _fp("ms:q:big", _rect(-14, 50, 28, 20), "microsoft", tags={})  # 560 m2, untyped
+    alone = _place([big])["ms:q:big"]
+    assert alone.category == "barn" and not alone.town
+    town = _place([big, *_subdivision()])
+    assert town["ms:q:big"].category != "barn" and town["ms:q:big"].town
+    assert town["ms:q:big"].wall_style not in ("barn_red", "barn_grey", "steel_white")
+    # An OSM-tagged barn stays a barn wherever it stands.
+    tagged = _fp("osm:barn", _rect(-15, 50, 30, 20), tags={"building": "barn"})
+    assert _place([tagged, *_subdivision()])["osm:barn"].category == "barn"
+    # Between the bands (8 neighbours) the land cover decides: farmland -> barn, town -> not.
+    few = _subdivision(1)[:8]
+    assert _place([big, *few], landcover=_cover(15))["ms:q:big"].category == "barn"  # cropland
+    assert _place([big, *few], landcover=_cover(17))["ms:q:big"].category != "barn"  # urban
+    assert _place([big, *few])["ms:q:big"].category != "barn"  # unknown: not a barn
+    # Alone on urban land cover (a school in a park) it is in town; alone on cropland a barn.
+    assert _place([big], landcover=_cover(17))["ms:q:big"].category != "barn"
+    assert _place([big], landcover=_cover(15))["ms:q:big"].category == "barn"
+
+
+def test_town_houses_are_brick_rows_with_a_door_per_unit():
+    from driftmaps.geometry.buildings import _TOWN_HOUSE_WALLS, _TOWNHOUSE_WALLS
+
+    row = _fp("ms:q:row", _rect(-16, 50, 32, 10), "microsoft", tags={})  # 5 units of 6.4 m
+    got = _place([row, *_subdivision()])
+    b = got["ms:q:row"]
+    assert b.category == "townhouse" and b.roof.shape != ROOF_FLAT
+    assert b.wall_style in dict(_TOWNHOUSE_WALLS) and b.wall_style.startswith(("brick", "stone"))
+    fronts = [d for d in b.doors if d.style.startswith("door_")]
+    assert len(fronts) == 5 and all(d.edge == b.front_edge for d in b.doors)
+    houses = [h for h in got.values() if h.category == "house"]
+    assert len(houses) == 22 and all(h.wall_style in dict(_TOWN_HOUSE_WALLS) for h in houses)
+    assert all(h.roof_style.startswith("shingle") for h in houses)
+    styles = {h.wall_style for h in houses}
+    assert not styles & {"board_white", "barn_red", "barn_grey", "steel_white", "shed_wood"}
+    # The same footprint in the country is one long house, not a row of units.
+    assert _place([row])["ms:q:row"].category == "house"
+
+
+def test_garages_wear_their_house_colours():
+    house = _fp("osm:w10", _rect(-6, 30, 12, 9))
+    garages = [
+        _fp(
+            f"osm:g{i}",
+            _rect(10 + 9 * (i % 2), 32 + 9 * (i // 2), 6, 7),
+            tags={"building": "garage"},
+        )
+        for i in range(6)
+    ]
+    got = _place([house, *garages])
+    assert all(got[g.id].wall_style == got["osm:w10"].wall_style for g in garages)

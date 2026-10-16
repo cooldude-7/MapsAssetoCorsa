@@ -1802,10 +1802,12 @@ def _buildings(
     sc.footprints = res
     roads = _building_roads(geo, options)
 
+    landcover = _landcover_fn(geo, options)
+
     def place(c: CanopyFn | None) -> list[Building]:
         return place_buildings(
             res.footprints, geo.projection, geo.model, ground,
-            corridor=corridor, canopy=c, seed=track_id, roads=roads,
+            corridor=corridor, canopy=c, seed=track_id, roads=roads, landcover=landcover,
         )  # fmt: skip
 
     try:
@@ -1816,6 +1818,13 @@ def _buildings(
     if sc.buildings:
         lines = res.attributions_for({b.id for b in sc.buildings})
         sc.attributions += [a for a in lines if a not in sc.attributions]
+
+
+def _landcover_fn(geo: TrackGeometry, options: BuildOptions) -> LandcoverFn:
+    """NRCan land cover on AC XZ points (trees: kinds; buildings: farm or town)."""
+    if options.landcover_source is not None:
+        return options.landcover_source(geo.projection)
+    return LandcoverSampler(geo.projection, cache_dir=options.cache_dir)
 
 
 def _building_roads(geo: TrackGeometry, options: BuildOptions) -> list[np.ndarray]:
@@ -1930,10 +1939,7 @@ def _trees(
         max_trees=int(round(vopt.max_trees * density)),
         max_trees_per_km=vopt.max_trees_per_km * density,
     )
-    if options.landcover_source is not None:
-        landcover = options.landcover_source(geo.projection)
-    else:
-        landcover = LandcoverSampler(geo.projection, cache_dir=options.cache_dir)
+    landcover = _landcover_fn(geo, options)
     exclude = _tree_exclusion(geo, sc)
     try:
         sc.trees = place_trees(
