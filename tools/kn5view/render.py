@@ -6,8 +6,8 @@ run. Examples (from any checkout of the repo):
 
     uv run python tools/kn5view/render.py TRACK_DIR --station 0 --out shots/
     uv run python tools/kn5view/render.py TRACK_DIR --stations 0,2984,7282 --look forward,back
-    uv run python tools/kn5view/render.py TRACK_DIR --at 43.4547,-79.8876 --aerial 120 --tilt 30
-    uv run python tools/kn5view/render.py TRACK_DIR --topdown 43.4547,-79.8876 --size 300
+    uv run python tools/kn5view/render.py TRACK_DIR --at 43.4477,-79.8776 --aerial 120 --tilt 30
+    uv run python tools/kn5view/render.py TRACK_DIR --topdown 43.4477,-79.8776 --size 300
 
 TRACK_DIR is a built track folder (with route.json and ai/fast_lane.ai) or a .kn5 file.
 Stations are metres along the AI line measured from the A start gate (AC_AB_START_*).
@@ -237,9 +237,41 @@ def topdown_view(x: float, z: float, size: float, a) -> dict:
         "up": [0.0, 0.0, -1.0],  # north up
         "ortho": True,
         "orthoWidth": size,
+        "scaleBar": True,
         "far": 6000,
         "shadowRadius": size * 0.75,
     }
+
+
+def scale_bar(png: bytes, metres_per_px: float) -> bytes:
+    """Draw a scale bar (bottom left) and a north arrow (top right) on a top-down PNG."""
+    import io
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    img = Image.open(io.BytesIO(png)).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.load_default(size=max(12, img.width // 70))
+    except TypeError:  # Pillow < 10.1
+        font = ImageFont.load_default()
+    target = img.width * metres_per_px / 5
+    nice = max(n * 10**k for k in range(-1, 6) for n in (1, 2, 5) if n * 10**k <= target)
+    bar = round(nice / metres_per_px)
+    x0, y0, th = 16, img.height - 30, 8
+    label = f"{nice:g} m   ({metres_per_px:.3g} m/px)"
+    tw = draw.textlength(label, font=font)
+    draw.rectangle([x0 - 8, y0 - 26, x0 + max(bar, tw) + 8, y0 + th + 8], fill=(255, 255, 255))
+    draw.rectangle([x0, y0, x0 + bar, y0 + th], fill=(0, 0, 0))
+    draw.rectangle([x0 + bar // 2, y0, x0 + bar, y0 + th // 2], fill=(255, 255, 255))
+    draw.text((x0, y0 - 22), label, fill=(0, 0, 0), font=font)
+    ax, ay = img.width - 30, 18
+    draw.rectangle([ax - 16, ay - 8, ax + 16, ay + 50], fill=(255, 255, 255))
+    draw.polygon([(ax, ay), (ax - 9, ay + 22), (ax + 9, ay + 22)], fill=(0, 0, 0))
+    draw.text((ax - 5, ay + 26), "N", fill=(0, 0, 0), font=font)
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
 
 
 def _tag(v: float, digits: int = 5) -> str:
@@ -248,6 +280,8 @@ def _tag(v: float, digits: int = 5) -> str:
 
 def build_views(args, track: Track, meta: dict) -> list[tuple[str, dict]]:
     views: list[tuple[str, dict]] = []
+    w, h = (int(v) for v in args.res.lower().split("x"))
+    mpp = args.size / w  # top-down metres per pixel
     stations: list[float] = []
     for text in args.station + args.stations:
         stations += [float(v) for v in text.split(",") if v.strip()]
@@ -280,14 +314,12 @@ def build_views(args, track: Track, meta: dict) -> list[tuple[str, dict]]:
     for text in args.topdown:
         x, z = latlon_to_xz(track.route, text)
         lat, lon = text.split(",")
-        name = f"topdown_{_tag(float(lat))}_{_tag(float(lon))}_{args.size:.0f}m"
+        name = f"topdown_{_tag(float(lat))}_{_tag(float(lon))}_{args.size:.0f}m_{mpp:.3g}mpp"
         views.append((name, topdown_view(x, z, args.size, args)))
     for text in args.topdown_xyz:
         x, z = _floats(text, 2)
-        views.append(
-            (f"topdown_xyz_{x:.0f}_{z:.0f}_{args.size:.0f}m", topdown_view(x, z, args.size, args))
-        )
-    w, h = (int(v) for v in args.res.lower().split("x"))
+        name = f"topdown_xyz_{x:.0f}_{z:.0f}_{args.size:.0f}m_{mpp:.3g}mpp"
+        views.append((name, topdown_view(x, z, args.size, args)))
     for _, v in views:
         v["width"], v["height"] = w, h
     return views
@@ -356,6 +388,7 @@ def parse_args(argv: list[str] | None = None):
     g.add_argument("--shadows", action="store_true", help="sun shadows (slower)")
     g.add_argument("--show-collision", action="store_true", help="show hidden walls in red")
     g.add_argument("--double-sided", action="store_true", help="draw every face both sides")
+    g.add_argument("--no-lod", action="store_true", help="ignore the meshes' LOD distances")
     g.add_argument("--hide", help="regex of mesh names to hide, e.g. '^far|^tree'")
     g.add_argument("--only", help="regex of mesh names to keep (all others hidden)")
     g = p.add_argument_group("cache / debugging")
@@ -401,6 +434,7 @@ def main(argv: list[str] | None = None) -> int:
                 "hide": args.hide,
                 "only": args.only,
                 "shadows": args.shadows,
+                "noLod": args.no_lod,
                 "sunPitch": track.lighting.get("SUN_PITCH_ANGLE", 45.0),
                 "sunHeading": track.lighting.get("SUN_HEADING_ANGLE", 135.0),
             }
@@ -416,13 +450,16 @@ def main(argv: list[str] | None = None) -> int:
                 t0 = time.perf_counter()
                 res = browser.call("render", view, timeout=600)
                 png = base64.b64decode(res["png"].split(",", 1)[1])
+                if view.get("scaleBar"):
+                    png = scale_bar(png, view["orthoWidth"] / view["width"])
                 path = args.out / f"{name}.png"
                 path.write_bytes(png)
                 info = res["info"]
                 ground = "none" if info["ground"] is None else f"{info['ground']:.2f}"
                 print(
-                    f"{path}  ({time.perf_counter() - t0:.1f} s; eye {info['eye']}, "
-                    f"ground y {ground}, {info['drawCalls']} draws)"
+                    f"{path}\n    {time.perf_counter() - t0:.1f} s (draw {info['renderMs']} ms, "
+                    f"png {info['encodeMs']} ms); eye {info['eye']}, ground y {ground}, "
+                    f"{info['drawCalls']} draws, {info['lodHidden']} meshes past LOD"
                 )
         except ChromiumError as exc:
             print(f"error: {exc}", file=sys.stderr)

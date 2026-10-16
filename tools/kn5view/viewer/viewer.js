@@ -16,22 +16,28 @@ const state = {
   scene: null,
   root: null,
   solid: [], // meshes rays may hit when looking for the ground (opaque, visible)
+  lod: [], // {mesh, centre, lodIn, lodOut}: meshes AC shows only within a distance band
   sun: null,
   cfg: {},
 };
 
+// Sky as an equirectangular gradient (by elevation), so the horizon always meets the fog colour
+// whatever the camera pitch.
 function skyTexture() {
   const c = document.createElement('canvas');
-  c.width = 4;
-  c.height = 256;
+  c.width = 8;
+  c.height = 512;
   const g = c.getContext('2d');
-  const grad = g.createLinearGradient(0, 0, 0, 256);
+  const grad = g.createLinearGradient(0, 0, 0, 512); // top row = zenith, bottom row = nadir
   grad.addColorStop(0, '#' + SKY_TOP.getHexString());
-  grad.addColorStop(0.55, '#a8c8e8');
-  grad.addColorStop(1, '#' + SKY_HORIZON.getHexString());
+  grad.addColorStop(0.3, '#7fa9db');
+  grad.addColorStop(0.46, '#b3cfe9');
+  grad.addColorStop(0.5, '#' + SKY_HORIZON.getHexString());
+  grad.addColorStop(1, '#a9b4b0');
   g.fillStyle = grad;
-  g.fillRect(0, 0, 4, 256);
+  g.fillRect(0, 0, 8, 512);
   const tex = new THREE.CanvasTexture(c);
+  tex.mapping = THREE.EquirectangularReflectionMapping;
   tex.colorSpace = THREE.SRGBColorSpace;
   return tex;
 }
@@ -99,6 +105,7 @@ async function load(cfg) {
     side: THREE.DoubleSide,
     depthWrite: false,
   });
+  root.updateMatrixWorld(true);
   const hideRe = cfg.hide ? new RegExp(cfg.hide, 'i') : null;
   const onlyRe = cfg.only ? new RegExp(cfg.only, 'i') : null;
   let meshes = 0;
@@ -120,6 +127,11 @@ async function load(cfg) {
     if (hideRe && hideRe.test(o.name)) visible = false;
     if (onlyRe && !onlyRe.test(o.name)) visible = false;
     o.visible = visible;
+    if (visible && ud.lodOut > 0 && !cfg.noLod) {
+      o.geometry.computeBoundingSphere();
+      const centre = o.geometry.boundingSphere.center.clone().applyMatrix4(o.matrixWorld);
+      state.lod.push({ mesh: o, centre, lodIn: ud.lodIn || 0, lodOut: ud.lodOut });
+    }
     if (!visible) {
       hidden += 1;
       return;
@@ -238,6 +250,14 @@ async function render(view) {
   camera.lookAt(target);
   camera.updateMatrixWorld();
 
+  // AC's per-mesh LOD distances (lod_in..lod_out from the camera). Plans show everything.
+  let lodHidden = 0;
+  for (const item of state.lod) {
+    const d = eye.distanceTo(item.centre);
+    item.mesh.visible = !!view.ortho || (d >= item.lodIn && d < item.lodOut);
+    if (!item.mesh.visible) lodHidden += 1;
+  }
+
   scene.fog = view.fog ? new THREE.Fog(SKY_HORIZON, view.fog[0], view.fog[1]) : null;
   if (state.cfg.shadows) placeSunShadow(view.ortho ? anchor : target, view.shadowRadius || 250);
 
@@ -250,6 +270,7 @@ async function render(view) {
       ground,
       eye: eye.toArray().map((v) => Math.round(v * 100) / 100),
       target: target.toArray().map((v) => Math.round(v * 100) / 100),
+      lodHidden,
       drawCalls: renderer.info.render.calls,
       triangles: renderer.info.render.triangles,
       renderMs: Math.round(t1 - t0),

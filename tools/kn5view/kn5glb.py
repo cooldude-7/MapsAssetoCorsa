@@ -13,7 +13,10 @@ self-contained GLB that three.js (or Blender) can open:
   Pillow; textures used by alpha materials are stored as PNG (alpha kept), the rest as JPEG.
   PNG sources small enough are embedded untouched.
 - Alpha: `alpha_tested` (or ALPHA_TO_COVERAGE, or an "AT"/tree/grass shader) -> alphaMode MASK
-  with the material's ksAlphaRef as cutoff, double-sided. ALPHA_BLEND -> BLEND, double-sided.
+  with the material's ksAlphaRef as cutoff; ALPHA_BLEND -> BLEND. Nothing is double-sided: AC
+  culls back faces and has no double-sided materials, so content that should be seen from both
+  sides carries its own back triangles (e.g. tree cards). Forcing doubleSided would make those
+  z-fight with their own mirrored copy. The viewer has --double-sided for debugging.
 - Hidden meshes (not visible / not renderable, or physics walls named like "1WALL_...") are kept
   but flagged `extras.hidden = true`; the viewer hides them unless asked to show collision.
 
@@ -39,7 +42,7 @@ from driftmaps.ac.kn5 import read_kn5
 from driftmaps.ac.model import BlendMode, Dummy, Kn5, Material, Mesh, SkinnedMesh
 
 # Bump when the GLB layout or the sidecar changes, so old caches are rebuilt.
-CONVERTER_VERSION = 2
+CONVERTER_VERSION = 3
 
 COLLISION_RE = re.compile(r"^\d+WALL", re.IGNORECASE)
 _AT_SHADER_RE = re.compile(r"(_AT(_|$)|AT$|tree|grass)", re.IGNORECASE)
@@ -200,7 +203,6 @@ def _material_json(mat: Material, texture_index: int | None) -> dict:
     out: dict = {"name": mat.name, "pbrMetallicRoughness": pbr}
     if mode != "OPAQUE":
         out["alphaMode"] = mode
-        out["doubleSided"] = True
     if mode == "MASK":
         ref = _prop(mat, "ksAlphaRef")
         out["alphaCutoff"] = float(ref) if ref and 0.0 < ref < 1.0 else 0.5
@@ -322,7 +324,12 @@ def kn5_to_glb(
             hidden = is_hidden_mesh(node) or not node.active
             if hidden:
                 stats.hidden_meshes += 1
-            entry["extras"] = {"hidden": hidden, "castShadows": bool(node.cast_shadows)}
+            extras = {"hidden": hidden, "castShadows": bool(node.cast_shadows)}
+            if node.lod_out > 0.0:
+                # AC draws the mesh only while the camera is lod_in..lod_out metres away.
+                extras["lodIn"] = float(node.lod_in)
+                extras["lodOut"] = float(node.lod_out)
+            entry["extras"] = extras
         nodes.append(entry)
         return len(nodes) - 1
 
