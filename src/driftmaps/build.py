@@ -1363,6 +1363,23 @@ def _network(
                 (min(a, b), max(a, b)) for a, b in zip(cont.nodes[:-1], cont.nodes[1:], strict=True)
             }
     highway = [route.ways.get(int(w), {}).get("highway", "") for w in geo.way_id.tolist()]
+    # The real run-up and run-off can be on other roads: their class from the nearest way.
+    m = geo.model
+    beyond = np.flatnonzero((m.s < geo.s_a) | (m.s > geo.s_b))
+    if len(beyond) and ways:
+        dense = [
+            (
+                np.asarray(shapely.segmentize(shapely.LineString(w.xz), 2.0).coords),
+                w.tags["highway"],
+            )
+            for w in ways
+            if w.tags.get("highway") and len(w.xz) >= 2
+        ]
+        pts = np.concatenate([d for d, _ in dense])
+        cls = [c for d, c in dense for _ in d]
+        _, k = cKDTree(pts).query(m.centre[beyond][:, [0, 2]])
+        for i, kk in zip(beyond.tolist(), k.tolist(), strict=True):
+            highway[i] = cls[kk]
     nopt = dataclasses.replace(
         options.network_options,
         source_resolution_m=geo.elevation.resolution_m(),

@@ -189,8 +189,10 @@ class TerrainExtra:
     stations: np.ndarray = field(default_factory=lambda: np.zeros((0, 3)))
     outer: np.ndarray = field(default_factory=lambda: np.zeros(0))
     hidden: np.ndarray | None = None
-    fine_m: float = 12.0
+    fine_m: float = 8.0
     fine_cell_m: float = 2.0
+    ring_m: float = 0.6  # extra points this far outside the network near the route ...
+    ring_reach_m: float = 8.0  # ... where they are within this of the route's footprint
 
 
 def _route_segments(model: RoadModel, extra: TerrainExtra | None) -> np.ndarray:
@@ -331,6 +333,19 @@ def _network_grid(
         ok = ~shapely.dwithin(foot, shapely.points(q), options.edge_clearance_m)
         out_g.append(q[ok])
         out_d.append(np.maximum(fd[ok], 0.0))
+    # A ring of points just outside the network's outline where it meets the route (junction
+    # mouths, corners): the triangulation then follows those corners instead of bridging them
+    # with triangles that the hole test removes (leaving holes).
+    ring = shapely.segmentize(shapely.boundary(foot.buffer(extra.ring_m, quad_segs=4)), 1.0)
+    q = shapely.get_coordinates(ring)
+    if len(q):
+        d, i = tree.query(q)
+        fd = d - model.outer[i]
+        ok = (fd >= 0.5) & (fd <= extra.ring_reach_m)
+        q, fd = q[ok], fd[ok]
+        ok = ~shapely.dwithin(foot, shapely.points(q), 0.9 * extra.ring_m)
+        out_g.append(q[ok])
+        out_d.append(fd[ok])
     return out_g, out_d
 
 
@@ -434,7 +449,7 @@ def build_terrain(
     if extra is not None and not extra.footprint.is_empty:
         net = extra.footprint
         shapely.prepare(net)
-        net_inner = net.buffer(-0.02)
+        net_inner = net.buffer(-0.25)  # corners: keep triangles that only clip them
         shapely.prepare(net_inner)
         keep &= ~shapely.contains_xy(net, centroid[:, 0], centroid[:, 1])
         for p, q in ((a, b), (b, c), (c, a)):

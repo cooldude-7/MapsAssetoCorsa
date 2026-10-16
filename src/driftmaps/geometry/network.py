@@ -153,6 +153,9 @@ EDGE_LINE_INSET_M = 0.15
 CENTRE_LINE_WIDTH_M = 0.10
 CENTRE_GAP_M = 0.10  # between the two yellow lines
 
+NOTCH_FILL_M = 2.5  # wedges and notches about this narrow become gravel ...
+NOTCH_MAX_M2 = 40.0  # ... when no bigger than this
+POLY_SIMPLIFY_M = 0.04  # side road outlines (from 1 m stations) are simplified this much
 PIN_TAPER_M = 30.0  # a side road's pinned start blends into its own profile over this
 ROUTE_BLEND_M = 5.0  # mouths blend from the route's height to the side road's over this
 
@@ -509,9 +512,11 @@ def mesh_polygon(
     cell_m: float = 3.0,
     uv_tile_m: float = 4.0,
     lift: float = 0.0,
+    seg_m: float = 1.5,
 ) -> MeshData | None:
-    """The polygon(s) as an up-facing mesh on `height_fn` (+ `lift`), planar UVs."""
-    verts, tri = triangulate(geom, cell_m)
+    """The polygon(s) as an up-facing mesh on `height_fn` (+ `lift`), planar UVs; `seg_m`:
+    the longest boundary edge."""
+    verts, tri = triangulate(geom, cell_m, seg_m)
     if not len(tri):
         return None
     used = np.unique(tri)
@@ -539,14 +544,15 @@ def _face_up(pos: np.ndarray, tri: np.ndarray) -> np.ndarray:
     return tri.reshape(-1)
 
 
-def boundary_points(mesh: MeshData) -> np.ndarray:
-    """(K, 3) vertices on the mesh's open boundary (edges used by one triangle)."""
+def boundary_points(mesh: MeshData, spacing_m: float = 1.0) -> np.ndarray:
+    """(K, 3) points on the mesh's open boundary (edges used by one triangle): its vertices
+    and points every `spacing_m` along longer edges (on the edge, so a terrain joined to them
+    has no crack, and dense enough for its triangulation to follow the outline)."""
     tri = mesh.triangles
     if not len(tri):
         return np.zeros((0, 3))
     e = np.concatenate([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]])
     pos = mesh.positions
-    # Weld by position: separate meshes / seams duplicate vertices.
     key = np.round(pos[:, [0, 2]] / 1e-5).astype(np.int64)
     _, vid = np.unique(key, axis=0, return_inverse=True)
     vid = vid.reshape(-1)
@@ -557,7 +563,14 @@ def boundary_points(mesh: MeshData) -> np.ndarray:
         return np.zeros((0, 3))
     first = np.zeros(vid.max() + 1, np.int64)
     first[vid[::-1]] = np.arange(len(vid))[::-1]
-    return pos[first[np.unique(open_edges)]]
+    a, b = pos[first[open_edges[:, 0]]], pos[first[open_edges[:, 1]]]
+    n = np.maximum(1, np.ceil(np.linalg.norm((b - a)[:, [0, 2]], axis=1) / spacing_m)).astype(int)
+    seg = np.repeat(np.arange(len(a)), n - 1)
+    t = (np.arange((n - 1).sum()) - np.repeat(np.cumsum(n - 1) - (n - 1), n - 1) + 1) / np.repeat(
+        n, n - 1
+    )
+    mids = a[seg] + t[:, None] * (b - a)[seg]
+    return np.concatenate([pos[first[np.unique(open_edges)]], mids])
 
 
 # --------------------------------------------------------------------------------------------
@@ -742,10 +755,12 @@ class RoadNetwork:
     driveways: list = field(default_factory=list)
 
     def corridor(self, verge_m: float) -> shapely.Geometry:
-        """The network's share of the hidden-wall corridor."""
+        """The network's share of the hidden-wall corridor (simplified to 0.25 m: the paved
+        area's outline has a vertex every metre, which the walls do not need)."""
         if self.paved.is_empty:
             return shapely.Polygon()
-        return shapely.buffer(self.paved, verge_m, quad_segs=4)
+        grown = shapely.buffer(self.paved, verge_m, quad_segs=4)
+        return shapely.simplify(grown, 0.25).buffer(0)
 
     def centre_points(self) -> np.ndarray:
         """(K, 3) side road centreline points (for nearest-road heights)."""
@@ -1243,7 +1258,8 @@ def build_network(
         m = sr.model
         le, ri = road_columns(m, m.half_width), road_columns(m, -m.half_width)
         edges.append((le, ri))
-        poly = footprint_polygon(le, ri)
+        # Simplified (4 cm): built from 1 m quads, the outline has a vertex every metre.
+        poly = footprint_polygon(le, ri).simplify(POLY_SIMPLIFY_M)
         if sr.end[0] == "end" and options.turning_circles:
             bulb = _bulb(sr, turning, nodes_known)
             if bulb is not None:
@@ -1256,11 +1272,30 @@ def build_network(
         if sr.shoulder > 0:
             lo, ro = road_columns(m, m.outer), road_columns(m, -m.outer)
             sh = _union([footprint_polygon(lo, le), footprint_polygon(ri, ro)])
+            # Grown into the carriageway, then cut by it: the two share one edge exactly.
+            sh = _union([sh.simplify(POLY_SIMPLIFY_M), poly.buffer(0.06)]).difference(poly)
             if sr.end[0] == "end":
                 sh = _union([sh, poly.buffer(sr.shoulder, quad_segs=6).difference(poly)])
             shoulders.append(sh)
         else:
             shoulders.append(shapely.Polygon())
+
+    # A side road leaving the route carries on straight back through its node onto the route:
+    # where the route's smoothed line cuts a corner (it turns off a road that goes on), the
+    # node lies off the route's ribbon and the road it turned off would stop short of it.
+    for sr in sides:
+        for end, (kind, _) in (("start", sr.start), ("end", sr.end)):
+            if kind != "route":
+                continue
+            m = sr.model
+            p = m.centre[0 if end == "start" else -1, [0, 2]]
+            d = m.forward[0 if end == "start" else -1, [0, 2]] * (1.0 if end == "start" else -1.0)
+            d = d / max(np.linalg.norm(d), 1e-9)
+            dist, i = route_tree.query(p)
+            reach = float(dist + 1.0)  # to just past the route's centre line
+            hw = float(m.half_width[0 if end == "start" else -1])
+            ext = shapely.LineString([p - d * reach, p]).buffer(hw, cap_style="flat")
+            carriage[sr.index] = _union([carriage[sr.index], ext])
 
     # ---- Junctions ----------------------------------------------------------------------
     by_node: dict[int, list[tuple[int, str]]] = defaultdict(list)
@@ -1300,12 +1335,18 @@ def build_network(
             continue
         closed = u.buffer(j.radius, quad_segs=12).buffer(-j.radius, quad_segs=12)
         fill = closed.difference(u).intersection(disc)
+        legs = _legs(j, sides, carriage, model, route_highway, route_oneway, asphalt_q, hidden_seg)
+        outside = _outside_sector(legs)  # the through road's far side: no curb return there
         keep = [
             p
             for p in _polygons(fill, 0.05)
             if any(p.distance(q) < 0.05 for q in parts if not q.is_empty)
+            and not (outside is not None and _in_sector(p.centroid.coords[0], j.xz, outside))
         ]
         j.fillets = _union(keep)
+        sh = max([sides[k].shoulder for k, _ in j.legs] + [0.0])
+        if sh > 0 and not j.fillets.is_empty:  # gravel round the corner, like the roads
+            shoulders.append(j.fillets.buffer(sh, quad_segs=8).difference(u))
     net.junctions = junctions
 
     # ---- Roundabouts ----------------------------------------------------------------------
@@ -1387,6 +1428,20 @@ def build_network(
     gravel_road = unpaved.difference(paved_hard).intersection(paved_all)
     asphalt = paved_all.difference(gravel_road)
     shoulder_all = _union(shoulders).difference(_union([paved_all, blockers]))
+    # Acute notches where the network meets the route (or itself) are filled with gravel: the
+    # terrain's triangulation cannot follow a boundary into a sliver that thin.
+    route_foot_near = _union(
+        list(asphalt_q[near_idx]) + list(sh_left_q[near_idx]) + list(sh_right_q[near_idx])
+    )
+    whole = _union([route_foot_near, paved_all, shoulder_all, islands_all])
+    notch = whole.buffer(NOTCH_FILL_M, quad_segs=4).buffer(-NOTCH_FILL_M, quad_segs=4)
+    network_area = _union([paved_all, shoulder_all])
+    fill = [
+        p
+        for p in _polygons(notch.difference(whole), 0.02)
+        if p.area <= NOTCH_MAX_M2 and p.distance(network_area) < 0.01
+    ]
+    shoulder_all = _union([shoulder_all, *fill])
     net.paved = _union([paved_all, islands_all])
     net.islands = islands
     net.polygons = {
@@ -1398,9 +1453,18 @@ def build_network(
     batch = Batcher(options.batch_m)
     meshes: list[MeshData] = []
 
-    def add(key: str, geom: shapely.Geometry, lift: float = 0.0, tile: float = 4.0) -> None:
+    def add(
+        key: str,
+        geom: shapely.Geometry,
+        lift: float = 0.0,
+        tile: float = 4.0,
+        cell: float | None = None,
+        seg: float = 1.5,
+    ) -> None:
         for poly in _polygons(geom, 0.01):
-            mesh = mesh_polygon(poly, height, cell_m=options.cell_m, uv_tile_m=tile, lift=lift)
+            mesh = mesh_polygon(
+                poly, height, cell_m=cell or options.cell_m, uv_tile_m=tile, lift=lift, seg_m=seg
+            )
             if mesh is not None:
                 batch.add(key, mesh)
                 if lift == 0.0:
@@ -1408,7 +1472,7 @@ def build_network(
 
     add("asphalt", asphalt)
     add("gravel", gravel_road, tile=2.0)
-    add("gravel", shoulder_all, tile=2.0)
+    add("gravel", shoulder_all, tile=2.0, cell=6.0, seg=4.0)  # thin strips: few vertices
     for p in rb_parts:
         for key, mesh in p.meshes:
             batch.add(key, mesh)
@@ -1612,6 +1676,29 @@ def _through(legs: Sequence[_Leg]) -> tuple[int, int] | None:
             if best is None or key > best[0]:
                 best = (key, (a, b))
     return None if best is None else best[1]
+
+
+def _outside_sector(legs: Sequence[_Leg]) -> tuple[float, float] | None:
+    """(start, end) angles of the sector between the two through legs that holds no other
+    leg (the outside of the through road), or None (no through road, or other legs on both
+    sides as at a crossroads)."""
+    through = _through(legs)
+    if through is None:
+        return None
+    ang = [math.atan2(lg.direction[1], lg.direction[0]) for lg in legs]
+    a, b = (ang[n] for n in through)
+    others = [ang[n] for n in range(len(legs)) if n not in through]
+    for lo, hi in ((a, b), (b, a)):
+        span = (hi - lo) % (2 * math.pi)
+        if not any(0.0 < (o - lo) % (2 * math.pi) < span for o in others):
+            return (lo, hi)
+    return None
+
+
+def _in_sector(p, centre: np.ndarray, sector: tuple[float, float]) -> bool:
+    lo, hi = sector
+    t = math.atan2(p[1] - centre[1], p[0] - centre[0])
+    return 0.0 < (t - lo) % (2 * math.pi) < (hi - lo) % (2 * math.pi)
 
 
 def _lane_quad(m: RoadModel, s: float, lo: float, hi: float, width: float) -> shapely.Geometry:
@@ -1938,7 +2025,7 @@ DRIVEWAY_FLARE_M = 3.0
 DRIVEWAY_PERPENDICULAR_M = 15.0
 DRIVEWAY_MAX_M = 150.0
 DRIVEWAY_MIN_M = 3.0
-DRIVEWAY_LIFT_M = 0.05  # above the terrain (draped, the terrain has no hole for them)
+DRIVEWAY_LIFT_M = 0.06  # above the terrain (draped on a 3 m grid; the terrain has no hole)
 DRIVEWAY_SHOULDER_LIFT_M = 0.015  # above a road shoulder it lies on
 DRIVEWAY_JUNCTION_CLEAR_M = 15.0  # no inferred driveway mouth this close to a junction
 DRIVEWAY_SERVED_M = 12.0  # a house with a driveway this close already has one
@@ -2176,7 +2263,7 @@ def build_driveways(
             continue
         d.polygon = poly
         res.driveways.append(d)
-        mesh = mesh_polygon(poly, height, cell_m=2.0, uv_tile_m=2.0 if d.rural else 4.0)
+        mesh = mesh_polygon(poly, height, cell_m=3.0, uv_tile_m=2.0 if d.rural else 4.0, seg_m=3.0)
         batch.add("gravel" if d.rural else "asphalt", mesh)
         if d.road == -1:
             near_seg = seg_tree.query_ball_point(d.mouth, 25.0)
