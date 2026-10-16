@@ -27,6 +27,7 @@ and extrudes. Attribution lines for LICENSE-DATA.txt come back in `BuildingFootp
 from __future__ import annotations
 
 import csv
+import dataclasses
 import gzip
 import hashlib
 import io
@@ -61,8 +62,10 @@ __all__ = [
     "MS_LINKS_URL",
     "MS_ZOOM",
     "BuildingFootprints",
+    "ConflationReport",
     "Footprint",
     "build_buildings_query",
+    "conflate",
     "fetch_buildings",
     "fetch_ms_buildings",
     "fetch_osm_buildings",
@@ -72,7 +75,9 @@ __all__ = [
     "parse_ms_features",
     "quadkey",
     "quadkeys_for_bbox",
+    "regularize",
     "route_boxes",
+    "within_route",
 ]
 
 log = logging.getLogger(__name__)
@@ -96,16 +101,30 @@ StreamOpener = Callable[[str], IO[bytes]]
 class Footprint:
     """One building outline: `lonlat` (N, 2) is the closed exterior ring (first == last).
 
-    `id` is "osm:w<id>", "osm:r<id>.<k>" (k-th outer ring of a relation) or "ms:<quadkey>:<n>".
-    `tags` are the OSM tags (empty for Microsoft); `ms_height_m` the Microsoft ML height
-    (None when unknown). Holes (courtyards) are not kept: the building is drawn solid.
+    `id` is "osm:w<id>", "osm:r<id>.<k>" (k-th outer ring of a relation), "ms:<quadkey>:<n>",
+    "nrcan:<fid>" or "<municipality>:<objectid>[.<k>]" (`geo.building_sources`).
+    `tags` are the OSM tags (empty for Microsoft; a `building` value for municipal types);
+    `ms_height_m` the Microsoft ML height (None when unknown; the MEAN height over the
+    footprint, so about mid-roof). Holes (courtyards) are not kept: the building is drawn solid.
+
+    Measured heights above ground, when a source has them: `peak_m` (roof peak: municipal
+    PEAKHGT, NRCan `heightmax`), `eave_m` (municipal EAVEHGT), `low_m` (NRCan `heightmin`, the
+    lowest lidar building point). `year` is when the outline was captured (lidar / photo
+    year), `lidar` True for a lidar-derived outline (NRCan). `also` lists the ids of the other
+    sources' footprints that `conflate` matched to this one (same building).
     """
 
     id: str
-    source: str  # "osm" | "microsoft"
+    source: str  # "osm" | "microsoft" | "nrcan" | a municipality ("burlington", ...)
     lonlat: np.ndarray = field(repr=False)
     tags: Mapping[str, str] = field(default_factory=dict)
     ms_height_m: float | None = None
+    peak_m: float | None = None
+    eave_m: float | None = None
+    low_m: float | None = None
+    year: int | None = None
+    lidar: bool = False
+    also: tuple[str, ...] = ()
 
     @property
     def kind(self) -> str:
@@ -134,23 +153,60 @@ class Footprint:
 
 @dataclass
 class BuildingFootprints:
-    """What `fetch_buildings` found: the merged footprints and where they came from."""
+    """What the footprint sources gave: the merged footprints and where they came from.
+
+    `found` counts the fetched footprints per source, `report` is the conflation's
+    (`ConflationReport`), `osm` every OSM footprint fetched (listed in route_osm.geojson)."""
 
     footprints: list[Footprint]
     osm_count: int = 0
     ms_count: int = 0  # Microsoft footprints added by the merge
     osm_base: str | None = None
     notes: list[str] = field(default_factory=list)
+    found: dict[str, int] = field(default_factory=dict)
+    report: ConflationReport | None = None
+    osm: list[Footprint] | None = None
 
     @property
     def attributions(self) -> list[str]:
         """LICENSE-DATA.txt lines for the sources that contributed footprints."""
-        out = []
-        if self.osm_count:
-            out.append(OSM_BUILDINGS_ATTRIBUTION)
-        if self.ms_count:
-            out.append(MS_ATTRIBUTION)
-        return out
+        return self.attributions_for(None)
+
+    def attributions_for(self, ids: set[str] | None) -> list[str]:
+        """LICENSE-DATA.txt lines for the sources of the footprints with these ids (all when
+        None): their geometry's source and every source merged into them (`also`)."""
+        used: list[str] = []
+        for f in self.footprints:
+            if ids is not None and f.id not in ids:
+                continue
+            for sid in (f.id, *f.also):
+                src = _source_of(sid)
+                if src not in used:
+                    used.append(src)
+        if ids is None and not self.footprints:
+            used = (["osm"] if self.osm_count else []) + (["microsoft"] if self.ms_count else [])
+        return [line for s in _ATTRIBUTION_ORDER if s in used and (line := _attribution(s))]
+
+
+_ATTRIBUTION_ORDER = ("osm", "burlington", "milton", "oakville", "nrcan", "microsoft")
+
+
+def _source_of(footprint_id: str) -> str:
+    head = footprint_id.split(":", 1)[0]
+    return "microsoft" if head == "ms" else head
+
+
+def _attribution(source: str) -> str | None:
+    if source == "osm":
+        return OSM_BUILDINGS_ATTRIBUTION
+    if source == "microsoft":
+        return MS_ATTRIBUTION
+    from driftmaps.geo import building_sources as bsrc  # no import cycle at module load
+
+    if source == "nrcan":
+        return bsrc.NRCAN_ATTRIBUTION
+    muni = bsrc.MUNICIPAL_SOURCES.get(source)
+    return muni.attribution if muni is not None else None
 
 
 # --------------------------------------------------------------------------------------------
@@ -525,9 +581,10 @@ def merge_footprints(
     return out
 
 
-def _within_route(
+def within_route(
     footprints: Sequence[Footprint], route_lonlat: np.ndarray, around_m: float
 ) -> list[Footprint]:
+    """The footprints within `around_m` of the (N, 2) lon/lat route line."""
     if not footprints:
         return []
     proj = LocalProjection(float(route_lonlat[0, 1]), float(route_lonlat[0, 0]))
@@ -566,7 +623,7 @@ def fetch_buildings(
         offline=offline,
         **post_kwargs,
     )
-    osm = _within_route(osm, ll, around_m)
+    osm = within_route(osm, ll, around_m)
     result = BuildingFootprints(list(osm), osm_count=len(osm), osm_base=osm_base)
     if not microsoft:
         return result
@@ -587,8 +644,450 @@ def fetch_buildings(
         log.warning(msg)
         result.notes.append(msg)
         return result
-    ms = _within_route(ms, ll, around_m)
+    ms = within_route(ms, ll, around_m)
     merged = merge_footprints(osm, ms, max_overlap)
     result.footprints = merged
     result.ms_count = len(merged) - len(osm)
     return result
+
+
+# --------------------------------------------------------------------------------------------
+# Outline regularisation (lidar footprints)
+# --------------------------------------------------------------------------------------------
+
+
+def _line_cross(e0: tuple, e1: tuple) -> np.ndarray | None:
+    """Intersection of two edge lines ("h" y=v, "v" x=v, "o" through a and b), or None."""
+
+    def pd(e: tuple) -> tuple[np.ndarray, np.ndarray]:
+        kind, v, _, a, b = e
+        if kind == "h":
+            return np.array([0.0, v]), np.array([1.0, 0.0])
+        if kind == "v":
+            return np.array([v, 0.0]), np.array([0.0, 1.0])
+        return a, b - a
+
+    p0, d0 = pd(e0)
+    p1, d1 = pd(e1)
+    den = d0[0] * d1[1] - d0[1] * d1[0]
+    if abs(den) < 1e-9 * (np.linalg.norm(d0) * np.linalg.norm(d1) + 1e-12):
+        return None
+    w = p1 - p0
+    t = (w[0] * d1[1] - w[1] * d1[0]) / den
+    return p0 + t * d0
+
+
+def _orthogonal_ring(ring: np.ndarray, snap_deg: float, min_edge: float) -> np.ndarray | None:
+    """Edges of an open ring (in the building's own frame, dominant axis = x) within
+    `snap_deg` of x or y made exactly axis-parallel; consecutive parallel edges merged (length
+    weighted), edges shorter than `min_edge` dropped; vertices = consecutive edge crossings."""
+    edges: list[tuple] = []
+    n = len(ring)
+    for i in range(n):
+        a, b = ring[i], ring[(i + 1) % n]
+        d = b - a
+        length = float(np.hypot(*d))
+        if length < 1e-9:
+            continue
+        ang = abs(math.degrees(math.atan2(d[1], d[0]))) % 180.0
+        if ang <= snap_deg or ang >= 180.0 - snap_deg:
+            edges.append(("h", 0.5 * (a[1] + b[1]), length, a, b))
+        elif abs(ang - 90.0) <= snap_deg:
+            edges.append(("v", 0.5 * (a[0] + b[0]), length, a, b))
+        else:
+            edges.append(("o", 0.0, length, a, b))
+    changed = True
+    while changed and len(edges) > 3:
+        changed = False
+        for i in range(len(edges)):
+            j = (i + 1) % len(edges)
+            ki, kj = edges[i][0], edges[j][0]
+            if ki == kj and ki in "hv":
+                li, lj = edges[i][2], edges[j][2]
+                v = (edges[i][1] * li + edges[j][1] * lj) / (li + lj)
+                merged = (ki, v, li + lj, edges[i][3], edges[j][4])
+                if j == 0:
+                    edges = [merged, *edges[1:i]]
+                else:
+                    edges[i] = merged
+                    del edges[j]
+                changed = True
+                break
+        if changed:
+            continue
+        k = min(range(len(edges)), key=lambda q: edges[q][2])
+        if edges[k][2] < min_edge and len(edges) > 4:
+            del edges[k]
+            changed = True
+    if len(edges) < 3:
+        return None
+    pts = []
+    for i in range(len(edges)):
+        p = _line_cross(edges[i - 1], edges[i])
+        pts.append(edges[i][3] if p is None else p)
+    return np.asarray(pts)
+
+
+def regularize(
+    poly: shapely.Polygon,
+    *,
+    tolerance_m: float = 0.6,
+    snap_deg: float = 15.0,
+    min_edge_m: float = 1.0,
+    rect_min: float = 0.85,
+) -> shapely.Polygon:
+    """A cleaner outline for a lidar (stair-stepped) footprint, in metres (research §4):
+    Douglas-Peucker at `tolerance_m`; if it then fills >= `rect_min` of its minimum rotated
+    rectangle, that rectangle scaled to the same area; else edges within `snap_deg` of the
+    rectangle's axes snapped to them, collinear runs merged, edges < `min_edge_m` dropped.
+    The input comes back unchanged when a step would distort it (area off by > 20 % or
+    IoU < 0.75)."""
+    if poly.is_empty or not isinstance(poly, shapely.Polygon) or poly.area <= 0:
+        return poly
+    base = shapely.Polygon(poly.exterior)
+    simple = base.simplify(tolerance_m, preserve_topology=True)
+    if not isinstance(simple, shapely.Polygon) or simple.is_empty or not simple.is_valid:
+        simple = base
+
+    def ok(cand: shapely.Geometry) -> bool:
+        if not isinstance(cand, shapely.Polygon) or cand.is_empty or not cand.is_valid:
+            return False
+        if abs(cand.area / base.area - 1.0) > 0.2:
+            return False
+        inter = cand.intersection(base).area
+        return inter / (cand.area + base.area - inter) >= 0.75
+
+    rect = shapely.oriented_envelope(simple)
+    if not isinstance(rect, shapely.Polygon) or rect.area <= 0:
+        return simple if ok(simple) else base
+    c = np.asarray(rect.exterior.coords)[:4]
+    if simple.area / rect.area >= rect_min:
+        centre = c.mean(axis=0)
+        k = math.sqrt(base.area / rect.area)
+        cand = shapely.Polygon(centre + (c - centre) * k)
+        if ok(cand):
+            return cand
+    e0 = c[1] - c[0] if np.hypot(*(c[1] - c[0])) >= np.hypot(*(c[2] - c[1])) else c[2] - c[1]
+    theta = math.atan2(e0[1], e0[0])
+    cs, sn = math.cos(theta), math.sin(theta)
+    rot = np.array([[cs, -sn], [sn, cs]])  # local -> world
+    ring = np.asarray(simple.exterior.coords)[:-1]
+    origin = ring.mean(axis=0)
+    local = (ring - origin) @ rot
+    out = _orthogonal_ring(local, snap_deg, min_edge_m)
+    if out is not None and len(out) >= 3:
+        cand = shapely.Polygon(out @ rot.T + origin)
+        if ok(cand):
+            return cand
+    return simple if ok(simple) else base
+
+
+# --------------------------------------------------------------------------------------------
+# Conflation: one building per real building, from several sources (research §4)
+# --------------------------------------------------------------------------------------------
+
+
+@dataclass
+class ConflationReport:
+    """What `conflate` did. `kept` counts the result's geometries per source."""
+
+    kept: dict[str, int] = field(default_factory=dict)
+    matched: int = 0  # lower-priority footprints merged into a kept one (IoU >= iou_same)
+    overlapping: int = 0  # dropped: overlap >= overlap_drop of either footprint
+    cut: int = 0  # lidar footprints added after cutting the kept ones out of them
+    unconfirmed: int = 0  # new lower-priority footprints the lidar does not confirm
+    small: int = 0  # dropped: < min_area_m2 (after cutting)
+    demolished: list[str] = field(default_factory=list)  # dropped: lidar sees no building
+
+
+def _xz_polygon(fp: Footprint, projection: LocalProjection) -> shapely.Polygon | None:
+    e, n = projection.to_enu(fp.lonlat[:, 0], fp.lonlat[:, 1])
+    poly = shapely.Polygon(np.stack([e, -n], axis=1))
+    if not poly.is_valid:
+        poly = shapely.make_valid(poly)
+    parts = [p for p in shapely.get_parts(poly) if isinstance(p, shapely.Polygon) and p.area > 0]
+    if not parts:
+        return None
+    return shapely.Polygon(max(parts, key=lambda p: p.area).exterior)
+
+
+def _xz_to_lonlat(poly: shapely.Polygon, projection: LocalProjection) -> np.ndarray:
+    xz = np.asarray(poly.exterior.coords)
+    lon, lat = projection.to_lonlat(xz[:, 0], -xz[:, 1])
+    return np.stack([lon, lat], axis=1)
+
+
+def _lidar_medians(
+    polys: Sequence[shapely.Polygon], canopy: Callable[[np.ndarray], np.ndarray], erode_m: float
+) -> np.ndarray:
+    """Median DSM - DTM inside each polygon shrunk by `erode_m` (1 m lattice; half-metre on
+    the full polygon when that leaves too few points). NaN = no lidar."""
+    pts, owner = [], []
+    for k, p in enumerate(polys):
+        inner = p.buffer(-erode_m)
+        q = _lattice_pts(inner, 1.0)
+        if len(q) < 3:
+            q = _lattice_pts(p, 0.5)
+        pts.append(q)
+        owner.append(np.full(len(q), k))
+    out = np.full(len(polys), np.nan)
+    if not pts or not sum(len(q) for q in pts):
+        return out
+    allp = np.concatenate(pts)
+    own = np.concatenate(owner)
+    try:
+        h = np.asarray(canopy(allp), np.float64).reshape(-1)
+    except (OSError, RuntimeError, ValueError) as exc:
+        log.warning("lidar check of building footprints skipped: %s", exc)
+        return out
+    for k in range(len(polys)):
+        v = h[own == k]
+        v = v[np.isfinite(v)]
+        if v.size >= 3:
+            out[k] = float(np.median(v))
+    return out
+
+
+def _lattice_pts(poly: shapely.Geometry, step: float) -> np.ndarray:
+    if poly.is_empty:
+        return np.zeros((0, 2))
+    x0, z0, x1, z1 = poly.bounds
+    xs = np.arange(x0 + step / 2, x1, step)
+    zs = np.arange(z0 + step / 2, z1, step)
+    if len(xs) == 0 or len(zs) == 0:
+        return np.zeros((0, 2))
+    gx, gz = np.meshgrid(xs, zs)
+    p = np.stack([gx.ravel(), gz.ravel()], axis=1)
+    return p[shapely.contains_xy(poly, p[:, 0], p[:, 1])]
+
+
+def _merge_attrs(keep: Footprint, other: Footprint) -> Footprint:
+    """`keep` with what `other` (the same building, another source) adds: lidar heights,
+    OSM tags (a more specific `building` value), the Microsoft height."""
+    tags = dict(keep.tags)
+    if other.tags:
+        for k, v in other.tags.items():
+            if k == "building":
+                if tags.get("building", "yes") == "yes" and v not in ("yes", ""):
+                    tags["building"] = v
+            elif k not in tags:
+                tags[k] = v
+    return dataclasses.replace(
+        keep,
+        tags=tags,
+        peak_m=keep.peak_m if keep.peak_m is not None else other.peak_m,
+        eave_m=keep.eave_m if keep.eave_m is not None else other.eave_m,
+        low_m=keep.low_m if keep.low_m is not None else other.low_m,
+        ms_height_m=keep.ms_height_m if keep.ms_height_m is not None else other.ms_height_m,
+        year=keep.year if keep.year is not None else other.year,
+        also=(*keep.also, other.id, *other.also),
+    )
+
+
+def conflate(
+    tiers: Sequence[Sequence[Footprint]],
+    projection: LocalProjection,
+    canopy: Callable[[np.ndarray], np.ndarray] | None = None,
+    *,
+    iou_same: float = 0.5,
+    overlap_drop: float = 0.3,
+    new_max: float = 0.1,
+    min_area_m2: float = 10.0,
+    min_peak_m: float = 2.0,
+    min_lidar_m: float = 2.0,
+    demolished_max_m: float = 1.0,
+    regularize_lidar: bool = True,
+    survey_small_m2: float = 40.0,
+    survey_near_m: float = 250.0,
+) -> tuple[list[Footprint], ConflationReport]:
+    """One footprint per building from `tiers` (highest priority first, e.g. municipal, OSM,
+    NRCan lidar, Microsoft), by the research's rules (§4), in the build's metres
+    (`projection`; `canopy(xz)` = lidar DSM - DTM on AC XZ points, as `place_buildings` uses):
+
+    - The first non-empty tier is kept whole (near-duplicates inside it, IoU >= `iou_same`,
+      dropped).
+    - A lower-priority footprint with IoU >= `iou_same` against a kept one is the SAME
+      building: its attributes are merged in (`also` lists it), its geometry dropped.
+    - One overlapping a kept footprint by >= `overlap_drop` of either area is dropped.
+    - Otherwise it is NEW when its overlap with all kept ones is < `new_max` of its own area,
+      or (lidar footprints only) when the kept ones cut out of it leave >= `min_area_m2`.
+      New buildings need lidar confirmation: a lidar outline with peak >= `min_peak_m`, an
+      NRCan outline covering >= `overlap_drop` of it, or a DSM - DTM median >= `min_lidar_m`
+      (no lidar at all: accepted). Where the first tier is a full survey (municipal: it maps
+      sheds), a lidar-only outline < `survey_small_m2` within `survey_near_m` of it also
+      needs OSM or Microsoft to have it (lidar takes RVs, trailers and hedges for sheds).
+    - Lidar outlines are regularised (`regularize`) first.
+    - DEMOLISHED: a kept non-lidar footprint older than the lidar near it (`year`), with no
+      lidar outline on it and a DSM - DTM median (shrunk by 0.7 m) < `demolished_max_m`, is
+      dropped and listed in the report.
+
+    Returns the footprints (lon/lat; regularised or cut outlines converted back) sorted by id.
+    """
+    rep = ConflationReport()
+    tiers = [list(t) for t in tiers]
+    polys: list[list[shapely.Polygon | None]] = []
+    for tier in tiers:
+        row = []
+        for fp in tier:
+            p = _xz_polygon(fp, projection)
+            if p is not None and fp.lidar and regularize_lidar:
+                p = regularize(p)
+            row.append(p)
+        polys.append(row)
+    lidar_fps = [(fp, p) for t, row in zip(tiers, polys, strict=True)
+                 for fp, p in zip(t, row, strict=True) if fp.lidar and p is not None]  # fmt: skip
+    lidar_tree = shapely.STRtree([p for _, p in lidar_fps]) if lidar_fps else None
+    # The first tier when it is a full survey (municipal); the non-lidar lower tiers.
+    survey = [p for fp, p in zip(tiers[0], polys[0], strict=True) if p is not None and not fp.lidar]
+    survey_tree = shapely.STRtree(survey) if survey else None
+    other_fps = [
+        (fp, p)
+        for t, row in list(zip(tiers, polys, strict=True))[1:]
+        for fp, p in zip(t, row, strict=True)
+        if p is not None and not fp.lidar
+    ]
+    other_tree = shapely.STRtree([p for _, p in other_fps]) if other_fps else None
+
+    kept: list[Footprint] = []
+    kept_poly: list[shapely.Polygon] = []
+    changed_geom: set[int] = set()
+    needs_lidar: set[int] = set()  # new, unconfirmed: checked against the DSM at the end
+
+    base_tier = next((k for k, row in enumerate(polys) if any(p is not None for p in row)), 0)
+    for t_idx, (tier, row) in enumerate(zip(tiers, polys, strict=True)):
+        tier_start = len(kept)
+        tree = shapely.STRtree(kept_poly) if kept_poly else None
+        for fp, p in zip(tier, row, strict=True):
+            if p is None or p.area <= 0:
+                continue
+            area = p.area
+            hits = []  # (kept index, polygon, intersection area) against earlier tiers
+            if tree is not None:
+                for j in tree.query(p, predicate="intersects"):
+                    q = kept_poly[int(j)]
+                    inter = shapely.intersection(p, q).area
+                    if inter > 0:
+                        hits.append((int(j), q, inter))
+            # ... and against this tier's own earlier footprints (duplicates only)
+            for k in range(tier_start, len(kept)):
+                q = kept_poly[k]
+                if q.intersects(p):
+                    inter = shapely.intersection(p, q).area
+                    if inter / (area + q.area - inter) >= iou_same:
+                        hits.append((k, q, inter))
+            best = max(hits, key=lambda h: h[2] / (area + h[1].area - h[2]), default=None)
+            if best is not None and best[2] / (area + best[1].area - best[2]) >= iou_same:
+                kept[best[0]] = _merge_attrs(kept[best[0]], fp)
+                rep.matched += 1
+                continue
+            hits = [h for h in hits if h[0] < tier_start]
+            if t_idx <= base_tier or not hits:
+                geom = p
+            else:
+                covered = sum(h[2] for h in hits)
+                big = any(h[2] >= overlap_drop * min(area, h[1].area) for h in hits)
+                # A lidar blob over two kept pieces (a row, a house + garage) is dropped; one
+                # that just touches a small kept shed is the rest of a bigger building.
+                if big and not (fp.lidar and covered < overlap_drop * area):
+                    rep.overlapping += 1
+                    continue
+                if not fp.lidar:
+                    if covered >= new_max * area:
+                        rep.overlapping += 1
+                        continue
+                    geom = p
+                else:  # cut the kept outlines out (attached garages are not added twice)
+                    kept_here = shapely.union_all([h[1] for h in hits])
+                    cut = shapely.difference(p, kept_here.buffer(0.2, join_style="mitre"))
+                    cut = shapely.simplify(cut, 0.05)
+                    parts = [g for g in shapely.get_parts(cut) if isinstance(g, shapely.Polygon)]
+                    if not parts:
+                        rep.small += 1
+                        continue
+                    geom = shapely.Polygon(max(parts, key=lambda g: g.area).exterior)
+                    if geom.area < min_area_m2 or 2.0 * geom.area / geom.length < 1.2:
+                        rep.small += 1  # too small, or a sliver along a kept wall
+                        continue
+                    rep.cut += 1
+            if geom.area < min_area_m2:
+                rep.small += 1
+                continue
+            if t_idx > base_tier:
+                if fp.lidar:
+                    if fp.peak_m is not None and fp.peak_m < min_peak_m:
+                        rep.unconfirmed += 1
+                        continue
+                    # A small lidar-only object where a full survey (the base tier, e.g. a
+                    # municipal layer with sheds) found nothing: an RV, a trailer, a hedge, ...
+                    # unless OSM or Microsoft has it too.
+                    if (
+                        geom.area < survey_small_m2
+                        and survey_tree is not None
+                        and len(survey_tree.query(geom.buffer(survey_near_m)))
+                        and not _covered_by(geom, other_tree, other_fps, overlap_drop)
+                    ):
+                        rep.unconfirmed += 1
+                        continue
+                elif not _covered_by(geom, lidar_tree, lidar_fps, overlap_drop):
+                    needs_lidar.add(len(kept))
+            if geom is not p or (fp.lidar and regularize_lidar):
+                changed_geom.add(len(kept))
+            kept.append(fp)
+            kept_poly.append(geom)
+
+    # Demolished candidates: kept non-lidar outlines older than the lidar near them, with no
+    # lidar outline on them.
+    lidar_years = [(fp.year, p) for fp, p in lidar_fps if fp.year is not None]
+    year_tree = shapely.STRtree([p for _, p in lidar_years]) if lidar_years else None
+    demolish_chk: list[int] = []
+    if canopy is not None and year_tree is not None:
+        for k, (fp, p) in enumerate(zip(kept, kept_poly, strict=True)):
+            if fp.lidar or fp.year is None or k in needs_lidar:
+                continue
+            if _covered_by(p, lidar_tree, lidar_fps, 1e-6):
+                continue
+            j = int(year_tree.nearest(p))
+            near_year, near_p = lidar_years[j]
+            if near_year > fp.year and shapely.distance(p, near_p) < 500.0:
+                demolish_chk.append(k)
+    drop: set[int] = set()
+    new_chk = sorted(needs_lidar)
+    if canopy is not None and (demolish_chk or new_chk):
+        shrunk = []
+        for k in demolish_chk:
+            s = kept_poly[k].buffer(-0.7)
+            shrunk.append(s if s.area > 4.0 else kept_poly[k])
+        med = _lidar_medians([*shrunk, *[kept_poly[k] for k in new_chk]], canopy, 0.0)
+        for k, m in zip(demolish_chk, med[: len(demolish_chk)], strict=True):
+            if np.isfinite(m) and m < demolished_max_m:
+                drop.add(k)
+                rep.demolished.append(kept[k].id)
+        for k, m in zip(new_chk, med[len(demolish_chk) :], strict=True):
+            if np.isfinite(m) and m < min_lidar_m:
+                drop.add(k)
+                rep.unconfirmed += 1
+
+    out = []
+    for k, (fp, p) in enumerate(zip(kept, kept_poly, strict=True)):
+        if k in drop:
+            continue
+        if k in changed_geom:
+            fp = dataclasses.replace(fp, lonlat=_xz_to_lonlat(p, projection))
+        rep.kept[fp.source] = rep.kept.get(fp.source, 0) + 1
+        out.append(fp)
+    return sorted(out, key=lambda f: f.id), rep
+
+
+def _covered_by(
+    p: shapely.Polygon,
+    tree: shapely.STRtree | None,
+    items: Sequence[tuple[Footprint, shapely.Polygon]],
+    share: float,
+) -> bool:
+    """Whether the lidar outlines in `tree` cover >= `share` of `p`'s area."""
+    if tree is None:
+        return False
+    for j in tree.query(p, predicate="intersects"):
+        if shapely.intersection(p, items[int(j)][1]).area >= share * p.area:
+            return True
+    return False

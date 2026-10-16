@@ -171,6 +171,15 @@ def _latlon(text: str) -> tuple[float, float]:
     return lat, lon
 
 
+def _municipal(enabled: bool, burlington: bool) -> tuple[str, ...]:
+    """The municipal building layers to use (geo.building_sources.MUNICIPAL_SOURCES)."""
+    from driftmaps.geo.building_sources import MUNICIPAL_SOURCES
+
+    if not enabled:
+        return ()
+    return tuple(n for n in MUNICIPAL_SOURCES if burlington or n != "burlington")
+
+
 def _pins(start: str | None, end: str | None, via: list[str] | None) -> list[tuple[float, float]]:
     if not start or not end:
         raise typer.BadParameter("give --start and --end (or --route for build)")
@@ -267,7 +276,24 @@ def build(
     dds: bool = typer.Option(False, help="Embed DDS textures instead of PNG."),
     debug_png: bool = typer.Option(True, help="Write top-down debug images to <out>/debug."),
     trees: bool = typer.Option(True, help="Trees from the lidar canopy (NRCan, Canada only)."),
-    buildings: bool = typer.Option(True, help="Buildings from OSM + Microsoft footprints."),
+    buildings: bool = typer.Option(
+        True,
+        help="Buildings: municipal footprints, OSM, NRCan lidar footprints and heights, then "
+        "Microsoft ML footprints, merged into one building each.",
+    ),
+    nrcan_buildings: bool = typer.Option(
+        True, help="NRCan lidar building footprints and heights (Canada; OGL-Canada)."
+    ),
+    municipal_buildings: bool = typer.Option(
+        True,
+        help="Municipal building footprints where they exist (Burlington, Milton, Oakville).",
+    ),
+    burlington_buildings: bool = typer.Option(
+        True,
+        help="City of Burlington buildings (exact outlines, eave and peak heights). Its open "
+        "data terms are revocable and must travel with the track: LICENSE-DATA.txt carries "
+        "their URL. --no-burlington-buildings builds without them.",
+    ),
     guardrails: bool = typer.Option(
         True,
         help="Guardrails from guardrails.json and OSM, plus the automatic ones (bridges keep "
@@ -347,6 +373,8 @@ def build(
         force=force,
         trees=trees,
         buildings=buildings,
+        nrcan_buildings=nrcan_buildings,
+        municipal_buildings=_municipal(municipal_buildings, burlington_buildings),
         guardrails=guardrails,
         auto_guardrails=auto_guardrails,
         bridge_approach_rails=bridge_approach_rails,

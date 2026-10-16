@@ -20,8 +20,10 @@ Binds 127.0.0.1 only. Endpoints (all JSON; errors are `{"error": "<plain English
   `far_pin` (its request index) beside `error`.
 - `POST /api/profile {route_id}`: ground height every ~20 m along the route.
 - `POST /api/build {route_id, name, track_id, install, options, loop}` -> `{job_id}`;
-  `options` (all optional): `trees`, `buildings`, `guardrails` (OSM-mapped rails; false = no
-  rails at all), `auto_guardrails` (also where Ontario road rules call for one; default true),
+  `options` (all optional): `trees`, `buildings`, `burlington_buildings` (the City of
+  Burlington's building layer, under revocable terms; default true), `guardrails`
+  (OSM-mapped rails; false = no rails at all), `auto_guardrails` (also where Ontario road
+  rules call for one; default true),
   `scenery_density` (0..2);
   `GET /api/jobs/<job_id>`: one build at a time, the rest queued (see `jobs.py`). A loop route
   builds a circuit; `loop` is optional and, if sent, must match the route.
@@ -995,6 +997,7 @@ class App:
                 install=install,
                 trees=bool(opts.get("trees", True)),
                 buildings=bool(opts.get("buildings", True)),
+                burlington_buildings=bool(opts.get("burlington_buildings", True)),
                 guardrails=bool(opts.get("guardrails", True)),
                 auto_guardrails=bool(opts.get("auto_guardrails", True)),
                 scenery_density=density,
