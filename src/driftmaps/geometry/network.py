@@ -67,6 +67,7 @@ from driftmaps.geometry.road import (
     smooth_centreline,
 )
 from driftmaps.geometry.street_items import (
+    MAILBOX,
     SIGN_STOP,
     SIGN_YIELD,
     StreetItem,
@@ -155,7 +156,10 @@ CENTRE_GAP_M = 0.10  # between the two yellow lines
 PIN_TAPER_M = 30.0  # a side road's pinned start blends into its own profile over this
 ROUTE_BLEND_M = 5.0  # mouths blend from the route's height to the side road's over this
 
-TURNING_CIRCLE_RADIUS_M = 12.5  # cul-de-sac bulb (TAC / Halton residential: 12-15 m)
+# Cul-de-sac bulb curb radius: standards say 13-15 m (Hamilton RD-116.01, Richmond Hill C-15),
+# measured bulbs 9-14 m (median 11.7 m Brampton): 12 m, clamped 9-15 m (streetscape research).
+TURNING_CIRCLE_RADIUS_M = 12.0
+TURNING_LOOP_ISLAND_M = 5.0  # a turning loop's central island (R 4-6 m, ASSUMED)
 
 _ROAD_CLASSES = frozenset(
     "motorway trunk primary secondary tertiary unclassified residential living_street road "
@@ -279,6 +283,44 @@ class CentreLine:
         """Mask of the points within the bounding box + `reach`."""
         return np.all((p >= self.lo - reach) & (p <= self.hi + reach), axis=1)
 
+    def nearest(self, p: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """(foot points (M, 2) on the centreline, unit tangents (M, 2), distances (M,), half
+        widths there (M,)) of every point."""
+        p = np.asarray(p, np.float64).reshape(-1, 2)
+        _, i = self.tree.query(p)
+        a, t, d = self._segments(p, i)
+        n = len(self.xz)
+        b = np.minimum(a + 1, n - 1)
+        seg = self.xz[b] - self.xz[a]
+        foot = self.xz[a] + t[:, None] * seg
+        tan = seg / np.maximum(np.linalg.norm(seg, axis=1), 1e-9)[:, None]
+        hw = self.hw[a] + t * (self.hw[b] - self.hw[a])
+        return foot, tan, d, hw
+
+    def _segments(self, q: np.ndarray, i: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(segment start index, parameter, distance) of the nearest of the two segments next to
+        each point's nearest station `i`."""
+        n = len(self.xz)
+        best_d = np.full(len(q), np.inf)
+        best_t = np.zeros(len(q))
+        best_a = i.copy()
+        for a in (np.maximum(i - 1, 0), i):
+            b = np.minimum(a + 1, n - 1)
+            seg = self.xz[b] - self.xz[a]
+            ll = np.einsum("ij,ij->i", seg, seg)
+            t = np.where(
+                ll > 1e-12,
+                np.einsum("ij,ij->i", q - self.xz[a], seg) / np.maximum(ll, 1e-12),
+                0.0,
+            )
+            t = np.clip(t, 0.0, 1.0)
+            d = np.linalg.norm(self.xz[a] + t[:, None] * seg - q, axis=1)
+            better = d < best_d
+            best_d = np.where(better, d, best_d)
+            best_t = np.where(better, t, best_t)
+            best_a = np.where(better, a, best_a)
+        return best_a, best_t, best_d
+
     def project(self, p: np.ndarray, reach: float = np.inf) -> tuple[np.ndarray, np.ndarray]:
         """(distance beyond the asphalt edge (0 inside), height) of every point; inf / NaN for
         points further than `reach` from the centreline."""
@@ -296,24 +338,8 @@ class CentreLine:
         if not ok.any():
             return d_out, h_out
         q, i, sel = q[ok], i[ok], sel[ok]
-        n = len(self.xz)
-        best_d = np.full(len(q), np.inf)
-        best_t = np.zeros(len(q))
-        best_a = i.copy()
-        for a in (np.maximum(i - 1, 0), i):
-            b = np.minimum(a + 1, n - 1)
-            seg = self.xz[b] - self.xz[a]
-            ll = np.einsum("ij,ij->i", seg, seg)
-            t = np.where(
-                ll > 1e-12, np.einsum("ij,ij->i", q - self.xz[a], seg) / np.maximum(ll, 1e-12), 0.0
-            )
-            t = np.clip(t, 0.0, 1.0)
-            d = np.linalg.norm(self.xz[a] + t[:, None] * seg - q, axis=1)
-            better = d < best_d
-            best_d = np.where(better, d, best_d)
-            best_t = np.where(better, t, best_t)
-            best_a = np.where(better, a, best_a)
-        b = np.minimum(best_a + 1, n - 1)
+        best_a, best_t, best_d = self._segments(q, i)
+        b = np.minimum(best_a + 1, len(self.xz) - 1)
         h = self.y[best_a] + best_t * (self.y[b] - self.y[best_a])
         hw = self.hw[best_a] + best_t * (self.hw[b] - self.hw[best_a])
         d_out[sel] = np.maximum(best_d - hw, 0.0)
@@ -707,6 +733,13 @@ class RoadNetwork:
     height: HeightField | None = None
     polygons: dict[str, shapely.Geometry] = field(default_factory=dict)  # for debug images
     stats: dict[str, object] = field(default_factory=dict)
+    # For the driveway stage (after buildings): carriageways, the route's asphalt edges and
+    # outer edges (N, 3), junction nodes, OSM driveway ways, the driveways built.
+    carriage: list[shapely.Geometry] = field(default_factory=list, repr=False)
+    route_columns: tuple[np.ndarray, ...] = field(default=(), repr=False)
+    junction_xz: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)), repr=False)
+    driveway_ways: list[NetWay] = field(default_factory=list, repr=False)
+    driveways: list = field(default_factory=list)
 
     def corridor(self, verge_m: float) -> shapely.Geometry:
         """The network's share of the hidden-wall corridor."""
@@ -1204,6 +1237,7 @@ def build_network(
 
     carriage: list[shapely.Geometry] = []
     shoulders: list[shapely.Geometry] = []
+    loop_islands: list[shapely.Geometry] = []  # turning loops' central islands
     edges: list[tuple[np.ndarray, np.ndarray]] = []
     for sr in sides:
         m = sr.model
@@ -1214,6 +1248,10 @@ def build_network(
             bulb = _bulb(sr, turning, nodes_known)
             if bulb is not None:
                 poly = _union([poly, bulb])
+                tc = turning.get(sr.end[1])
+                if tc is not None and tc.tags.get("highway") == "turning_loop":
+                    end = sr.model.centre[-1, [0, 2]]
+                    loop_islands.append(shapely.Point(end).buffer(TURNING_LOOP_ISLAND_M, 16))
         carriage.append(poly)
         if sr.shoulder > 0:
             lo, ro = road_columns(m, m.outer), road_columns(m, -m.outer)
@@ -1288,7 +1326,7 @@ def build_network(
     ]
 
     # ---- What replaces the route's shoulders and lines ------------------------------------
-    islands = [isl for p in rb_parts for isl, _ in p.islands]
+    islands = [isl for p in rb_parts for isl, _ in p.islands] + loop_islands
     islands_all = _union(islands)
     paved_raw = _union(
         [*carriage, *(j.fillets for j in junctions), *(p.pavement for p in rb_parts)]
@@ -1375,6 +1413,10 @@ def build_network(
         for key, mesh in p.meshes:
             batch.add(key, mesh)
             meshes.append(mesh)
+    for isl in loop_islands:
+        for key, mesh in rbm.island_meshes(isl, height, options.cell_m):
+            batch.add(key, mesh)
+            meshes.append(mesh)
 
     # ---- Junction control, stop bars, lines -------------------------------------------------
     controls = [
@@ -1403,6 +1445,26 @@ def build_network(
             driving_side,
             options,
         )
+    others_for_lines = _union(
+        [
+            route_kept,
+            route_sh_kept,
+            *(j.fillets for j in junctions),
+            islands_all,
+            *(p.pavement for p in rb_parts),
+        ]
+    ).buffer(0.3)
+    shapely.prepare(others_for_lines)
+    for j in junctions:  # the through road's centre line carries on across the junction
+        legs = _legs(j, sides, carriage, model, route_highway, route_oneway, asphalt_q, hidden_seg)
+        line = _crossing_line(j, legs, sides, model, others_for_lines, centre_off)
+        if line is not None:
+            g = CENTRE_GAP_M / 2 + CENTRE_LINE_WIDTH_M / 2
+            for off in (g, -g):
+                le = _offset_line(line, off + CENTRE_LINE_WIDTH_M / 2)
+                ri = _offset_line(line, off - CENTRE_LINE_WIDTH_M / 2)
+                keep = np.ones(len(line) - 1, bool)
+                batch.add("paint_yellow", strip_mesh(le, ri, keep, height))
     if centre_off:
         masks.centre &= ~_mask_by_s(model.s, centre_off)
     for p in rb_parts:
@@ -1414,15 +1476,6 @@ def build_network(
         for key, g in p.paint:
             if key != "paint_white":
                 add(key, g, lift=PAINT_LIFT_M + 0.004, tile=1.0)
-    others_for_lines = _union(
-        [
-            route_kept,
-            route_sh_kept,
-            *(j.fillets for j in junctions),
-            islands_all,
-            *(p.pavement for p in rb_parts),
-        ]
-    ).buffer(0.3)
     for sr, poly in zip(sides, carriage, strict=True):
         _side_lines(sr, poly, carriage, others_for_lines, side_cut, height, batch)
 
@@ -1443,9 +1496,16 @@ def build_network(
             bp = bp[out]
             _, first = np.unique(np.round(bp[:, [0, 2]], 4), axis=0, return_index=True)
             net.edge_points = bp[np.sort(first)]
-    net.island_walls = [w for p in rb_parts for w in p.walls]
+    net.island_walls = [w for p in rb_parts for w in p.walls] + [
+        np.asarray(shapely.segmentize(isl.buffer(-0.5).exterior, 2.0).coords)
+        for isl in loop_islands
+    ]
     net.pieces = batch.pieces()
     net.planned_items = items
+    net.carriage = carriage
+    net.route_columns = (route_left, route_right, left_outer, right_outer)
+    net.junction_xz = np.array([j.xz for j in junctions]).reshape(-1, 2)
+    net.driveway_ways = list(graph.driveways)
     net.stats = {
         "side_roads": len(sides),
         "side_road_km": round(sum(sr.length for sr in sides) / 1000.0, 3),
@@ -1478,8 +1538,8 @@ def _bulb(
     r = TURNING_CIRCLE_RADIUS_M
     if tc is not None:
         d = parse_width(tc.tags.get("diameter"))
-        if d is not None and 8.0 <= d <= 60.0:
-            r = d / 2.0
+        if d is not None and d > 0:
+            r = float(np.clip(d / 2.0, 9.0, 15.0))
         if tc.tags.get("highway") == "turning_loop":
             r = max(r, 15.0)
     end = sr.model.centre[-1, [0, 2]]
@@ -1627,20 +1687,30 @@ def _control(
         "route_in",
         "route_out",
     }
-    t_junction = len(legs) == 3 and through is not None
+    partner = {} if through is None else {through[0]: through[1], through[1]: through[0]}
+    hw_route = float(model.half_width[model.index_at(j.route_s)]) if j.route_s is not None else 0.0
     for k, leg in enumerate(legs):
-        if t_junction and k in through:  # a T's through road does not give way to its stem
-            others = [legs[n].highway for n in through if n != k]
-        else:
-            others = [lg.highway for n, lg in enumerate(legs) if n != k]
+        # A leg never gives way to the rest of its own road (its through partner), so a class
+        # change at the junction (primary to secondary) puts no stop on the road itself.
+        others = [lg.highway for n, lg in enumerate(legs) if n != k and n != partner.get(k)]
         ctrl = approach_stops(leg.highway, others, mapped=mapped.get(k))
         if k not in mapped and highway_rank(leg.highway) <= highway_rank("service"):
             ctrl = None  # private and commercial entrances get no rule-made signs
         j.controls.append((leg.kind, leg.highway, ctrl))
         if ctrl not in ("stop", "yield") or not leg.approach:
             continue
+        # The road crossed: the other legs' carriageways (the route's legs as straight bands
+        # from the node, as the route ribbon also turns into them).
         crossing = _union(
-            [lg.poly for n, lg in enumerate(legs) if n != k and lg.kind == "side"]
+            [
+                lg.poly
+                if lg.kind == "side"
+                else shapely.LineString([j.xz, j.xz + lg.direction * 40.0]).buffer(
+                    hw_route, cap_style="flat"
+                )
+                for n, lg in enumerate(legs)
+                if n != k
+            ]
             + ([route_kept] if leg.kind == "side" else [])
         )
         if leg.kind == "side":
@@ -1733,6 +1803,68 @@ def _control(
                 centre_off.append((float(model.s[lo + k[0]]), float(model.s[lo + k[-1]])))
 
 
+def _offset_line(xz: np.ndarray, off: float) -> np.ndarray:
+    """A polyline (K, 2) moved `off` metres to its left (+) or right (-), in AC XZ."""
+    t = np.gradient(xz, axis=0)
+    t = t / np.maximum(np.linalg.norm(t, axis=1), 1e-9)[:, None]
+    left = np.stack([t[:, 1], -t[:, 0]], axis=1)  # up x forward, with X east and Z south
+    return xz + off * left
+
+
+def _crossing_line(
+    j: Junction,
+    legs: Sequence[_Leg],
+    sides: Sequence[SideRoad],
+    model: RoadModel,
+    block: shapely.Geometry,
+    centre_off: list[tuple[float, float]],
+) -> np.ndarray | None:
+    """Where a side road is the through road (the route is the stem, crosses it or turns
+    onto it), its centre line across the junction: a curve (K, 2) joining where its two legs'
+    own centre lines stop. The route's centre line is cut back across that road."""
+    through = _through(legs)
+    if through is None:
+        return None
+    a, b = (legs[n] for n in through)
+    if a.kind != "side" and b.kind != "side":
+        return None  # the route is the through road: its own line carries on
+    ends = []
+    i = model.index_at(j.route_s) if j.route_s is not None else 0
+    reach = max((float(sides[lg.road].model.half_width[0]) for lg in legs if lg.kind == "side"),
+                default=3.0) + float(model.shoulder[i]) + 1.5  # fmt: skip
+    for lg in (a, b):
+        if lg.kind == "side":
+            sr = sides[lg.road]
+            m = sr.model
+            if sr.oneway != 0 or not m.centre_line[0]:
+                return None
+            ss = np.arange(0.0, min(30.0, sr.length), 0.5)
+            ss = ss if lg.end == "start" else m.s[-1] - ss
+            pts = np.array([np.asarray(m.at(float(s))[0])[[0, 2]] for s in ss])
+            free = ~shapely.contains_xy(block, pts[:, 0], pts[:, 1])
+            if not free.any():
+                return None
+            ends.append(pts[int(np.argmax(free))])
+        else:
+            if j.route_s is None or not model.centre_line[i]:
+                return None
+            s_end = j.route_s + (reach if lg.kind == "route_out" else -reach)
+            s_end = float(np.clip(s_end, model.s[0], model.s[-1]))
+            ends.append(np.asarray(model.at(s_end)[0])[[0, 2]])
+            centre_off.append((min(s_end, j.route_s), max(s_end, j.route_s)))
+    if j.route_s is not None:  # the route's own line also stops short of the through road
+        centre_off.append((j.route_s - reach, j.route_s + reach))
+    p0, p1 = ends
+    if np.linalg.norm(p1 - p0) < 1.0:
+        return None
+    # A quadratic curve through the junction node's side of the chord: straight for a
+    # straight road, bending with it otherwise.
+    mid = 0.5 * (p0 + p1)
+    ctrl = mid + 0.5 * (j.xz - mid) if np.linalg.norm(j.xz - mid) > 0.5 else mid
+    t = np.linspace(0.0, 1.0, max(3, int(np.linalg.norm(p1 - p0) / 1.0) + 1))[:, None]
+    return (1 - t) ** 2 * p0 + 2 * (1 - t) * t * ctrl + t**2 * p1
+
+
 def _side_lines(
     sr: SideRoad,
     own: shapely.Geometry,
@@ -1789,3 +1921,324 @@ def _side_lines(
             if b is not None:
                 keep &= mid < b
         batch.add(key, strip_mesh(le, ri, keep, height))
+
+
+# --------------------------------------------------------------------------------------------
+# Driveways (after the buildings are placed)
+# --------------------------------------------------------------------------------------------
+
+# Ontario driveways (streetscape research, Hamilton RD-106 / RD-113, Oakville, Burlington
+# zoning): rural entrances 3.6-6.0 m of gravel (or asphalt), flared to the road edge with R 3 m
+# corners, straight to the house and perpendicular to the road for the last 15 m; subdivision
+# driveways perpendicular to the road, constant width (3.0-6.0 m, 5.5 m for a double garage),
+# no flares, asphalt.
+DRIVEWAY_RURAL_WIDTH_M = 4.5
+DRIVEWAY_URBAN_WIDTH_M = 5.5
+DRIVEWAY_FLARE_M = 3.0
+DRIVEWAY_PERPENDICULAR_M = 15.0
+DRIVEWAY_MAX_M = 150.0
+DRIVEWAY_MIN_M = 3.0
+DRIVEWAY_LIFT_M = 0.05  # above the terrain (draped, the terrain has no hole for them)
+DRIVEWAY_SHOULDER_LIFT_M = 0.015  # above a road shoulder it lies on
+DRIVEWAY_JUNCTION_CLEAR_M = 15.0  # no inferred driveway mouth this close to a junction
+DRIVEWAY_SERVED_M = 12.0  # a house with a driveway this close already has one
+MAILBOX_SETBACK_M = 0.6  # beyond the shoulder (rural route mailbox on a post)
+MAILBOX_SIDE_M = 1.0  # beside the driveway edge
+HOUSE_KINDS = frozenset(
+    "house detached residential semidetached_house bungalow yes farm cabin terrace".split()
+)
+HOUSE_AREA_M2 = (45.0, 800.0)
+SUBDIVISION_NEIGHBOURS = 5  # this many houses within 60 m: a subdivision, not a rural lot
+
+
+@dataclass
+class Driveway:
+    polygon: shapely.Geometry
+    path: np.ndarray  # (K, 2) from the road edge to the house
+    source: str  # "osm" or "inferred"
+    rural: bool
+    road: int  # -1: the route, else a side road index
+    mouth: np.ndarray  # (2,) on the road's asphalt edge
+    normal: np.ndarray  # (2,) away from the road
+
+
+@dataclass
+class DrivewayResult:
+    driveways: list[Driveway] = field(default_factory=list)
+    pieces: list[ScenePiece] = field(default_factory=list)
+    items: list[PlannedItem] = field(default_factory=list)
+    masks_changed: bool = False
+
+    @property
+    def stats(self) -> dict[str, int]:
+        return {
+            "driveways_osm": sum(1 for d in self.driveways if d.source == "osm"),
+            "driveways_inferred": sum(1 for d in self.driveways if d.source == "inferred"),
+            "mailboxes": len(self.items),
+        }
+
+
+def _roads_for_driveways(net: RoadNetwork) -> list[tuple[int, CentreLine, float]]:
+    """(road index (-1 route), centre line with asphalt half widths, shoulder) per road."""
+    m = net.model
+    hidden = net.masks.hidden
+    kept = np.concatenate([~hidden, [False]]) | np.concatenate([[False], ~hidden])
+    out = []
+    for a, b in _runs(kept):
+        if b > a:
+            cl = CentreLine(m.centre[a : b + 1, [0, 2]], m.centre[a : b + 1, 1],
+                            m.half_width[a : b + 1])  # fmt: skip
+            out.append((-1, cl, float(np.median(m.shoulder[a : b + 1]))))
+    for sr in net.side_roads:
+        if highway_rank(sr.highway) > highway_rank("service") or sr.highway == "service":
+            out.append((sr.index, CentreLine(sr.xz, sr.model.centre[:, 1], sr.model.half_width),
+                        sr.shoulder))  # fmt: skip
+    return out
+
+
+def _nearest_road(
+    roads: Sequence[tuple[int, CentreLine, float]], p: np.ndarray
+) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, float, float] | None:
+    """(road, edge point, tangent, normal away from the road, edge distance, shoulder) of the
+    road whose asphalt edge is nearest to the point."""
+    best = None
+    for idx, cl, shoulder in roads:
+        if not cl.near(p[None], 200.0).any():
+            continue
+        foot, tan, d, hw = cl.nearest(p[None])
+        edge = float(d[0] - hw[0])
+        if best is None or edge < best[4]:
+            n = np.array([tan[0, 1], -tan[0, 0]])
+            if n @ (p - foot[0]) < 0:
+                n = -n
+            best = (idx, foot[0] + n * hw[0], tan[0], n, edge, shoulder)
+    if best is None:
+        return None
+    return best
+
+
+def build_driveways(
+    net: RoadNetwork,
+    footprints: Sequence[tuple[shapely.Geometry, str]],
+    ground: Callable[[np.ndarray], np.ndarray],
+    options: NetworkOptions | None = None,
+    *,
+    infer: bool = True,
+) -> DrivewayResult:
+    """OSM driveways and one inferred driveway per detached house without one (`footprints`:
+    the placed buildings' (polygon, building kind) in AC XZ), draped on the terrain
+    (`ground(xz)`). Their mouths cut the route's edge line and replace the route shoulder
+    they cover (`net.masks` is updated: rebuild the route meshes when `masks_changed`); rural
+    driveways get a mailbox on the right of the mouth (seen from the road)."""
+    options = options or NetworkOptions()
+    res = DrivewayResult()
+    if not net.route_columns:
+        return res
+    roads = _roads_for_driveways(net)
+    if not roads:
+        return res
+    route_xz = net.model.centre[:, [0, 2]]
+    route_tree = cKDTree(route_xz)
+    blocked = _union(
+        [*net.islands]
+        + [shapely.Point(rb.centre).buffer(rb.zone_r + 10.0) for rb in net.roundabouts]
+    )
+    junction_tree = cKDTree(net.junction_xz) if len(net.junction_xz) else None
+    houses = [
+        (poly, kind)
+        for poly, kind in footprints
+        if kind in HOUSE_KINDS and HOUSE_AREA_M2[0] <= poly.area <= HOUSE_AREA_M2[1]
+    ]
+    all_fp = [poly for poly, _ in footprints]
+    fp_tree = shapely.STRtree(all_fp) if all_fp else None
+    centroids = np.array([p.centroid.coords[0] for p, _ in houses]).reshape(-1, 2)
+    house_tree = cKDTree(centroids) if len(centroids) else None
+    cls = {sr.index: sr.highway for sr in net.side_roads}
+    cls[-1] = "secondary"
+    drives: list[Driveway] = []
+
+    def rural_at(p: np.ndarray, road: int) -> bool:
+        if cls.get(road, "") in ("residential", "living_street"):
+            return False
+        if house_tree is None:
+            return True
+        return len(house_tree.query_ball_point(p, 60.0)) < SUBDIVISION_NEIGHBOURS
+
+    # OSM driveways: oriented from the end nearest a road.
+    for way in net.driveway_ways:
+        xz = np.asarray(way.xz, np.float64)
+        if len(xz) < 2 or route_tree.query(xz)[0].min() > options.radius_m:
+            continue
+        ends = [_nearest_road(roads, xz[0]), _nearest_road(roads, xz[-1])]
+        k = 0 if (ends[1] is None or (ends[0] is not None and ends[0][4] <= ends[1][4])) else 1
+        near = ends[k]
+        if near is None or near[4] > 8.0:
+            continue
+        path = xz if k == 0 else xz[::-1]
+        road, edge_pt, _, n, _, _ = near
+        keep = np.linalg.norm(path - edge_pt, axis=1) > 0.5
+        path = np.vstack([edge_pt - n * 0.3, path[keep]])
+        rural = rural_at(path[-1], road)
+        w = parse_width(way.tags.get("width")) or (
+            DRIVEWAY_RURAL_WIDTH_M if rural else DRIVEWAY_URBAN_WIDTH_M
+        )
+        drives.append(Driveway(shapely.LineString(path), path, "osm", rural, road, edge_pt, n))
+        drives[-1].polygon = _driveway_polygon(path, w, rural, near, None)
+
+    served = _union([d.polygon for d in drives]).buffer(DRIVEWAY_SERVED_M) if drives else None
+    if infer:
+        order = np.argsort([route_tree.query(c)[0] for c in centroids]) if len(houses) else []
+        for h in order:
+            poly, _ = houses[int(h)]
+            if route_tree.query(centroids[h])[0] > options.radius_m:
+                continue
+            if served is not None and served.intersects(poly):
+                continue
+            near = _nearest_road(roads, centroids[h])
+            if near is None:
+                continue
+            road, edge_pt, tan, n, _, _ = near
+            # The house front: its boundary point nearest the road.
+            ring = poly.exterior
+            front = np.asarray(ring.interpolate(ring.project(shapely.Point(edge_pt))).coords[0])
+            near = _nearest_road(roads, front)
+            if near is None:
+                continue
+            road, edge_pt, tan, n, edge, _ = near
+            if not (DRIVEWAY_MIN_M <= edge <= DRIVEWAY_MAX_M):
+                continue
+            if (
+                junction_tree is not None
+                and junction_tree.query(edge_pt)[0] < DRIVEWAY_JUNCTION_CLEAR_M
+            ):
+                continue
+            if (
+                blocked is not None
+                and not blocked.is_empty
+                and blocked.distance(shapely.Point(edge_pt)) < 5.0
+            ):
+                continue
+            rural = rural_at(centroids[h], road)
+            depth = float((front - edge_pt) @ n)
+            if rural:
+                bend = edge_pt + n * min(DRIVEWAY_PERPENDICULAR_M, max(depth, 0.0) * 0.6)
+                path = np.array([edge_pt - n * 0.3, bend, front])
+            else:
+                path = np.array([edge_pt - n * 0.3, edge_pt + n * max(depth, 1.0)])
+            path = path[
+                np.concatenate([[True], np.linalg.norm(np.diff(path, axis=0), axis=1) > 0.3])
+            ]
+            if len(path) < 2:
+                continue
+            w = DRIVEWAY_RURAL_WIDTH_M if rural else DRIVEWAY_URBAN_WIDTH_M
+            dw = _driveway_polygon(path, w, rural, near, poly)
+            # Never through another building or another driveway.
+            if fp_tree is not None:
+                hits = fp_tree.query(dw, predicate="intersects")
+                if any(all_fp[i] is not poly for i in hits):
+                    continue
+            if served is not None and served.intersects(dw):
+                continue
+            d = Driveway(dw, path, "inferred", rural, road, edge_pt, n)
+            drives.append(d)
+            grown = dw.buffer(DRIVEWAY_SERVED_M)
+            served = grown if served is None else served.union(grown)
+
+    # Clip, mesh and mark the mouths.
+    carriage = _union([c for c in net.carriage])
+    cut = _union(
+        [carriage, net.paved.difference(_union(net.islands)) if net.islands else net.paved]
+    )
+    route_left, route_right, left_outer, right_outer = net.route_columns
+    outer_cls = [CentreLine(cl.xz, cl.y, cl.hw + sh) for _, cl, sh in roads]
+
+    def height(xz: np.ndarray) -> np.ndarray:
+        g = np.asarray(ground(xz), np.float64)
+        d = np.full(len(xz), np.inf)
+        for cl in outer_cls:
+            dd, _ = cl.project(xz, 30.0)
+            d = np.minimum(d, dd)
+        lift = DRIVEWAY_SHOULDER_LIFT_M + (
+            DRIVEWAY_LIFT_M - DRIVEWAY_SHOULDER_LIFT_M
+        ) * _smoothstep(d / 1.0)
+        return g + lift
+
+    batch = Batcher(options.batch_m)
+    sh_l = _quads(left_outer, route_left)
+    sh_r = _quads(route_right, right_outer)
+    mid_l = 0.5 * (route_left[:-1, [0, 2]] + route_left[1:, [0, 2]])
+    mid_r = 0.5 * (route_right[:-1, [0, 2]] + route_right[1:, [0, 2]])
+    seg_tree = cKDTree(0.5 * (route_xz[:-1] + route_xz[1:]))
+    for d in drives:
+        poly = d.polygon.difference(cut) if not cut.is_empty else d.polygon
+        poly = _union([p for p in _polygons(poly, 0.5)])
+        if poly.is_empty:
+            continue
+        d.polygon = poly
+        res.driveways.append(d)
+        mesh = mesh_polygon(poly, height, cell_m=2.0, uv_tile_m=2.0 if d.rural else 4.0)
+        batch.add("gravel" if d.rural else "asphalt", mesh)
+        if d.road == -1:
+            near_seg = seg_tree.query_ball_point(d.mouth, 25.0)
+            if near_seg:
+                idx = np.array(sorted(near_seg))
+                grown = poly.buffer(0.6)
+                for mids, quads, edge_mask, sh_mask in (
+                    (mid_l, sh_l, net.masks.edge_left, net.masks.shoulder_left),
+                    (mid_r, sh_r, net.masks.edge_right, net.masks.shoulder_right),
+                ):
+                    hit = shapely.contains_xy(grown, mids[idx, 0], mids[idx, 1])
+                    if hit.any():
+                        edge_mask[idx[hit]] = False
+                        res.masks_changed = True
+                    covered = shapely.contains(poly.buffer(0.05), quads[idx])
+                    if covered.any():
+                        sh_mask[idx[covered]] = False
+                        res.masks_changed = True
+        if d.rural:
+            # The mailbox: just beyond the shoulder, beside the driveway on its right (seen
+            # from the road), facing the road.
+            right = np.array([-d.normal[1], d.normal[0]])
+            shoulder = next((sh for idx, _, sh in roads if idx == d.road), 1.0)
+            base = d.mouth + d.normal * (shoulder + MAILBOX_SETBACK_M)
+            across = shapely.LineString([base - right * 20.0, base + right * 20.0])
+            half = 0.0
+            for piece in _polygons(across.intersection(poly).buffer(0.01), 0.0):
+                pts = np.asarray(piece.exterior.coords)
+                half = max(half, float(np.max((pts - base) @ right)))
+            pos = base + right * (max(half, DRIVEWAY_RURAL_WIDTH_M / 2) + MAILBOX_SIDE_M)
+            face = (float(-d.normal[0]), float(-d.normal[1]))
+            res.items.append(
+                PlannedItem(
+                    MAILBOX, (float(pos[0]), float(pos[1])), face, ref=f"driveway:{d.source}"
+                )
+            )
+    res.pieces = batch.pieces()
+    for p in res.pieces:  # their own names: they come after the network's pieces
+        p.name = p.name.replace("_net", "_dw")
+    return res
+
+
+def _driveway_polygon(
+    path: np.ndarray,
+    width: float,
+    rural: bool,
+    near: tuple,
+    house: shapely.Geometry | None,
+) -> shapely.Geometry:
+    """The driveway's surface: the path at `width`, a rural entrance flared into the road
+    edge with `DRIVEWAY_FLARE_M` corners, stopping at the house."""
+    _, edge_pt, tan, n, _, _ = near
+    body = shapely.LineString(path).buffer(width / 2, cap_style="flat", join_style="round")
+    if rural:
+        road = shapely.LineString([edge_pt - tan * 20 - n * 3, edge_pt + tan * 20 - n * 3]).buffer(
+            3.0, cap_style="flat"
+        )
+        r = DRIVEWAY_FLARE_M
+        flared = body.union(road).buffer(r, quad_segs=6).buffer(-r, quad_segs=6)
+        body = flared.difference(road).intersection(
+            shapely.Point(edge_pt).buffer(width / 2 + r + 1.0).union(body)
+        )
+    if house is not None:
+        body = body.difference(house)
+    return body

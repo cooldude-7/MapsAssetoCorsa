@@ -199,6 +199,7 @@ from driftmaps.geometry.network import (
     NetWay,
     NetworkOptions,
     RoadNetwork,
+    build_driveways,
     build_network,
 )
 from driftmaps.geometry.primitives import MeshData, split
@@ -456,6 +457,15 @@ class BuildResult:
                     f"{b['max_height_m']:.1f} m above ground, {b['piers']} piers"
                     + (" (solid: culvert/embankment)" if b["solid"] else "")
                     + ("" if b["railing"] else ", no parapets (at-grade culvert)")
+                )
+            net = s.get("network") or {}
+            if net:
+                lines.append(
+                    f"network  {net.get('side_roads', 0)} side roads "
+                    f"({net.get('side_road_km', 0.0):.2f} km), {net.get('junctions', 0)} "
+                    f"junctions, {net.get('roundabouts', 0)} roundabouts, driveways "
+                    f"{net.get('driveways_osm', 0)} OSM + {net.get('driveways_inferred', 0)} "
+                    f"inferred, {s.get('street_items', 0)} street items"
                 )
             if sc["deck_intrusion_m"] > DECK_TOLERANCE_M:
                 lines.append(f"warning  terrain {sc['deck_intrusion_m']:.2f} m into a bridge deck")
@@ -1217,7 +1227,7 @@ def _assemble_kn5(
     extra: dict[str, object] = {"trees": TreeStats(), "buildings": BuildingStats()}
     if scenery is not None:
         for piece in scenery.pieces:
-            if piece.name.startswith(_NETWORK_PREFIXES):
+            if piece.name.startswith(_NETWORK_PREFIXES) or "_dw" in piece.name:
                 key = "network"
             elif piece.physical:
                 key = "scenery_collision"
@@ -1374,6 +1384,27 @@ def _network(
         options=nopt,
         nodes_known=osm.nodes_known,
     )
+
+
+def _driveways(
+    net: RoadNetwork,
+    m: RoadModel,
+    ground: Callable[[np.ndarray], np.ndarray],
+    options: BuildOptions,
+    sc: _Scenery,
+    roads: RoadMeshes,
+) -> RoadMeshes:
+    """OSM and inferred driveways (they need the placed buildings) with their mailboxes; the
+    route meshes are rebuilt when driveway mouths cut its edge lines or shoulders."""
+    footprints = [(b.polygon, b.kind) for b in sc.buildings]
+    res = build_driveways(net, footprints, ground, options.network_options)
+    net.driveways = res.driveways
+    net.planned_items += res.items
+    net.stats.update(res.stats)
+    sc.pieces += res.pieces
+    if res.masks_changed:
+        return build_road_meshes(m, chunk_m=options.chunk_m, keep=net.masks)
+    return roads
 
 
 def _terrain_extra(net: RoadNetwork | None) -> TerrainExtra | None:
@@ -1678,6 +1709,8 @@ def _tree_exclusion(geo: TrackGeometry, sc: _Scenery) -> shapely.Geometry | None
         polys.append(
             sc.network.paved.buffer(float(verge) + TREE_WALL_MARGIN_M - TREE_BUILDING_BUFFER_M)
         )
+    if sc.network is not None:  # no tree on a driveway (2 m clear, like buildings)
+        polys += [d.polygon for d in sc.network.driveways]
     polys = [p for p in polys if p is not None and not p.is_empty]
     if not polys:
         return None
@@ -1906,9 +1939,11 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
             _terrain_extra(net),
         )
         corridor = corridor_polygon(m, m.outer + options.verge_m)
+        fine_zone = None
         if net is not None and not net.paved.is_empty:
+            fine_zone = corridor.buffer(1.0)  # the route's walls keep their 2 m spacing
             corridor = shapely.union(corridor, net.corridor(options.verge_m))
-        lines = wall_lines(corridor)
+        lines = wall_lines(corridor, fine_zone=fine_zone)
         if net is not None:
             lines.rings += net.island_walls
 
@@ -1928,7 +1963,6 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
         if net is not None:
             sc.network = net
             sc.pieces += net.pieces
-            street_items += net.street_items(ground)
         if options.guardrails:
             _barriers(geo, ground, options, sc)
         canopy: CanopyFn | None = None
@@ -1940,6 +1974,9 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
         if options.buildings:
             progress("Placing buildings", 0.55)
             _buildings(geo, ground, corridor, canopy, options, track_id, sc)
+        if net is not None:  # driveways need the placed houses
+            roads = _driveways(net, m, ground, options, sc, roads)
+            street_items += net.street_items(ground)
         if options.trees:
             progress("Planting trees", 0.7)
             _trees(geo, canopy, options, track_id, sc)
@@ -2267,6 +2304,7 @@ _NETWORK_RGB = {
     "gravel": (196, 176, 140),
     "asphalt": (78, 78, 82),
     "islands": (120, 170, 90),
+    "driveways": (170, 150, 120),
 }
 _ITEM_RGB = {
     "sign:stop": (230, 20, 20),
@@ -2279,12 +2317,17 @@ _ITEM_RGB = {
 }
 
 
+def _union_all(geoms: Sequence[shapely.Geometry]) -> shapely.Geometry:
+    return shapely.union_all(np.array(geoms, dtype=object)) if geoms else shapely.Polygon()
+
+
 def _draw_network(dr, px, a: np.ndarray, b: np.ndarray, net: RoadNetwork) -> None:
     """Side roads, junction mouths, roundabouts (gravel tan, asphalt grey, islands green),
     their painted markings and the planned street items (coloured dots)."""
     view = shapely.box(a[0] - 5, a[1] - 5, b[0] + 5, b[1] + 5)
-    for key in ("gravel", "asphalt", "islands"):
-        geom = net.polygons.get(key)
+    polygons = dict(net.polygons, driveways=_union_all([d.polygon for d in net.driveways]))
+    for key in ("gravel", "asphalt", "islands", "driveways"):
+        geom = polygons.get(key)
         if geom is None or geom.is_empty:
             continue
         for poly in shapely.get_parts(geom.intersection(view)):

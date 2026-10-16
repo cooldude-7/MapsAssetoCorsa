@@ -62,8 +62,16 @@ class WallLines:
         return float(sum(np.linalg.norm(np.diff(r, axis=0), axis=1).sum() for r in self.rings))
 
 
-def wall_lines(corridor: shapely.Geometry, spacing_m: float = 2.0) -> WallLines:
-    """Exterior and interior rings of the corridor, densified to `spacing_m`."""
+def wall_lines(
+    corridor: shapely.Geometry,
+    spacing_m: float = 2.0,
+    *,
+    fine_zone: shapely.Geometry | None = None,
+    coarse_m: float = 4.0,
+) -> WallLines:
+    """Exterior and interior rings of the corridor, densified to `spacing_m`; with
+    `fine_zone` (e.g. the route's own corridor, grown), points outside it are thinned to
+    about `coarse_m` (side-road walls: the same collision for half the vertices)."""
     polys = list(corridor.geoms) if isinstance(corridor, shapely.MultiPolygon) else [corridor]
     rings = []
     for poly in polys:
@@ -72,8 +80,18 @@ def wall_lines(corridor: shapely.Geometry, spacing_m: float = 2.0) -> WallLines:
         for ring in [poly.exterior, *poly.interiors]:
             if ring.length < 5.0:  # slivers
                 continue
-            dense = shapely.segmentize(ring, spacing_m)
-            rings.append(np.asarray(dense.coords)[:, :2])
+            dense = np.asarray(shapely.segmentize(ring, spacing_m).coords)[:, :2]
+            if fine_zone is not None and coarse_m > spacing_m:
+                # The coarse densification (it keeps the ring's corners) plus the fine points
+                # inside the fine zone, in order along the ring.
+                fine = dense[shapely.contains_xy(fine_zone, dense[:, 0], dense[:, 1])]
+                coarse = np.asarray(shapely.segmentize(ring, coarse_m).coords)[:-1, :2]
+                pts = np.concatenate([coarse, fine])
+                at = shapely.line_locate_point(ring, shapely.points(pts))
+                _, first = np.unique(np.round(at, 6), return_index=True)
+                pts = pts[first]  # sorted by position along the ring, duplicates dropped
+                dense = np.vstack([pts, pts[:1]])
+            rings.append(dense)
     return WallLines(rings)
 
 

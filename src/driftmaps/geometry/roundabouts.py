@@ -58,6 +58,7 @@ __all__ = [
     "RoundaboutParts",
     "build_roundabout",
     "find_roundabouts",
+    "island_meshes",
     "pavers_texture",
     "settle_route",
 ]
@@ -71,6 +72,9 @@ APRON_RAISE_M = 0.07
 MOUNTABLE_CURB_M = 0.30  # width of the sloped curb in front of the apron
 ISLAND_CURB_M = 0.15
 CURB_TOP_M = 0.25
+# Curbs keep their real 150 mm reveal but rise over 180 mm (streetscape research §7: AC tests
+# tyre contact at one point per wheel, so a vertical step makes the wheel jump harshly).
+CURB_FACE_RUN_M = 0.18
 MOUND_M = 1.2
 ENTRY_RADIUS_M = 15.0
 ZONE_MARGIN_M = 10.0  # the route ribbon is replaced this far beyond the circulatory roadway
@@ -473,43 +477,7 @@ def _ring_band(
     return compute_tangents(compute_normals(data))
 
 
-def _curb_face(
-    ring: np.ndarray,
-    height: Callable[[np.ndarray], np.ndarray],
-    base: float,
-    top: float,
-    inside: shapely.Geometry,
-) -> MeshData | None:
-    """Vertical curb face along a closed ring (K, 2), facing away from `inside`."""
-    ring = np.asarray(ring, np.float64)
-    if len(ring) < 4:
-        return None
-    y = np.asarray(height(ring))
-    lo = np.stack([ring[:, 0], y + base, ring[:, 1]], axis=1)
-    hi = np.stack([ring[:, 0], y + top, ring[:, 1]], axis=1)
-    pos = np.concatenate([lo, hi])
-    n = len(ring)
-    a = np.arange(n - 1)
-    tri = np.concatenate([np.stack([a, a + 1, n + a + 1], 1), np.stack([a, n + a + 1, n + a], 1)])
-    nrm = np.cross(pos[tri[:, 1]] - pos[tri[:, 0]], pos[tri[:, 2]] - pos[tri[:, 0]])
-    mid = pos[tri].mean(axis=1)
-    probe = (
-        mid[:, [0, 2]]
-        + 0.05 * nrm[:, [0, 2]] / np.maximum(np.linalg.norm(nrm[:, [0, 2]], axis=1), 1e-9)[:, None]
-    )
-    flip = shapely.contains_xy(inside, probe[:, 0], probe[:, 1])
-    tri[flip] = tri[flip][:, [0, 2, 1]]
-    s = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(ring, axis=0), axis=1))])
-    uv = np.concatenate(
-        [np.stack([s / 2.0, np.zeros(n)], 1), np.stack([s / 2.0, np.full(n, 0.1)], 1)]
-    )
-    data = MeshData(
-        pos, np.tile([0.0, 1.0, 0.0], (len(pos), 1)), uv, np.zeros_like(pos), tri.reshape(-1)
-    )
-    return compute_tangents(compute_normals(data))
-
-
-def _island_meshes(rb: Roundabout, height: HeightField) -> list[tuple[str, MeshData]]:
+def _central_island_meshes(rb: Roundabout, height: HeightField) -> list[tuple[str, MeshData]]:
     c = rb.centre
     n_ang = max(48, math.ceil(2 * math.pi * rb.inner_r / 1.5))
     out: list[tuple[str, MeshData]] = []
@@ -538,30 +506,37 @@ def _island_meshes(rb: Roundabout, height: HeightField) -> list[tuple[str, MeshD
     else:
         top = 0.0
     curb_top = top + ISLAND_CURB_M
+    r_face = r_isl - CURB_FACE_RUN_M  # sloped face: AC's one-point tyre contact
+    out.append(("curb", _ring_band(c, [r_isl, r_face], [top, curb_top], height, n_ang)))
     out.append(
-        ("curb", _ring_band(c, [r_isl, r_isl], [top, curb_top], height, n_ang, vertical=True))
+        ("curb", _ring_band(c, [r_face, r_face - CURB_TOP_M], [curb_top, curb_top], height, n_ang))
     )
-    out.append(
-        ("curb", _ring_band(c, [r_isl, r_isl - CURB_TOP_M], [curb_top, curb_top], height, n_ang))
-    )
-    r0 = r_isl - CURB_TOP_M
+    r0 = r_face - CURB_TOP_M
     rr = np.linspace(r0, 0.0, 9)
     mound = curb_top + MOUND_M * _smoothstep((r0 - rr) / max(0.6 * r0, 1e-3))
     out.append(("island_grass", _ring_band(c, list(rr), list(mound), height, n_ang, uv_tile=4.0)))
     return out
 
 
-def _splitter_meshes(
+def island_meshes(
     island: shapely.Geometry, height: HeightField, cell: float
 ) -> list[tuple[str, MeshData]]:
     out: list[tuple[str, MeshData]] = []
     for poly in _polygons(island, 1.0):
-        ring = np.asarray(shapely.segmentize(poly.exterior, 1.0).coords)
-        face = _curb_face(ring, height, 0.0, SPLITTER_CURB_M, poly)
-        if face is not None:
-            out.append(("curb", face))
-        inner = poly.buffer(-CURB_TOP_M)
-        band = poly.difference(inner)
+        # Curb face sloped over CURB_FACE_RUN_M (a vertical step makes AC's single tyre
+        # contact point jump), then the curb top, then the island's top surface.
+        top_edge = poly.buffer(-CURB_FACE_RUN_M, join_style="mitre")
+        ring = poly.exterior
+
+        def face_height(xz: np.ndarray, ring=ring) -> np.ndarray:
+            d = shapely.distance(ring, shapely.points(np.asarray(xz).reshape(-1, 2)))
+            return height(xz) + SPLITTER_CURB_M * np.clip(d / CURB_FACE_RUN_M, 0.0, 1.0)
+
+        m = mesh_polygon(poly.difference(top_edge), face_height, cell_m=cell, uv_tile_m=2.0)
+        if m is not None:
+            out.append(("curb", m))
+        inner = top_edge.buffer(-CURB_TOP_M)
+        band = top_edge.difference(inner)
         m = mesh_polygon(band, height, cell_m=cell, uv_tile_m=2.0, lift=SPLITTER_CURB_M)
         if m is not None:
             out.append(("curb", m))
@@ -695,9 +670,9 @@ def build_roundabout(
     isl_r = rb.island_r
     parts.islands = [(centre_disc, "central")] + [(i, "splitter") for i in islands]
 
-    parts.meshes += _island_meshes(rb, height)
+    parts.meshes += _central_island_meshes(rb, height)
     for isl in islands:
-        parts.meshes += _splitter_meshes(isl, height, cell_m)
+        parts.meshes += island_meshes(isl, height, cell_m)
 
     # Hidden walls: inside the central island's curb and inside every splitter.
     ang = np.linspace(0.0, 2 * np.pi, max(24, math.ceil(2 * math.pi * isl_r / 2.0)) + 1)
