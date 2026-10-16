@@ -88,8 +88,9 @@ def _fp(fid: str, ring_xz, tags=None, ms_height=None, source="osm") -> Footprint
     r = np.asarray(ring_xz, np.float64)
     r = np.vstack([r, r[:1]])
     lon, lat = PROJ.to_lonlat(r[:, 0], -r[:, 1])
-    return Footprint(fid, source, np.stack([lon, lat], 1), dict(tags or {"building": "house"}),
-                     ms_height)
+    return Footprint(
+        fid, source, np.stack([lon, lat], 1), dict(tags or {"building": "house"}), ms_height
+    )
 
 
 def _rect(x0, z0, w, d):
@@ -107,13 +108,33 @@ def _flat(y=100.0):
     return lambda xz: np.full(len(xz), y)
 
 
-def _building(ring, shape=ROOF_GABLED, rise=3.0, ground=10.0, eave=5.0, sink=0.5,
-              wall="siding_white", roof="shingle_charcoal") -> Building:
+def _building(
+    ring,
+    shape=ROOF_GABLED,
+    rise=3.0,
+    ground=10.0,
+    eave=5.0,
+    sink=0.5,
+    wall="siding_white",
+    roof="shingle_charcoal",
+) -> Building:
     poly = shapely.orient_polygons(shapely.Polygon(ring), exterior_cw=True)
     c, L, S, hl, hw = _min_rect(poly)
     r = Roof(shape, c, L, S, hl, hw, rise if shape != ROOF_FLAT else 0.0)
-    return Building("t", "osm", "house", np.asarray(poly.exterior.coords)[:-1], r, eave,
-                    ground, ground - sink, "test", wall, roof, u_offset=7.0)
+    return Building(
+        "t",
+        "osm",
+        "house",
+        np.asarray(poly.exterior.coords)[:-1],
+        r,
+        eave,
+        ground,
+        ground - sink,
+        "test",
+        wall,
+        roof,
+        u_offset=7.0,
+    )
 
 
 def _open_edges(mesh, tol=1e-5) -> int:
@@ -175,28 +196,79 @@ def test_parse_osm_fixture_keeps_only_closed_building_ways():
 def test_parse_tags_and_relations():
     payload = {
         "elements": [
-            {"type": "way", "id": 5, "tags": {"building": "house", "height": "7.5 m",
-                                               "building:levels": "2", "roof:shape": "hipped"},
-             "geometry": [{"lon": 0, "lat": 0}, {"lon": 1e-4, "lat": 0},
-                          {"lon": 1e-4, "lat": 1e-4}, {"lon": 0, "lat": 0}]},
-            {"type": "way", "id": 6, "tags": {"building": "yes"},  # not closed
-             "geometry": [{"lon": 0, "lat": 0}, {"lon": 1e-4, "lat": 0},
-                          {"lon": 1e-4, "lat": 1e-4}, {"lon": 0, "lat": 1e-4}]},
-            {"type": "way", "id": 7, "tags": {"building": "no"},
-             "geometry": [{"lon": 0, "lat": 0}, {"lon": 1e-4, "lat": 0},
-                          {"lon": 1e-4, "lat": 1e-4}, {"lon": 0, "lat": 0}]},
-            {"type": "relation", "id": 9, "tags": {"building": "barn", "type": "multipolygon"},
-             "members": [
-                 {"type": "way", "role": "outer",
-                  "geometry": [{"lon": 0, "lat": 0}, {"lon": 2e-4, "lat": 0},
-                               {"lon": 2e-4, "lat": 2e-4}]},
-                 {"type": "way", "role": "outer",
-                  "geometry": [{"lon": 2e-4, "lat": 2e-4}, {"lon": 0, "lat": 2e-4},
-                               {"lon": 0, "lat": 0}]},
-                 {"type": "way", "role": "inner",
-                  "geometry": [{"lon": 5e-5, "lat": 5e-5}, {"lon": 1e-4, "lat": 5e-5},
-                               {"lon": 1e-4, "lat": 1e-4}, {"lon": 5e-5, "lat": 5e-5}]},
-             ]},
+            {
+                "type": "way",
+                "id": 5,
+                "tags": {
+                    "building": "house",
+                    "height": "7.5 m",
+                    "building:levels": "2",
+                    "roof:shape": "hipped",
+                },
+                "geometry": [
+                    {"lon": 0, "lat": 0},
+                    {"lon": 1e-4, "lat": 0},
+                    {"lon": 1e-4, "lat": 1e-4},
+                    {"lon": 0, "lat": 0},
+                ],
+            },
+            {
+                "type": "way",
+                "id": 6,
+                "tags": {"building": "yes"},  # not closed
+                "geometry": [
+                    {"lon": 0, "lat": 0},
+                    {"lon": 1e-4, "lat": 0},
+                    {"lon": 1e-4, "lat": 1e-4},
+                    {"lon": 0, "lat": 1e-4},
+                ],
+            },
+            {
+                "type": "way",
+                "id": 7,
+                "tags": {"building": "no"},
+                "geometry": [
+                    {"lon": 0, "lat": 0},
+                    {"lon": 1e-4, "lat": 0},
+                    {"lon": 1e-4, "lat": 1e-4},
+                    {"lon": 0, "lat": 0},
+                ],
+            },
+            {
+                "type": "relation",
+                "id": 9,
+                "tags": {"building": "barn", "type": "multipolygon"},
+                "members": [
+                    {
+                        "type": "way",
+                        "role": "outer",
+                        "geometry": [
+                            {"lon": 0, "lat": 0},
+                            {"lon": 2e-4, "lat": 0},
+                            {"lon": 2e-4, "lat": 2e-4},
+                        ],
+                    },
+                    {
+                        "type": "way",
+                        "role": "outer",
+                        "geometry": [
+                            {"lon": 2e-4, "lat": 2e-4},
+                            {"lon": 0, "lat": 2e-4},
+                            {"lon": 0, "lat": 0},
+                        ],
+                    },
+                    {
+                        "type": "way",
+                        "role": "inner",
+                        "geometry": [
+                            {"lon": 5e-5, "lat": 5e-5},
+                            {"lon": 1e-4, "lat": 5e-5},
+                            {"lon": 1e-4, "lat": 1e-4},
+                            {"lon": 5e-5, "lat": 5e-5},
+                        ],
+                    },
+                ],
+            },
         ]
     }
     fps = parse_buildings(json.dumps(payload))
@@ -217,8 +289,13 @@ def test_query_uses_small_boxes_along_the_route():
     # whole 2 x 1.4 km bounding box.
     xy = np.array([[0.0, 0.0], [2000.0, 0.0], [2000.0, 1400.0]])
     lon, lat = PROJ.to_lonlat(xy[:, 0], xy[:, 1])
-    dense = np.stack([np.interp(np.linspace(0, 2, 341), [0, 1, 2], lon),
-                      np.interp(np.linspace(0, 2, 341), [0, 1, 2], lat)], 1)
+    dense = np.stack(
+        [
+            np.interp(np.linspace(0, 2, 341), [0, 1, 2], lon),
+            np.interp(np.linspace(0, 2, 341), [0, 1, 2], lat),
+        ],
+        1,
+    )
     boxes = gb.route_boxes(dense, 150.0)
     assert len(boxes) == 4
     for s_, w, n, e in boxes:
@@ -370,8 +447,15 @@ def test_choose_height_order_and_clamps():
 
 def _place_one(ring, tags=None, canopy=None, ms_height=None, **opts):
     fp = _fp("osm:w1", ring, tags, ms_height)
-    out = place_buildings([fp], PROJ, _straight_road(), _flat(), canopy=canopy, seed="t",
-                          options=BuildingOptions(**opts))
+    out = place_buildings(
+        [fp],
+        PROJ,
+        _straight_road(),
+        _flat(),
+        canopy=canopy,
+        seed="t",
+        options=BuildingOptions(**opts),
+    )
     assert len(out) == 1
     return out[0]
 
@@ -408,23 +492,34 @@ def test_roof_types_from_tags_kind_size_and_lidar():
 
 def test_lidar_height_of_the_real_fixture_house(tmp_path):
     real = default_sources()
-    srcs = {"hrdem-1m-dsm": CogSource(real["hrdem-1m-dsm"].info, str(DSM_TIF)),
-            "hrdem-1m": CogSource(real["hrdem-1m"].info, str(DTM_TIF))}
+    srcs = {
+        "hrdem-1m-dsm": CogSource(real["hrdem-1m-dsm"].info, str(DSM_TIF)),
+        "hrdem-1m": CogSource(real["hrdem-1m"].info, str(DTM_TIF)),
+    }
 
     def canopy(xz):
         lon, lat = PROJ.to_lonlat(xz[:, 0], -xz[:, 1])
-        return canopy_height_grid(lon, lat, cache_dir=tmp_path, sources=srcs,
-                                  chain=["hrdem-1m-dsm"]).heights
+        return canopy_height_grid(
+            lon, lat, cache_dir=tmp_path, sources=srcs, chain=["hrdem-1m-dsm"]
+        ).heights
 
     osm = parse_buildings(OSM_FIXTURE.read_bytes())
     route = _snake_route()
     e, n = PROJ.to_enu(route[:, 0], route[:, 1])
     xz = np.stack([e, -n], 1)
     s = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(xz, axis=0), axis=1))])
-    road = RoadModel(s, np.stack([xz[:, 0], np.zeros(len(xz)), xz[:, 1]], 1), 3.3, 1.0, True,
-                     False)
-    bs = {b.id: b for b in place_buildings(osm, PROJ, road, _flat(150.0), canopy=canopy,
-                                           corridor=corridor_polygon(road, road.outer + 3.0))}
+    road = RoadModel(s, np.stack([xz[:, 0], np.zeros(len(xz)), xz[:, 1]], 1), 3.3, 1.0, True, False)
+    bs = {
+        b.id: b
+        for b in place_buildings(
+            osm,
+            PROJ,
+            road,
+            _flat(150.0),
+            canopy=canopy,
+            corridor=corridor_polygon(road, road.outer + 3.0),
+        )
+    }
     assert set(bs) == {f.id for f in osm}
     house = bs[FIXTURE_HOUSE]
     # DSM - DTM over the roof: 8.49 m at the reference roof pixel (test_elevation_dsm.REF).
@@ -460,8 +555,9 @@ def test_corridor_exclusion_distance_and_cap():
     assert [b.id for b in no_corridor] == ["osm:w1", "osm:w4", "osm:w6"]
     capped = place_buildings(fps, PROJ, road, _flat(), options=BuildingOptions(max_buildings=1))
     assert [b.id for b in capped] == ["osm:w4"]  # nearest the road first
-    assert buildings_polygon(bs, 2.0).area == pytest.approx(2 * (14 * 12 - (4 - np.pi) * 4),
-                                                            rel=1e-2)
+    assert buildings_polygon(bs, 2.0).area == pytest.approx(
+        2 * (14 * 12 - (4 - np.pi) * 4), rel=1e-2
+    )
 
 
 def test_tree_canopy_over_a_small_house_is_not_its_height():
@@ -482,8 +578,9 @@ def test_lidar_failure_falls_back_to_tags():
     def broken(xz):
         raise RuntimeError("HRDEM unreachable")
 
-    b = _place_one(_rect(-6, 30, 12, 8), {"building": "house", "building:levels": "1"},
-                   canopy=broken)
+    b = _place_one(
+        _rect(-6, 30, 12, 8), {"building": "house", "building:levels": "1"}, canopy=broken
+    )
     assert b.height_source == "levels" and b.eave_h == pytest.approx(3.0)
 
 
@@ -493,8 +590,9 @@ def test_ground_base_and_no_ground():
     b = place_buildings([_fp("osm:w1", _rect(0, 30, 10, 8))], PROJ, road, slope)[0]
     assert b.base_y == pytest.approx(100.0 - 0.5, abs=0.05)  # lowest corner - sink
     assert b.ground_y == pytest.approx(101.0, abs=0.3)
-    nothing = place_buildings([_fp("osm:w1", _rect(0, 30, 10, 8))], PROJ, road,
-                              lambda xz: np.full(len(xz), np.nan))
+    nothing = place_buildings(
+        [_fp("osm:w1", _rect(0, 30, 10, 8))], PROJ, road, lambda xz: np.full(len(xz), np.nan)
+    )
     assert nothing == []
 
 
@@ -547,8 +645,7 @@ def test_extrusion_is_closed_with_outward_normals(name, shape):
     edges = np.concatenate([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]])
     count = Counter(map(tuple, edges))
     open_ = [(a, c) for (a, c) in count if (c, a) not in count]
-    ys = {round(float(m2.positions[np.flatnonzero(vid == v)[0], 1]), 6)
-          for e in open_ for v in e}
+    ys = {round(float(m2.positions[np.flatnonzero(vid == v)[0], 1]), 6) for e in open_ for v in e}
     assert ys == {round(b.base_y, 6)}
 
 
@@ -581,8 +678,9 @@ def test_uvs_unmirrored_and_inside_one_band():
             b = _building(ring, shape, wall="brick_red", roof="metal_green")
             m = extrude_building(b)
             uv = m.uvs[m.triangles]
-            signed = ((uv[:, 1, 0] - uv[:, 0, 0]) * (uv[:, 2, 1] - uv[:, 0, 1])
-                      - (uv[:, 2, 0] - uv[:, 0, 0]) * (uv[:, 1, 1] - uv[:, 0, 1]))
+            signed = (uv[:, 1, 0] - uv[:, 0, 0]) * (uv[:, 2, 1] - uv[:, 0, 1]) - (
+                uv[:, 2, 0] - uv[:, 0, 0]
+            ) * (uv[:, 1, 1] - uv[:, 0, 1])
             assert np.all(signed <= 1e-12), (name, shape)
             fn = face_normals(m)
             walls, roofs = np.abs(fn[:, 1]) < 1e-9, fn[:, 1] > 0.3
@@ -634,8 +732,8 @@ def test_scene_kn5_is_valid_and_cells_are_batched():
     mat = k.materials[0]
     assert mat.shader == "ksPerPixel" and mat.textures[0].texture_name == "dm_buildings.dds"
     info = read_dds_info(k.textures[0].data)
-    assert info.format == "BC1" and (info.width, info.height) == (1024, 2048)
-    assert info.mip_count == 12
+    assert info.format == "BC1" and (info.width, info.height) == (1024, 4096)
+    assert info.mip_count == 13
     assert stats.vertices < 28 * 200  # lean: ~50-120 vertices per house
     # Deterministic: same seed, same looks; meshes identical.
     again = place_buildings(fps, PROJ, road, _flat(), seed="track")
@@ -667,9 +765,9 @@ def test_cells_split_past_the_vertex_limit():
 
 
 def test_atlas_layout_tiling_and_determinism():
-    assert len(STYLES) == BAND_COUNT and sorted(s.band for s in STYLES) == list(range(32))
+    assert len(STYLES) <= BAND_COUNT and sorted(s.band for s in STYLES) == list(range(len(STYLES)))
     img = np.asarray(building_atlas(256, seed=3)).astype(float)
-    assert img.shape == (512, 256, 3)
+    assert img.shape == (256 * BAND_COUNT // 16, 256, 3)
     assert np.array_equal(img, np.asarray(building_atlas(256, seed=3)))
     # Bands tile left-right: the seam step is like any other column step.
     seam = np.abs(img[:, 0] - img[:, -1]).mean()
@@ -677,7 +775,7 @@ def test_atlas_layout_tiling_and_determinism():
     assert seam < 2.5 * typical
     for s in STYLES:
         v0, v1 = band_v(s, 256)
-        assert s.band / 32 < v0 < v1 < (s.band + 1) / 32
+        assert s.band / BAND_COUNT < v0 < v1 < (s.band + 1) / BAND_COUNT
     with pytest.raises(ValueError):
         building_atlas(100)
     tex = building_atlas_texture("x.png", 64)

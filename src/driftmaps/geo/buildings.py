@@ -65,14 +65,17 @@ __all__ = [
     "ConflationReport",
     "Footprint",
     "build_buildings_query",
+    "build_use_areas_query",
     "conflate",
     "fetch_buildings",
     "fetch_ms_buildings",
+    "fetch_use_areas",
     "fetch_osm_buildings",
     "merge_footprints",
     "ms_tile_urls",
     "parse_buildings",
     "parse_ms_features",
+    "parse_use_areas",
     "quadkey",
     "quadkeys_for_bbox",
     "regularize",
@@ -376,6 +379,86 @@ def fetch_osm_buildings(
         _write_gz(path, body)
     osm_base = ((payload or {}).get("osm3s") or {}).get("timestamp_osm_base")
     return parse_buildings(payload), osm_base
+
+
+# Land use and campuses around the buildings: what a commercial building is for
+# (`geometry.buildings._use`: a plaza on `landuse=retail`, a plant on `landuse=industrial`, the
+# school's buildings on its `amenity=school` grounds).
+USE_LANDUSE = ("retail", "commercial", "industrial")
+USE_AMENITIES = ("school", "hospital", "college", "university", "kindergarten")
+
+
+def build_use_areas_query(
+    boxes: Sequence[tuple[float, float, float, float]], timeout_s: int = 120
+) -> str:
+    """Overpass QL for `landuse=retail|commercial|industrial` and school / hospital / college
+    grounds (ways and multipolygons) in the (south, west, north, east) boxes."""
+    if not boxes:
+        raise ValueError("need at least one box")
+    lu = "|".join(USE_LANDUSE)
+    am = "|".join(USE_AMENITIES)
+    parts = []
+    for s_, w, n, e in boxes:
+        bb = f"({_fmt(s_)},{_fmt(w)},{_fmt(n)},{_fmt(e)})"
+        parts.append(
+            f'  way["landuse"~"^({lu})$"]{bb};\n'
+            f'  relation["landuse"~"^({lu})$"]["type"="multipolygon"]{bb};\n'
+            f'  way["amenity"~"^({am})$"]{bb};\n'
+            f'  relation["amenity"~"^({am})$"]["type"="multipolygon"]{bb};'
+        )
+    head = f"[out:json][timeout:{int(timeout_s)}];\n(\n"
+    return head + "\n".join(parts) + "\n);\nout body geom;\n"
+
+
+def parse_use_areas(payload: bytes | str | Mapping) -> list[tuple[np.ndarray, dict[str, str]]]:
+    """(lon/lat outer ring, tags) of each land use / campus area in an Overpass response."""
+    if isinstance(payload, bytes | str):
+        try:
+            payload = json.loads(payload)
+        except ValueError as exc:
+            raise OverpassError(f"not an Overpass JSON response: {exc}") from exc
+    if not isinstance(payload, Mapping) or "elements" not in payload:
+        raise OverpassError("not an Overpass JSON response (no 'elements')")
+    out: list[tuple[np.ndarray, dict[str, str]]] = []
+    for el in payload["elements"]:
+        tags = {str(k): str(v) for k, v in (el.get("tags") or {}).items()}
+        if tags.get("landuse") not in USE_LANDUSE and tags.get("amenity") not in USE_AMENITIES:
+            continue
+        if el.get("type") == "way":
+            ring = _ring(el.get("geometry") or [])
+            if ring is not None:
+                out.append((ring, tags))
+        elif el.get("type") == "relation":
+            out += [(ring, tags) for ring in _relation_rings(el.get("members") or [])]
+    return out
+
+
+def fetch_use_areas(
+    route_lonlat: npt.ArrayLike,
+    *,
+    cache_dir: Path | str | None = None,
+    around_m: float = DEFAULT_AROUND_M,
+    piece_m: float = 1000.0,
+    mirrors: Sequence[str] | None = None,
+    refresh: bool = False,
+    offline: bool = False,
+    **post_kwargs,
+) -> list[tuple[np.ndarray, dict[str, str]]]:
+    """OSM land use and campus areas near the route (`build_use_areas_query`), cached like
+    the buildings. `offline=True` never touches the network (OverpassError on a miss)."""
+    ll = np.asarray(route_lonlat, dtype=np.float64).reshape(-1, 2)
+    query = build_use_areas_query(route_boxes(ll, around_m + 5.0, piece_m))
+    key = query_cache_key(query)
+    cache = Path(cache_dir) if cache_dir is not None else default_cache_dir()
+    path = cache / "overpass" / f"{key}.json.gz"
+    payload = None if refresh else _read_gz_json(path)
+    if payload is None:
+        if offline:
+            raise OverpassError(f"no cached Overpass land use data (key {key[:12]}...)")
+        body = post_query(query, mirrors, **post_kwargs)
+        payload = json.loads(body)
+        _write_gz(path, body)
+    return parse_use_areas(payload)
 
 
 # --------------------------------------------------------------------------------------------
@@ -798,6 +881,7 @@ class ConflationReport:
     unconfirmed: int = 0  # new lower-priority footprints the lidar does not confirm
     small: int = 0  # dropped: < min_area_m2 (after cutting)
     demolished: list[str] = field(default_factory=list)  # dropped: lidar sees no building
+    promoted: int = 0  # OSM outlines that replaced a split building's pieces
 
 
 def _xz_polygon(fp: Footprint, projection: LocalProjection) -> shapely.Polygon | None:
@@ -899,6 +983,7 @@ def conflate(
     regularize_lidar: bool = True,
     survey_small_m2: float = 40.0,
     survey_near_m: float = 250.0,
+    promote_min_m2: float = 1500.0,
 ) -> tuple[list[Footprint], ConflationReport]:
     """One footprint per building from `tiers` (highest priority first, e.g. municipal, OSM,
     NRCan lidar, Microsoft), by the research's rules (§4), in the build's metres
@@ -917,6 +1002,11 @@ def conflate(
       sheds), a lidar-only outline < `survey_small_m2` within `survey_near_m` of it also
       needs OSM or Microsoft to have it (lidar takes RVs, trailers and hedges for sheds).
     - Lidar outlines are regularised (`regularize`) first.
+    - SPLIT landmarks: an OSM outline of a notable building (tagged with a specific
+      `building` type, an `amenity` or a `name`; at least `promote_min_m2`) that the first
+      tier maps as two or more pieces (each mostly inside it, together covering at least half
+      of it, none the same building) replaces those pieces: one hospital, not its wings
+      (the user's Oakville check, 2026-10-16).
     - DEMOLISHED: a kept non-lidar footprint older than the lidar near it (`year`), with no
       lidar outline on it and a DSM - DTM median (shrunk by 0.7 m) < `demolished_max_m`, is
       dropped and listed in the report.
@@ -934,6 +1024,8 @@ def conflate(
                 p = regularize(p)
             row.append(p)
         polys.append(row)
+    if len(tiers) > 1:
+        rep.promoted = _promote_split(tiers, polys, promote_min_m2, iou_same)
     lidar_fps = [(fp, p) for t, row in zip(tiers, polys, strict=True)
                  for fp, p in zip(t, row, strict=True) if fp.lidar and p is not None]  # fmt: skip
     lidar_tree = shapely.STRtree([p for _, p in lidar_fps]) if lidar_fps else None
@@ -1076,6 +1168,55 @@ def conflate(
         rep.kept[fp.source] = rep.kept.get(fp.source, 0) + 1
         out.append(fp)
     return sorted(out, key=lambda f: f.id), rep
+
+
+_PLAIN_KINDS = frozenset({"yes", "house", "detached", "residential", "semidetached_house",
+                          "garage", "garages", "shed", "roof", "terrace", "carport"})  # fmt: skip
+
+
+def _promote_split(
+    tiers: list[list[Footprint]],
+    polys: list[list[shapely.Polygon | None]],
+    min_m2: float,
+    iou_same: float,
+) -> int:
+    """Move notable OSM outlines that the first tier splits into pieces into the first tier,
+    dropping the pieces (`conflate`, SPLIT landmarks). Returns how many were promoted."""
+    base = [(k, p) for k, p in enumerate(polys[0]) if p is not None]
+    if not base:
+        return 0
+    tree = shapely.STRtree([p for _, p in base])
+    promoted = 0
+    for t_idx in range(1, len(tiers)):
+        for i, (fp, p) in enumerate(zip(tiers[t_idx], polys[t_idx], strict=True)):
+            if p is None or fp.source != "osm" or p.area < min_m2:
+                continue
+            t = fp.tags
+            if fp.kind in _PLAIN_KINDS and not t.get("amenity") and not t.get("name"):
+                continue
+            pieces, covered = [], 0.0
+            same = False
+            for j in tree.query(p, predicate="intersects"):
+                k, q = base[int(j)]
+                if polys[0][k] is None:
+                    continue
+                inter = shapely.intersection(p, q).area
+                if inter / (p.area + q.area - inter) >= iou_same:
+                    same = True
+                    break
+                if inter >= 0.6 * q.area:
+                    pieces.append(k)
+                    covered += inter
+            if same or len(pieces) < 2 or covered < 0.5 * p.area:
+                continue
+            for k in pieces:
+                polys[0][k] = None
+            ids = tuple(tiers[0][k].id for k in pieces)
+            tiers[0].append(dataclasses.replace(fp, also=(*fp.also, *ids)))
+            polys[0].append(p)
+            polys[t_idx][i] = None
+            promoted += 1
+    return promoted
 
 
 def _covered_by(

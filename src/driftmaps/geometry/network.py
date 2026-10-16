@@ -1810,7 +1810,9 @@ def _urban_section(
         n = len(m)
         xz = sr.xz
         left2 = m.left[:, [0, 2]]
-        municipal = walks.sides(xz, left2, m.half_width) if walks else None
+        # No far probe on a one-way carriageway's left (a divided road's median).
+        far = (not is_oneway(sr.tags), True)
+        municipal = walks.sides(xz, left2, m.half_width, far) if walks else None
         wl, wr = sts.walk_sides([sr.tags] * n, np.full(n, sr.along), sr.urban, municipal, m.s)
         reach = m.half_width + float(sts.section_width(sts.SIDEWALK_LOCAL_M)) + 0.5
         for mask, sign in ((wl, 1.0), (wr, -1.0)):
@@ -2440,6 +2442,12 @@ HOUSE_KINDS = frozenset(
     "house detached residential semidetached_house bungalow yes farm cabin terrace".split()
 )
 HOUSE_AREA_M2 = (45.0, 800.0)
+DRIVEWAY_FRONT_M = 40.0  # a garage door faces a built road whose edge is this close
+DRIVEWAY_DOOR_MARGIN_M = 0.6  # a town driveway: the garage door's width + this
+DRIVEWAY_MIN_WIDTH_M = 3.0
+DRIVEWAY_TOWN_JUNCTION_M = 10.0  # no town driveway mouth this close to a junction centre
+DRIVEWAY_OSM_SERVED_M = 3.0  # an OSM driveway this close to a building serves it
+DRIVEWAY_SHARED = 0.3  # a driveway may share this much of its area with another (pairs)
 SUBDIVISION_NEIGHBOURS = 5  # this many houses within 60 m: a subdivision, not a rural lot
 
 
@@ -2460,6 +2468,7 @@ class DrivewayResult:
     pieces: list[ScenePiece] = field(default_factory=list)
     items: list[PlannedItem] = field(default_factory=list)
     masks_changed: bool = False
+    skipped: dict[str, int] = field(default_factory=dict)  # garage doors without one, by why
 
     @property
     def stats(self) -> dict[str, int]:
@@ -2511,17 +2520,26 @@ def _nearest_road(
 
 def build_driveways(
     net: RoadNetwork,
-    footprints: Sequence[tuple[shapely.Geometry, str]],
+    footprints: Sequence[tuple],
     ground: Callable[[np.ndarray], np.ndarray],
     options: NetworkOptions | None = None,
     *,
     infer: bool = True,
 ) -> DrivewayResult:
-    """OSM driveways and one inferred driveway per detached house without one (`footprints`:
-    the placed buildings' (polygon, building kind) in AC XZ), draped on the terrain
-    (`ground(xz)`). Their mouths cut the route's edge line and replace the route shoulder
-    they cover (`net.masks` is updated: rebuild the route meshes when `masks_changed`); rural
-    driveways get a mailbox on the right of the mouth (seen from the road)."""
+    """OSM driveways and inferred ones (`footprints`: the placed buildings' (polygon,
+    building kind) in AC XZ, or (polygon, kind, fronts) where `fronts` are the building's
+    garage doors as (centre XZ, outward normal, width)), draped on the terrain (`ground(xz)`).
+    Their mouths cut the route's edge line and replace the route shoulder they cover
+    (`net.masks` is updated: rebuild the route meshes when `masks_changed`); rural driveways
+    get a mailbox on the right of the mouth (seen from the road).
+
+    Inferred, in town (the user's Oakville check, 2026-10-16: "some houses not having
+    driveways"): every garage door (each house's, each townhouse unit's, each garage's) that
+    faces a built road within `DRIVEWAY_FRONT_M` gets a driveway straight from the door to
+    that road's edge, as wide as the door + `DRIVEWAY_DOOR_MARGIN_M`, unless an OSM driveway
+    already serves the building, it would cross another building or most of another
+    driveway, or its mouth falls in a junction. Rural houses (and buildings without doors)
+    get one driveway from the road nearest to them (`DRIVEWAY_MAX_M`)."""
     options = options or NetworkOptions()
     res = DrivewayResult()
     if not net.route_columns:
@@ -2536,12 +2554,15 @@ def build_driveways(
         + [shapely.Point(rb.centre).buffer(rb.zone_r + 10.0) for rb in net.roundabouts]
     )
     junction_tree = cKDTree(net.junction_xz) if len(net.junction_xz) else None
-    houses = [
-        (poly, kind)
-        for poly, kind in footprints
-        if kind in HOUSE_KINDS and HOUSE_AREA_M2[0] <= poly.area <= HOUSE_AREA_M2[1]
-    ]
-    all_fp = [poly for poly, _ in footprints]
+    fronts_of: dict[int, tuple] = {}
+    houses = []
+    for fp in footprints:
+        poly, kind = fp[0], fp[1]
+        fronts = tuple(fp[2]) if len(fp) > 2 and fp[2] else ()
+        if fronts or (kind in HOUSE_KINDS and HOUSE_AREA_M2[0] <= poly.area <= HOUSE_AREA_M2[1]):
+            fronts_of[len(houses)] = fronts
+            houses.append((poly, kind))
+    all_fp = [fp[0] for fp in footprints]
     fp_tree = shapely.STRtree(all_fp) if all_fp else None
     centroids = np.array([p.centroid.coords[0] for p, _ in houses]).reshape(-1, 2)
     house_tree = cKDTree(centroids) if len(centroids) else None
@@ -2577,11 +2598,81 @@ def build_driveways(
         drives.append(Driveway(shapely.LineString(path), path, "osm", rural, road, edge_pt, n))
         drives[-1].polygon = _driveway_polygon(path, w, rural, near, None)
 
-    served = _union([d.polygon for d in drives]).buffer(DRIVEWAY_SERVED_M) if drives else None
+    osm_served = _union([d.polygon for d in drives]) if drives else None
+    served = osm_served.buffer(DRIVEWAY_SERVED_M) if osm_served is not None else None
+    taken: list[shapely.Geometry] = [d.polygon for d in drives]
+    taken_tree: list = [None, 0]  # STRtree over `taken`, rebuilt lazily
+
+    def overlaps_taken(dw: shapely.Geometry) -> bool:
+        if taken_tree[1] != len(taken):
+            taken_tree[0] = shapely.STRtree(taken) if taken else None
+            taken_tree[1] = len(taken)
+        if taken_tree[0] is None:
+            return False
+        for j in taken_tree[0].query(dw, predicate="intersects"):
+            if shapely.intersection(dw, taken[int(j)]).area > DRIVEWAY_SHARED * dw.area:
+                return True
+        return False
+
+    def door_driveway(h: int, c: np.ndarray, nrm: np.ndarray, width: float) -> Driveway | None:
+        """A town driveway from a garage door at `c` (facing `nrm`) to the road it faces."""
+        poly = houses[h][0]
+        width = max(DRIVEWAY_MIN_WIDTH_M, width + DRIVEWAY_DOOR_MARGIN_M)
+        skip = res.skipped
+        near = _road_ahead(roads, c, nrm, DRIVEWAY_FRONT_M + 15.0)
+        if near is None:
+            near = _nearest_road(roads, c + nrm * 0.5)
+        if near is None:
+            skip["no_road"] = skip.get("no_road", 0) + 1
+            return None
+        road, edge_pt, tan, n, edge, _ = near
+        to_road = edge_pt - c
+        dist = float(np.linalg.norm(to_road))
+        why = None
+        if not (DRIVEWAY_MIN_M - 1.0 <= edge <= DRIVEWAY_FRONT_M) or dist < 1e-6:
+            why = "too_far" if edge > DRIVEWAY_FRONT_M else "at_the_curb"
+        elif float(to_road @ nrm) < 0.5 * dist:  # the road is not in front of the door
+            why = "faces_no_road"
+        elif junction_tree is not None and (
+                junction_tree.query(edge_pt)[0] < DRIVEWAY_TOWN_JUNCTION_M):  # fmt: skip
+            why = "junction"
+        elif blocked is not None and not blocked.is_empty and blocked.distance(
+                shapely.Point(edge_pt)) < 5.0:  # fmt: skip
+            why = "island"
+        if why is not None:
+            skip[why] = skip.get(why, 0) + 1
+            return None
+        path = np.array([edge_pt - n * 0.3, c])
+        body = shapely.LineString(path).buffer(width / 2, cap_style="flat")
+        dw = body.difference(poly)
+        if dw.is_empty:
+            return None
+        if fp_tree is not None:
+            inner = dw.buffer(-0.25)
+            hits = fp_tree.query(inner, predicate="intersects")
+            if any(all_fp[i] is not poly for i in hits):
+                skip["building"] = skip.get("building", 0) + 1
+                return None  # never through another building
+        if overlaps_taken(dw):
+            skip["driveway"] = skip.get("driveway", 0) + 1
+            return None
+        return Driveway(dw, path, "inferred", False, road, edge_pt, n)
+
     if infer:
         order = np.argsort([route_tree.query(c)[0] for c in centroids]) if len(houses) else []
         for h in order:
             poly, _ = houses[int(h)]
+            fronts = fronts_of.get(int(h), ())
+            if fronts and not rural_at(centroids[h], -2):
+                if osm_served is not None and osm_served.distance(poly) < DRIVEWAY_OSM_SERVED_M:
+                    continue  # OSM maps this one's driveway
+                for c, nrm, width in fronts:
+                    d = door_driveway(int(h), np.asarray(c, np.float64),
+                                      np.asarray(nrm, np.float64), float(width))  # fmt: skip
+                    if d is not None:
+                        drives.append(d)
+                        taken.append(d.polygon)
+                continue
             if route_tree.query(centroids[h])[0] > options.radius_m:
                 continue
             if served is not None and served.intersects(poly):
@@ -2631,8 +2722,11 @@ def build_driveways(
                     continue
             if served is not None and served.intersects(dw):
                 continue
+            if overlaps_taken(dw):
+                continue
             d = Driveway(dw, path, "inferred", rural, road, edge_pt, n)
             drives.append(d)
+            taken.append(dw)
             grown = dw.buffer(DRIVEWAY_SERVED_M)
             served = grown if served is None else served.union(grown)
 
@@ -2755,6 +2849,33 @@ def build_driveways(
     if mouths and net.urban_bands:
         net.urban_pieces, _ = urban_section_meshes(net, _union(mouths), options)
     return res
+
+
+def _road_ahead(
+    roads: Sequence[tuple[int, CentreLine, float]], p: np.ndarray, nrm: np.ndarray, reach: float
+) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, float, float] | None:
+    """Like `_nearest_road`, for the first road a ray from `p` along `nrm` crosses within
+    `reach` (the road a garage door faces), the edge point taken square to that road."""
+    ray = shapely.LineString([p, p + nrm * reach])
+    best = None
+    for idx, cl, shoulder in roads:
+        if not cl.near(p[None], reach).any():
+            continue
+        hit = ray.intersection(shapely.LineString(cl.xz))
+        if hit.is_empty:
+            continue
+        pts = shapely.get_coordinates(hit)
+        t = float(np.min((pts - p) @ nrm))
+        if best is None or t < best[0]:
+            best = (t, idx, cl, shoulder)
+    if best is None:
+        return None
+    _, idx, cl, shoulder = best
+    foot, tan, d, hw = cl.nearest(p[None])
+    n = np.array([tan[0, 1], -tan[0, 0]])
+    if n @ (p - foot[0]) < 0:
+        n = -n
+    return idx, foot[0] + n * hw[0], tan[0], n, float(d[0] - hw[0]), shoulder
 
 
 def _driveway_polygon(

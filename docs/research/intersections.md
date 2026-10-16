@@ -61,6 +61,7 @@ sources list is at the end. Code: `geometry/lanes.py`, `geometry/streetscape.py`
 | Arrow lens | 300 mm | [TOR-SIG] §3.4 |
 | Pole set-back from the curb | at least 1.0 m where possible | [TOR-SIG] §3.9 |
 | Mast arm length | 1.2-7.6 m (standard lengths); 7.6 m single arm on a 9.1 m pole | [TOR-SIG] Tables 1-2 |
+| Arm drawn by the generator | 4.5-12 m; lanes beyond 12 m of the far-right pole get a far-side median pole (divided roads), never a longer arm | 4.5-7.6 m [TOR-SIG]; up to 12 m on wide suburban arterials **ASSUMED** (no Ontario standard found, 2026-10-16) |
 | Push buttons | within 3.0 m of the crosswalk | [TOR-SIG] §3.9 |
 | When the generator signalizes | OSM `highway=traffic_signals`; else a town junction where the approach and the road it crosses are both at least collectors and one is an arterial | **ASSUMED** rule (`street_items.signalized`) |
 

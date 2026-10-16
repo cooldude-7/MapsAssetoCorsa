@@ -479,3 +479,41 @@ def test_cul_de_sac_mapped_as_a_loop_gets_its_island():
     assert any(isl.contains(centre) for isl in net.islands)
     assert not net.polygons["asphalt"].contains(centre)
     assert net.paved.contains(shapely.Point(0.0, 81.5))  # the loop's carriageway
+
+
+def test_every_town_garage_door_facing_a_built_road_gets_a_driveway():
+    # A subdivision street (x = 0, z 0..110) off the route, its houses 12 m apart on the east
+    # side, each with a garage door on its front wall facing the street; one more house whose
+    # garage faces away from every road, and one behind a neighbour.
+    model = _model(np.array([[-200.0, 0.0], [200.0, 0.0]]))
+    ways = [
+        NetWay(1, (1, 2, 3, 4, 5), np.array([[-200, 0], [-100, 0], [0, 0], [100, 0], [200, 0.0]]),
+               {"highway": "tertiary", "lanes": "2"}),
+        NetWay(2, (3, 10, 11), np.array([[0, 0], [0, 60], [0, 110.0]]),
+               {"highway": "residential", "lanes": "2"}),
+    ]  # fmt: skip
+    net = build_network(
+        model, ways, [], route_nodes={1, 2, 3, 4, 5},
+        route_segments={(1, 2), (2, 3), (3, 4), (4, 5)}, route_highway=["tertiary"] * len(model),
+        dtm=flat, options=OPTS,
+    )  # fmt: skip
+    west = np.array([-1.0, 0.0])
+    fps = []
+    for k in range(6):
+        z0 = 30.0 + 12.0 * k
+        house = shapely.Polygon([(14, z0), (26, z0), (26, z0 + 10), (14, z0 + 10)])
+        fps.append((house, "house", ((np.array([13.95, z0 + 2.5]), west, 3.0),)))
+    away = shapely.Polygon([(60, 40), (72, 40), (72, 50), (60, 50)])  # garage faces east
+    fps.append((away, "house", ((np.array([72.05, 45.0]), -west, 3.0),)))
+    behind = shapely.Polygon([(32, 54), (44, 54), (44, 64), (32, 64)])  # a house in the way
+    fps.append((behind, "house", ((np.array([31.95, 56.5]), west, 3.0),)))
+    res = build_driveways(net, fps, flat, OPTS)
+    inferred = [d for d in res.driveways if d.source == "inferred"]
+    served = [any(d.polygon.distance(fp[0]) < 0.5 for d in inferred) for fp in fps]
+    assert served[:6] == [True] * 6  # 12 m lots: every house, not every other one
+    assert not served[6] and not served[7]
+    sk = res.skipped
+    assert sk.get("faces_no_road", 0) + sk.get("too_far", 0) >= 1 and sk.get("building", 0) >= 1
+    for d in inferred:
+        assert d.road != -1 and d.normal == pytest.approx((1.0, 0.0), abs=1e-6)  # square
+        assert d.polygon.area >= 3.0 * 8.0  # door width + margin, from the curb to the door

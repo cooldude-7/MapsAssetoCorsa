@@ -10,7 +10,14 @@
 3. The neighbourhood: at least `URBAN_STREET_M` of residential streets within
    `URBAN_RADIUS_M`, and `maxspeed` <= 60 (or untagged) -> urban (a subdivision).
 4. Otherwise rural (Ontario's rural cross-section: gravel shoulders and ditches).
-Short flips along a road are smoothed away (`URBAN_MIN_RUN_M`).
+Along a road the classification is smoothed (`smooth_runs`, `URBAN_MIN_RUN_M` = 150 m): rural
+gaps shorter than that between urban stretches are filled, then urban stretches shorter than
+that are dropped (the user's Oakville check, 2026-10-16: "some sidewalks breaking/stopping").
+
+**Sidewalks** (`walk_sides`) follow OSM `sidewalk*` tags, then the municipal lines beside the
+road (`SidewalkIndex`, up to `SidewalkIndex.FAR_M` from the asphalt edge: arterial
+boulevards are wide), then the rule; smoothed the same way, except that a stretch OSM tags
+`sidewalk=no` is never filled.
 """
 
 from __future__ import annotations
@@ -22,16 +29,18 @@ import shapely
 from scipy.spatial import cKDTree
 
 __all__ = [
+    "URBAN_MIN_RUN_M",
     "URBAN_RADIUS_M",
     "URBAN_STREET_M",
     "UrbanContext",
     "sidewalk_sides",
+    "smooth_runs",
     "tag_context",
 ]
 
 URBAN_RADIUS_M = 150.0
 URBAN_STREET_M = 500.0  # residential streets within the radius that make a subdivision
-URBAN_MIN_RUN_M = 40.0  # urban or rural stretches shorter than this take their neighbours'
+URBAN_MIN_RUN_M = 150.0  # rural gaps / urban stretches shorter than this are smoothed away
 _STREET_STEP_M = 10.0
 _LOCAL_CLASSES = frozenset({"residential", "living_street"})
 _YES_SIDES = frozenset({"both", "left", "right", "yes", "separate"})
@@ -169,20 +178,42 @@ class UrbanContext:
             slow = ~(speeds[todo] > 60.0)
             out[todo] = walk | (dense & slow)
         if s is not None and n > 2:
-            out = _smooth_runs(out, np.asarray(s, np.float64), URBAN_MIN_RUN_M)
+            out = smooth_runs(out, np.asarray(s, np.float64), URBAN_MIN_RUN_M)
         return out
 
 
-def _smooth_runs(mask: np.ndarray, s: np.ndarray, min_m: float) -> np.ndarray:
-    """Flip runs shorter than `min_m` (not at the ends) to their neighbours' value."""
-    out = mask.copy()
-    d = np.flatnonzero(np.diff(out.astype(np.int8)) != 0) + 1
-    edges = np.concatenate([[0], d, [len(out)]])
-    for a, b in zip(edges[:-1], edges[1:], strict=True):
-        if a == 0 or b == len(out):
-            continue
-        if s[b - 1] - s[a] < min_m:
-            out[a:b] = not out[a]
+def _runs(mask: np.ndarray) -> list[tuple[int, int, bool]]:
+    """(start, end, value) of each run of equal values."""
+    d = np.flatnonzero(np.diff(mask.astype(np.int8)) != 0) + 1
+    edges = np.concatenate([[0], d, [len(mask)]])
+    return [(int(a), int(b), bool(mask[a])) for a, b in zip(edges[:-1], edges[1:], strict=True)]
+
+
+def smooth_runs(
+    mask: np.ndarray,
+    s: np.ndarray,
+    min_m: float = URBAN_MIN_RUN_M,
+    fixed: np.ndarray | None = None,
+) -> np.ndarray:
+    """Continuity along a road (stations at `s`): False gaps shorter than `min_m` between True
+    stretches are filled (unless a station of the gap is `fixed`: real data says no), then
+    True stretches shorter than `min_m` that do not reach an end of the road are dropped."""
+    out = np.asarray(mask, bool).copy()
+    s = np.asarray(s, np.float64)
+    n = len(out)
+    if n < 3:
+        return out
+    hold = np.zeros(n, bool) if fixed is None else np.asarray(fixed, bool)
+
+    def length(a: int, b: int) -> float:  # metres covered by stations a..b-1 (to the next)
+        return float(s[min(b, n - 1)] - s[a]) if b < n else float(s[n - 1] - s[a])
+
+    for a, b, v in _runs(out):
+        if not v and 0 < a and b < n and length(a, b) < min_m and not hold[a:b].any():
+            out[a:b] = True
+    for a, b, v in _runs(out):
+        if v and 0 < a and b < n and length(a, b) < min_m:
+            out[a:b] = False
     return out
 
 
@@ -252,6 +283,8 @@ class SidewalkIndex:
 
     PROBE_M = 4.0  # probe this far beyond the asphalt edge ...
     REACH_M = 3.5  # ... for a sidewalk line within this distance (0.5-7.5 m from the edge)
+    FAR_M = 10.5  # and, where `far` allows it, here for one 7.5-13.5 m out (wide boulevards)
+    FAR_REACH_M = 3.0
 
     def __init__(self, lines: Sequence[np.ndarray] = ()) -> None:
         pts = []
@@ -267,18 +300,31 @@ class SidewalkIndex:
         return self.tree is not None
 
     def sides(
-        self, xz: np.ndarray, left: np.ndarray, half_width: np.ndarray
+        self,
+        xz: np.ndarray,
+        left: np.ndarray,
+        half_width: np.ndarray,
+        far: tuple[np.ndarray | bool, np.ndarray | bool] = (True, True),
     ) -> tuple[np.ndarray, np.ndarray]:
-        """(left, right) (N,) bools: a sidewalk line runs beside the road there."""
+        """(left, right) (N,) bools: a sidewalk line runs beside the road there. `far`
+        (left, right; per station or one value) allows the far probe: not on a divided
+        road's median side, where it would find the other carriageway's sidewalk."""
         xz = np.asarray(xz, np.float64).reshape(-1, 2)
         if self.tree is None:
             z = np.zeros(len(xz), bool)
             return z, z.copy()
+        hw = np.asarray(half_width, np.float64).reshape(-1)[:, None]
         out = []
-        for sign in (1.0, -1.0):
-            probe = xz + sign * left * (np.asarray(half_width)[:, None] + self.PROBE_M)
+        for sign, far_ok in zip((1.0, -1.0), far, strict=True):
+            probe = xz + sign * left * (hw + self.PROBE_M)
             d, _ = self.tree.query(probe, distance_upper_bound=self.REACH_M)
-            out.append(np.isfinite(d))
+            got = np.isfinite(d)
+            ok = np.broadcast_to(np.asarray(far_ok, bool), got.shape) & ~got
+            if ok.any():
+                probe2 = xz[ok] + sign * left[ok] * (hw[ok] + self.FAR_M)
+                d2, _ = self.tree.query(probe2, distance_upper_bound=self.FAR_REACH_M)
+                got[np.flatnonzero(ok)] = np.isfinite(d2)
+            out.append(got)
         return out[0], out[1]
 
 
@@ -300,33 +346,48 @@ def walk_sides(
     s: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Sidewalk (left, right) per station of a road driven along `s`: OSM `sidewalk*` tags
-    first (`along`: the road runs along its way's direction there), then the municipal lines,
-    then the rule (urban collectors and arterials both sides, local streets none). Only on
-    `urban` stations; short flips smoothed away."""
+    first (`along`: the road runs along its way's direction there), then the municipal lines
+    (a way they miss on both sides over its whole length is taken as not surveyed: a new
+    road), then the rule (urban collectors and arterials both sides, a one-way carriageway of
+    a divided road its outer (right) side only, local streets none). Only on `urban`
+    stations; short gaps and stretches smoothed away (`smooth_runs`)."""
     from driftmaps.geometry.street_items import highway_rank
 
     n = len(tags)
     left = np.zeros(n, bool)
     right = np.zeros(n, bool)
+    no_left = np.zeros(n, bool)  # OSM says there is none: never filled
+    no_right = np.zeros(n, bool)
     cache: dict[int, tuple] = {}
     major = highway_rank("tertiary")
+    surveyed = np.ones(n, bool)
+    if municipal is not None:
+        hit = np.asarray(municipal[0], bool) | np.asarray(municipal[1], bool)
+        keys = np.array([id(t) for t in tags])
+        for k in set(keys.tolist()):
+            sel = keys == k
+            if not hit[sel].any():
+                surveyed[sel] = False
     for i, t in enumerate(tags):
         k = id(t)
         if k not in cache:
-            cache[k] = (sidewalk_sides(t), highway_rank(t.get("highway", "")) >= major)
-        (ol, orr), is_major = cache[k]
+            one = str(t.get("oneway", "")).strip().lower() in ("yes", "1", "true", "-1")
+            cache[k] = (sidewalk_sides(t), highway_rank(t.get("highway", "")) >= major, one)
+        (ol, orr), is_major, one = cache[k]
         if not along[i]:
             ol, orr = orr, ol
         ml = bool(municipal[0][i]) if municipal is not None else False
         mr = bool(municipal[1][i]) if municipal is not None else False
-        left[i] = ol if ol is not None else (ml or (municipal is None and is_major))
-        right[i] = orr if orr is not None else (mr or (municipal is None and is_major))
-    left &= urban
-    right &= urban
+        rule = municipal is None or not surveyed[i]
+        left[i] = ol if ol is not None else (ml or (rule and is_major and not one))
+        right[i] = orr if orr is not None else (mr or (rule and is_major))
+        no_left[i], no_right[i] = ol is False, orr is False
+    urban = np.asarray(urban, bool)
     if s is not None and n > 2:
-        left = _smooth_runs(left, np.asarray(s, np.float64), 20.0)
-        right = _smooth_runs(right, np.asarray(s, np.float64), 20.0)
-    return left, right
+        s = np.asarray(s, np.float64)
+        left = smooth_runs(left, s, URBAN_MIN_RUN_M, fixed=no_left | ~urban)
+        right = smooth_runs(right, s, URBAN_MIN_RUN_M, fixed=no_right | ~urban)
+    return left & urban, right & urban
 
 
 # --------------------------------------------------------------------------------------------

@@ -83,6 +83,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import json
+import logging
 import time
 import urllib.error
 import warnings
@@ -174,6 +175,7 @@ from driftmaps.geo.buildings import (
     conflate,
     fetch_ms_buildings,
     fetch_osm_buildings,
+    fetch_use_areas,
     route_boxes,
     within_route,
 )
@@ -1418,6 +1420,7 @@ DECK_TOLERANCE_M = 0.05  # terrain grazing a deck by less than this is not repor
 APPROACH_RAIL_M = 20.0  # opt-in rails on both sides this far before and after each bridge
 BUILDINGS_AROUND_M = 300.0  # buildings drawn this close to the road (BuildingOptions)
 BUILDINGS_FETCH_M = 400.0  # footprints fetched this far: the far trees keep off them too
+log = logging.getLogger(__name__)
 _DATA_ERRORS = (OverpassError, SourceUnavailable, OSError, urllib.error.URLError, EOFError)
 
 
@@ -1637,7 +1640,10 @@ def _route_section(geo: TrackGeometry, walks: SidewalkIndex | None) -> None:
     along = np.array([dirs.get(int(w), 1) > 0 for w in geo.way_id.tolist()])
     municipal = None
     if walks:
-        municipal = walks.sides(m.centre[:, [0, 2]], m.left[:, [0, 2]], m.half_width)
+        # No far probe on a divided road's median side (the other carriageway's sidewalk).
+        one = np.asarray(geo.oneway) != 0 if len(geo.oneway) == len(m) else np.zeros(len(m), bool)
+        far = (~one, True) if geo.driving_side == "right" else (True, ~one)
+        municipal = walks.sides(m.centre[:, [0, 2]], m.left[:, [0, 2]], m.half_width, far)
     left, right = walk_sides(tags, along, urban, municipal, m.s)
     walk_w = np.array([sidewalk_width(t.get("highway", "")) for t in tags])
     geo.section = RouteSection(urban, left, right, walk_w)
@@ -1729,7 +1735,7 @@ def _driveways(
 ) -> RoadMeshes:
     """OSM and inferred driveways (they need the placed buildings) with their mailboxes; the
     route meshes are rebuilt when driveway mouths cut its edge lines or shoulders."""
-    footprints = [(b.polygon, b.kind) for b in sc.buildings]
+    footprints = [(b.polygon, b.kind, _garage_fronts(b)) for b in sc.buildings]
     res = build_driveways(net, footprints, ground, options.network_options)
     net.driveways = res.driveways
     net.planned_items += res.items
@@ -1740,6 +1746,34 @@ def _driveways(
             m, chunk_m=options.chunk_m, keep=net.masks, lines=paint, section=section
         )
     return roads
+
+
+DRIVEWAY_CATEGORIES = ("house", "townhouse", "garage")
+
+
+def _garage_fronts(b: Building) -> tuple[tuple[np.ndarray, np.ndarray, float], ...]:
+    """(centre, outward normal, width) of the garage doors of a house, townhouse row or
+    garage, where its driveways start (`network.build_driveways`); a house without one gets
+    a single-car width at the end of its front wall. Empty for other buildings."""
+    if b.category not in DRIVEWAY_CATEGORIES or b.front_normal is None:
+        return ()
+    out = []
+    for d in b.doors:
+        if d.style.startswith("garage"):
+            along = d.b - d.a
+            w = float(np.linalg.norm(along))
+            if w > 1e-6:
+                nrm = np.array([-along[1], along[0]]) / w
+                out.append((d.centre + nrm * 0.05, nrm, w))
+    if out or b.category != "house":
+        return tuple(out)
+    i = b.front_edge
+    a, c = b.ring[i], b.ring[(i + 1) % len(b.ring)]
+    length = float(np.linalg.norm(c - a))
+    if length < 3.0:
+        return ()
+    t = (c - a) / length
+    return ((a + t * min(2.3, 0.5 * length) + b.front_normal * 0.05, b.front_normal, 2.4),)
 
 
 def _terrain_extra(net: RoadNetwork | None) -> TerrainExtra | None:
@@ -2014,6 +2048,14 @@ def _buildings(
     )
     sc.footprints = res
     roads = _building_roads(geo, options)
+    local: list[np.ndarray] = []
+    if sc.network is not None:  # every built street, so a house faces its own
+        roads += [np.asarray(sr.xz, np.float64) for sr in sc.network.side_roads
+                  if len(sr.xz) >= 2]  # fmt: skip
+        local = [np.asarray(sr.xz, np.float64) for sr in sc.network.side_roads
+                 if sr.highway in LOCAL_STREETS and len(sr.xz) >= 2]  # fmt: skip
+    local += _local_route_runs(geo)
+    areas = _use_areas(geo, options) if options.building_footprints is None else []
 
     landcover = _landcover_fn(geo, options)
     paved = sc.network.paved if sc.network is not None else None
@@ -2022,7 +2064,7 @@ def _buildings(
         return place_buildings(
             res.footprints, geo.projection, geo.model, ground,
             corridor=corridor, canopy=c, seed=track_id, roads=roads, landcover=landcover,
-            paved=paved, report=sc.building_report,
+            paved=paved, report=sc.building_report, areas=areas, local_roads=local,
         )  # fmt: skip
 
     try:
@@ -2033,6 +2075,43 @@ def _buildings(
     if sc.buildings:
         lines = res.attributions_for({b.id for b in sc.buildings})
         sc.attributions += [a for a in lines if a not in sc.attributions]
+
+
+LOCAL_STREETS = ("residential", "living_street", "unclassified")
+
+
+def _local_route_runs(geo: TrackGeometry) -> list[np.ndarray]:
+    """The route's stretches on local streets (XZ polylines), where houses face it."""
+    m = geo.model
+    if len(geo.way_id) != len(m):
+        return []
+    local = np.array([geo.route.ways.get(int(w), {}).get("highway") in LOCAL_STREETS
+                      for w in geo.way_id.tolist()])  # fmt: skip
+    out = []
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], local.astype(np.int8), [0]])))
+    for a, b in zip(edges[::2], edges[1::2], strict=True):
+        if b - a >= 2:
+            out.append(m.centre[a:b, [0, 2]].copy())
+    return out
+
+
+def _use_areas(
+    geo: TrackGeometry, options: BuildOptions
+) -> list[tuple[shapely.Geometry, dict[str, str]]]:
+    """OSM land use and campus polygons (AC XZ) with their tags near the route, for what a
+    commercial building is for; empty when unavailable (the size rule decides)."""
+    try:
+        got = fetch_use_areas(_route_lonlat(geo), cache_dir=options.cache_dir,
+                              around_m=BUILDINGS_AROUND_M, offline=options.offline)  # fmt: skip
+    except _DATA_ERRORS as e:
+        log.info("land use for building types unavailable: %s", _short(e))
+        return []
+    out = []
+    for ring, tags in got:
+        poly = shapely.make_valid(shapely.Polygon(_xz(geo.projection, ring)))
+        if not poly.is_empty and poly.area > 0:
+            out.append((poly, tags))
+    return out
 
 
 def _landcover_fn(geo: TrackGeometry, options: BuildOptions) -> LandcoverFn:

@@ -291,3 +291,71 @@ def test_commercial_roofs_stay_flat_and_gables_keep_brick_proportions():
     v_per_m = (v1 - v0) / 3.0  # one storey of band per 3 m
     top = np.argmax(ys)
     assert uv[top, 1] == pytest.approx(v1 - (ys[top] - house.eave_y) * v_per_m, abs=1e-4)
+
+
+def test_big_landmarks_are_always_placed():
+    # A 40,000 m2 hospital 120 m from the road, a school a service lane clips, and 300 small
+    # houses that use up the whole byte budget before either (the user's Oakville check: the
+    # hospital and King's Christian Collegiate were missing).
+    hospital = _fp("osm:w1", _rect(-100, 130, 200, 200), tags={"building": "hospital"})
+    school = _fp("oakville:2", _rect(150, 40, 80, 85), "oakville",
+                 tags={"building": "school", "name": "King's Christian"})  # fmt: skip
+    houses = [_fp(f"osm:w{100 + k}", _rect(-390 + 13 * (k % 60), 70 + 14 * (k // 60), 10, 9))
+              for k in range(300)]  # fmt: skip
+    lane = shapely.box(150, 38, 230, 44)  # a paved drop-off lane under the school's edge
+    o = BuildingOptions(budget_bytes=200_000, town_budget_bytes=200_000)
+    rep: dict = {}
+    out = place_buildings([hospital, school, *houses], PROJ, _road(), _flat, seed="t", options=o,
+                          paved=lane, report=rep)  # fmt: skip
+    got = {b.id: b for b in out}
+    assert "osm:w1" in got and "oakville:2" in got
+    assert rep["budget"] > 0 and rep["landmarks"] >= 2  # the budget bound, the landmarks stayed
+    assert got["osm:w1"].area_m2 == pytest.approx(40_000.0, rel=0.01)  # no 20,000 m2 cap
+    s = got["oakville:2"]
+    assert not s.polygon.intersects(lane) and s.area_m2 > 0.9 * 80 * 85  # cut back, not dropped
+    assert got["osm:w1"].use == s.use == "institutional"
+    assert got["osm:w1"].eave_h >= 15.0  # a hospital is several storeys
+
+
+def test_stores_industrial_and_houses_wear_their_own_skins():
+    road = _road()
+
+    def one(tags, ring, **kw):
+        out = place_buildings([_fp("osm:w9", ring, tags=tags)], PROJ, road, _flat, seed="t", **kw)
+        assert len(out) == 1
+        return out[0]
+
+    plaza = one({"building": "retail", "shop": "supermarket"}, _rect(-40, 30, 80, 25))
+    plant = one({"building": "industrial"}, _rect(-60, 40, 120, 60))
+    school = one({"building": "school"}, _rect(-50, 40, 100, 40))
+    office = one({"building": "office", "building:levels": "6"}, _rect(-20, 40, 40, 30))
+    house = one({"building": "house"}, _rect(-6, 30, 12, 9))
+    untyped = one(
+        {"building": "commercial"},
+        _rect(-30, 40, 60, 30),
+        areas=[(shapely.box(-500, 0, 500, 300), {"landuse": "industrial"})],
+    )
+    assert plaza.use == "retail" and plaza.ground_style == "storefront"
+    assert plaza.wall_style in ("eifs_light", "eifs_tan", "brick_buff", "brick_grey", "brick_red")
+    assert plaza.parapet_m > 0 and plaza.roof.shape == ROOF_FLAT
+    # The storefront faces the road (north wall, -Z); the back wall is plain.
+    ring = plaza.ring
+    d = np.roll(ring, -1, axis=0) - ring
+    outward_z = d[:, 0] / np.linalg.norm(d, axis=1)  # z of the outward normal (-d_z, d_x)
+    assert [bool(f) for f in plaza.ground_edges] == [bool(z < -0.5) for z in outward_z]
+    assert plant.use == "industrial" and plant.ground_style == "loading_docks"
+    assert plant.wall_style in ("metal_panel", "metal_panel_blue", "precast", "steel_white")
+    assert school.use == "institutional" and school.wall_style.startswith("institutional")
+    assert office.use == "office"
+    assert untyped.use == "industrial"  # from the land use around it
+    assert house.use == "" and house.ground_style is None and house.parapet_m == 0.0
+    assert not house.wall_style.startswith(("eifs", "metal_panel", "institutional", "curtain"))
+    # The meshes put the storefront band on the ground storey only, on the street side.
+    m = extrude_building(plaza)
+    sv = band_v("storefront")
+    ground_v = (m.uvs[:, 1] >= sv[0] - 1e-9) & (m.uvs[:, 1] <= sv[1] + 1e-9)
+    assert ground_v.any() and m.positions[ground_v, 1].max() <= plaza.ground_y + 3.3 + 1e-6
+    assert (m.normals[ground_v][:, 2] < -0.9).all()  # only on the north (street) wall
+    # The parapet: the flat roof sits below the wall top.
+    up = m.normals[:, 1] > 0.99
+    assert m.positions[up, 1].max() == pytest.approx(plaza.eave_y - plaza.parapet_m)

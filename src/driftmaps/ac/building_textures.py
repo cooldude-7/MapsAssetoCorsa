@@ -60,6 +60,7 @@ __all__ = [
     "WINDOW_ZONE_M",
     "WINDOWED",
     "BuildingStyle",
+    "atlas_height",
     "DoorStyle",
     "band_v",
     "building_atlas",
@@ -70,9 +71,9 @@ __all__ = [
     "wall_u_start",
 ]
 
-ATLAS_SIZE = 1024  # width; the atlas is twice as tall
+ATLAS_SIZE = 1024  # width; the atlas is BAND_COUNT / 16 times as tall
 ATLAS_SEED = 20261016
-BAND_COUNT = 32
+BAND_COUNT = 64  # 42 used: room to grow without moving a band (each is size / 16 px tall)
 STOREY_M = 3.0  # a wall band is one storey tall
 ATLAS_U_M = 48.0  # metres of wall/roof per atlas width (square pixels at 1024 px: 16 x 3 m)
 INSET_PX = 1.5  # v inset at each band edge (texels at the top level)
@@ -126,6 +127,19 @@ _STYLE_NAMES: tuple[tuple[str, Surface], ...] = (
     ("metal_blue", "roof"),
     ("flat_membrane", "roof"),
     ("doors", "detail"),
+    # Commercial, industrial and institutional walls (the user's Oakville check, 2026-10-16:
+    # "for stores/industrial you need a different skin"). `storefront` and `loading_docks`
+    # are ground storeys (`geometry.buildings` puts them under another band's upper storeys).
+    ("storefront", "wall"),  # plaza / retail ground floor: glazing, mullions, signage fascia
+    ("eifs_light", "wall"),  # light EIFS with reveals, no windows (retail upper, parapets)
+    ("eifs_tan", "wall"),
+    ("metal_panel", "wall"),  # insulated metal panels, silver-grey, few windows
+    ("metal_panel_blue", "wall"),
+    ("precast", "wall"),  # tilt-up precast concrete panels, few windows
+    ("loading_docks", "wall"),  # precast with dock doors and seals (industrial ground floor)
+    ("institutional_buff", "wall"),  # buff brick with long ribbon windows (schools, hospitals)
+    ("institutional_red", "wall"),
+    ("curtain_wall", "wall"),  # office glass curtain wall with spandrels
 )
 STYLES: tuple[BuildingStyle, ...] = tuple(
     BuildingStyle(n, i, s) for i, (n, s) in enumerate(_STYLE_NAMES)
@@ -178,9 +192,14 @@ def styles_for(surface: Surface) -> tuple[BuildingStyle, ...]:
     return tuple(s for s in STYLES if s.surface == surface)
 
 
+def atlas_height(size: int = ATLAS_SIZE) -> int:
+    """The atlas height in pixels for a `size` wide atlas: `BAND_COUNT` bands of size / 16."""
+    return size * BAND_COUNT // 16
+
+
 def band_v(which: BuildingStyle | str | int, size: int = ATLAS_SIZE) -> tuple[float, float]:
     """(v_top, v_bottom) of a style's band in UV space, inset by `INSET_PX` texels. `size` is
-    the atlas WIDTH (its height is 2 x size)."""
+    the atlas WIDTH (its height is `atlas_height(size)`)."""
     if isinstance(which, str):
         band = style(which).band
     elif isinstance(which, BuildingStyle):
@@ -189,8 +208,8 @@ def band_v(which: BuildingStyle | str | int, size: int = ATLAS_SIZE) -> tuple[fl
         band = int(which)
     if not 0 <= band < BAND_COUNT:
         raise ValueError(f"band must be 0..{BAND_COUNT - 1}, got {band}")
-    height = 2 * size
-    h = height / BAND_COUNT
+    height = atlas_height(size)
+    h = size / 16
     return (band * h + INSET_PX) / height, ((band + 1) * h - INSET_PX) / height
 
 
@@ -347,6 +366,7 @@ def _brick(
     *,
     spread: float = 0.07,
     joint_rgb: np.ndarray | None = None,
+    windows: bool = True,
 ):
     """Running-bond brick with light mortar; per-brick tone jitter. Bricks are only ~2 px tall
     at the default size, so the pattern is painted at 4x and box-filtered down (no aliasing)."""
@@ -369,7 +389,9 @@ def _brick(
     lum = lum + 0.03 * _noise(shape, rng, 1.0)
     joint = _rgb(176, 170, 160) if joint_rgb is None else joint_rgb
     rgb = _shade(colour, lum) * (1.0 - m[..., None]) + joint * m[..., None]
-    _paint_windows(rgb, rng, px_per_m, _house_window_spans(px_per_m), trim=_rgb(225, 222, 212))
+    if windows:
+        _paint_windows(rgb, rng, px_per_m, _house_window_spans(px_per_m),
+                       trim=_rgb(225, 222, 212))  # fmt: skip
     return rgb
 
 
@@ -578,6 +600,209 @@ def _doors(shape, rng, px_per_m: float) -> np.ndarray:
     return rgb
 
 
+# ---------------------------------------------------------------------------------------------
+# Commercial, industrial and institutional walls (ASSUMED typical Ontario finishes: plazas of
+# storefront glazing under a sign fascia with EIFS or light brick above, warehouses of
+# insulated metal panels or tilt-up precast with dock doors, schools and hospitals of brick
+# with long ribbon windows, offices of glass curtain wall)
+# ---------------------------------------------------------------------------------------------
+
+_SIGN_COLOURS = (
+    _rgb(178, 34, 38), _rgb(236, 236, 230), _rgb(28, 64, 132), _rgb(232, 186, 42),
+    _rgb(30, 110, 64), _rgb(40, 40, 44), _rgb(214, 96, 30), _rgb(110, 30, 90),
+)  # fmt: skip
+
+
+def _periodic_x(w: int, period_px: float) -> np.ndarray:
+    """Column phase in [0, 1) for a pattern repeating a whole number of times across `w`."""
+    n = max(1, int(round(w / period_px)))
+    return ((np.arange(w)[None, :] + 0.5) * n / w) % 1.0
+
+
+def _storefront(shape, rng, px_per_m: float) -> np.ndarray:
+    """A plaza's ground storey: units 5-9 m wide between EIFS piers, each with aluminium-framed
+    glazing over a dark kick plate, a glass door, and a sign fascia (0.65 m) on top."""
+    h, w = shape
+
+    def py(m: float) -> int:  # metres above the storey floor -> row
+        return int(round(h - m * px_per_m))
+
+    lum = 1.0 + 0.03 * _noise(shape, rng, 2.5)
+    rgb = _shade(_rgb(214, 206, 188), lum)  # EIFS piers and fascia background
+    fascia_lo, glass_hi, kick = 2.35, 2.25, 0.35
+    t = max(1, int(round(0.06 * px_per_m)))
+    x = int(round(rng.uniform(0.4, 0.8) * px_per_m))
+    while True:
+        unit = int(round(rng.uniform(5.0, 9.0) * px_per_m))
+        pier = int(round(rng.uniform(0.45, 0.7) * px_per_m))
+        if x + unit > w - pier:
+            break
+        x0, x1 = x, x + unit
+        frame = _rgb(58, 56, 54) if rng.random() < 0.6 else _rgb(176, 178, 180)
+        y_top, y_kick = py(glass_hi), py(kick)
+        rgb[y_top:h, x0:x1] = frame
+        gy = np.linspace(0.0, 1.0, max(1, y_kick - y_top - t))[:, None, None]
+        glass = _rgb(46, 58, 66) * (0.8 + 0.55 * (1.0 - gy)) + rng.normal(0.0, 3.0)
+        rgb[y_top + t : y_kick, x0 + t : x1 - t] = glass
+        rgb[y_kick : h - t, x0 + t : x1 - t] = _rgb(44, 44, 46)  # kick plate
+        mull = max(1, int(round(1.5 * px_per_m)))
+        for mx in range(x0 + mull, x1 - t, mull):
+            rgb[y_top:h, mx : mx + t] = frame
+        tr = py(2.0)
+        rgb[tr : tr + t, x0:x1] = frame  # transom
+        # A glass door (no kick plate) with a push bar.
+        dw = int(round(0.95 * px_per_m))
+        dx = x0 + t + int(rng.uniform(0.1, 0.8) * max(1, unit - dw - 2 * t))
+        rgb[tr + t : h, dx : dx + dw] = _rgb(52, 64, 72) * 1.1
+        rgb[tr + t : h, dx : dx + t] = frame
+        rgb[tr + t : h, dx + dw - t : dx + dw] = frame
+        rgb[py(1.05) : py(1.0), dx : dx + dw] = _rgb(190, 190, 190)
+        # Sign: a coloured panel on the fascia with "lettering".
+        sx0 = x0 + int(rng.uniform(0.05, 0.25) * unit)
+        sx1 = x1 - int(rng.uniform(0.05, 0.25) * unit)
+        s_top, s_bot = py(fascia_lo + 0.58), py(fascia_lo + 0.08)
+        bg = _SIGN_COLOURS[int(rng.integers(len(_SIGN_COLOURS)))]
+        rgb[s_top:s_bot, sx0:sx1] = bg
+        ink = _rgb(240, 240, 236) if bg.mean() < 140 else _rgb(30, 30, 34)
+        lx = sx0 + max(2, int(0.2 * px_per_m))
+        l_top, l_bot = s_top + max(1, (s_bot - s_top) // 4), s_bot - max(1, (s_bot - s_top) // 4)
+        while lx < sx1 - int(0.3 * px_per_m):
+            lw = int(rng.uniform(0.18, 0.32) * px_per_m)
+            if rng.random() < 0.85:
+                rgb[l_top:l_bot, lx : lx + lw] = ink
+            lx += lw + max(1, int(0.08 * px_per_m))
+        x = x1 + pier
+    rgb[: max(1, int(0.08 * px_per_m))] *= 0.8  # coping line at the top
+    return rgb
+
+
+def _eifs(shape, rng, colour: np.ndarray, px_per_m: float) -> np.ndarray:
+    """Exterior insulation finish: smooth stucco panels, horizontal reveals every 1.5 m and
+    vertical ones every 6 m, a darker cornice reveal at the top; no windows."""
+    h, w = shape
+    y = np.arange(h)[:, None] + 0.5
+    reveal_y = ((y / (1.5 * px_per_m)) % 1.0) < 0.035
+    reveal_x = _periodic_x(w, 6.0 * px_per_m) < 0.012
+    lum = 1.0 + 0.025 * _noise(shape, rng, 2.8) + 0.02 * _noise(shape, rng, 0.4)
+    lum = lum - 0.12 * (reveal_y | reveal_x)
+    rgb = _shade(colour, lum)
+    rgb[: max(1, int(0.15 * px_per_m))] *= 0.86
+    return rgb
+
+
+def _metal_panel(shape, rng, colour: np.ndarray, px_per_m: float) -> np.ndarray:
+    """Insulated metal wall panels: 1 m horizontal panels with shallow striations, a dark base
+    trim, and a few small windows and man doors' worth of openings."""
+    h, w = shape
+    y = np.arange(h)[:, None] + 0.5
+    phase = (y / (1.0 * px_per_m)) % 1.0
+    lum = 1.0 + 0.05 * (phase < 0.04) - 0.09 * ((phase > 0.04) & (phase < 0.08))
+    lum = lum + 0.012 * np.sin(phase * 2 * np.pi * 5.0)
+    lum = lum + 0.012 * _noise(shape, rng, 3.0) + 0.02 * _noise(shape, rng, 0.6)
+    rgb = _shade(colour, np.broadcast_to(lum, shape))
+    rgb[h - max(1, int(0.15 * px_per_m)) :] *= 0.5
+    spans = _random_spans(w, rng, px_per_m, (10.0, 22.0), (1.2, 2.4))
+    _paint_windows(rgb, rng, px_per_m, spans, sill_m=1.2, head_m=2.2, trim=colour * 0.7,
+                   glass=_rgb(40, 48, 56), skip=0.35)  # fmt: skip
+    return rgb
+
+
+def _precast_base(shape, rng, colour: np.ndarray, px_per_m: float) -> np.ndarray:
+    h, w = shape
+    joint = _periodic_x(w, 9.6 * px_per_m) < 0.004
+    lum = 1.0 + 0.03 * _noise(shape, rng, 2.2) + 0.03 * _noise(shape, rng, 0.0)
+    lum = lum - 0.16 * joint
+    return _shade(colour, lum)
+
+
+def _precast(shape, rng, px_per_m: float) -> np.ndarray:
+    """Tilt-up precast concrete: 9.6 m panels, a painted accent reveal, few windows."""
+    h, w = shape
+    rgb = _precast_base(shape, rng, _rgb(196, 192, 182), px_per_m)
+    y0 = int(round(h - 2.6 * px_per_m))
+    rgb[y0 : y0 + max(1, int(0.12 * px_per_m))] = _rgb(92, 104, 118)  # accent reveal
+    spans = _random_spans(w, rng, px_per_m, (12.0, 24.0), (1.5, 3.0))
+    _paint_windows(rgb, rng, px_per_m, spans, sill_m=0.9, head_m=2.3, trim=_rgb(70, 72, 76),
+                   glass=_rgb(38, 46, 54), skip=0.4)  # fmt: skip
+    return rgb
+
+
+def _loading_docks(shape, rng, px_per_m: float) -> np.ndarray:
+    """An industrial ground storey of precast: six dock doors (2.7 m, ribbed white steel,
+    black dock seals, bumpers) every 4 m over the first 24 m, a steel man door at 33 m, then
+    blank wall to the seam."""
+    h, w = shape
+
+    def px(m: float) -> int:
+        return int(round(m * px_per_m))
+
+    rgb = _precast_base(shape, rng, _rgb(190, 186, 176), px_per_m)
+    seal = max(1, px(0.2))
+    for k in range(6):
+        c = 2.4 + 4.0 * k
+        x0, x1 = px(c - 1.35), px(c + 1.35)
+        top = h - px(2.85)
+        rgb[top - seal : h - px(0.25), x0 - seal : x1 + seal] = _rgb(26, 26, 28)  # seal
+        door = np.full((h - px(0.25) - top, x1 - x0, 3), _rgb(214, 216, 214))
+        yy = np.arange(door.shape[0])[:, None]
+        door *= np.where((yy % max(2, px(0.5))) < 1, 0.78, 1.0)[..., None]
+        rgb[top : h - px(0.25), x0:x1] = door
+        for bx in (x0 - seal, x1):
+            rgb[h - px(0.7) : h - px(0.25), bx : bx + seal] = _rgb(18, 18, 18)  # bumpers
+    x0, x1 = px(32.5), px(33.5)
+    rgb[h - px(2.2) : h, x0:x1] = _rgb(118, 120, 124)
+    rgb[h - px(1.1) : h - px(1.05), x1 - px(0.15) : x1 - px(0.08)] = _rgb(200, 200, 200)
+    return rgb
+
+
+def _ribbon_windows(rgb, rng, px_per_m: float, spans, *, sill_m: float, head_m: float,
+                    frame: np.ndarray, glass: np.ndarray, mullion_m: float) -> None:  # fmt: skip
+    """Long horizontal window bands with a mullion every `mullion_m`, painted in place."""
+    h = rgb.shape[0]
+    y_top = int(round(h - head_m * px_per_m))
+    y_bot = int(round(h - sill_m * px_per_m))
+    t = max(1, int(round(0.07 * px_per_m)))
+    mull = max(2, int(round(mullion_m * px_per_m)))
+    for x0, x1 in spans:
+        rgb[y_top:y_bot, x0:x1] = frame
+        gy = np.linspace(0.0, 1.0, max(1, y_bot - y_top - 2 * t))[:, None, None]
+        rgb[y_top + t : y_bot - t, x0 + t : x1 - t] = glass * (0.78 + 0.5 * (1.0 - gy))
+        for mx in range(x0 + mull, x1 - t, mull):
+            rgb[y_top:y_bot, mx : mx + t] = frame
+        rgb[y_bot : y_bot + t, x0:x1] = frame * 1.15  # sill
+
+
+def _institutional(shape, rng, colour: np.ndarray, px_per_m: float) -> np.ndarray:
+    """A school's or hospital's brick with long ribbon windows (8-16 m) between short piers."""
+    h, w = shape
+    rgb = _brick(shape, rng, colour, px_per_m, spread=0.05, windows=False)
+    spans = _random_spans(w, rng, px_per_m, (1.2, 3.5), (8.0, 16.0))
+    _ribbon_windows(rgb, rng, px_per_m, spans, sill_m=0.9, head_m=2.4, frame=_rgb(70, 72, 74),
+                    glass=_rgb(44, 58, 70), mullion_m=1.2)  # fmt: skip
+    rgb[h - max(1, int(0.25 * px_per_m)) :] = rgb[h - max(1, int(0.25 * px_per_m)) :] * 0.9
+    return rgb
+
+
+def _curtain_wall(shape, rng, px_per_m: float) -> np.ndarray:
+    """Office glass curtain wall: blue-green vision glass with a sky gradient and cloud
+    reflections, mullions every 1.5 m, a spandrel panel at each floor line."""
+    h, w = shape
+    gy = np.linspace(0.0, 1.0, h)[:, None]
+    refl = 0.08 * _noise(shape, rng, 3.2)
+    lum = 0.85 + 0.35 * (1.0 - gy) + refl
+    rgb = _shade(_rgb(70, 104, 112), lum)
+    spandrel = h - int(round(0.85 * px_per_m))
+    rgb[spandrel:] = _shade(_rgb(46, 60, 66), 1.0 + 0.03 * _noise((h - spandrel, w), rng, 2.0))
+    frame = _rgb(150, 156, 160)
+    t = max(1, int(round(0.06 * px_per_m)))
+    phase = _periodic_x(w, 1.5 * px_per_m)[0]
+    cols = phase < t / (1.5 * px_per_m)
+    rgb[:, cols] = frame
+    rgb[spandrel : spandrel + t] = frame
+    rgb[:t] = frame
+    return rgb
+
+
 _SIDING = {
     "siding_white": _rgb(230, 229, 222),
     "siding_cream": _rgb(216, 204, 174),
@@ -652,16 +877,36 @@ def _paint_band(s: BuildingStyle, shape: tuple[int, int], rng: np.random.Generat
         return _membrane(shape, rng)
     if n == "doors":
         return _doors(shape, rng, px_per_m)
+    if n == "storefront":
+        return _storefront(shape, rng, px_per_m)
+    if n == "eifs_light":
+        return _eifs(shape, rng, _rgb(222, 214, 196), px_per_m)
+    if n == "eifs_tan":
+        return _eifs(shape, rng, _rgb(196, 176, 146), px_per_m)
+    if n == "metal_panel":
+        return _metal_panel(shape, rng, _rgb(186, 190, 192), px_per_m)
+    if n == "metal_panel_blue":
+        return _metal_panel(shape, rng, _rgb(104, 124, 146), px_per_m)
+    if n == "precast":
+        return _precast(shape, rng, px_per_m)
+    if n == "loading_docks":
+        return _loading_docks(shape, rng, px_per_m)
+    if n == "institutional_buff":
+        return _institutional(shape, rng, _rgb(196, 168, 124), px_per_m)
+    if n == "institutional_red":
+        return _institutional(shape, rng, _rgb(140, 70, 54), px_per_m)
+    if n == "curtain_wall":
+        return _curtain_wall(shape, rng, px_per_m)
     raise ValueError(f"no painter for style {n!r}")
 
 
 def building_atlas(size: int = ATLAS_SIZE, seed: int = ATLAS_SEED) -> Image.Image:
-    """The RGB atlas, `size` wide and 2 x `size` tall: `BAND_COUNT` horizontal bands, one per
-    style (module docstring)."""
+    """The RGB atlas, `size` wide and `atlas_height(size)` tall: `BAND_COUNT` horizontal
+    bands, one per style (module docstring); the unused ones are mid grey."""
     if size < 64 or size & (size - 1):
         raise ValueError(f"atlas size must be a power of two >= 64, got {size}")
-    band_h = 2 * size // BAND_COUNT
-    out = np.zeros((2 * size, size, 3))
+    band_h = size // 16
+    out = np.full((atlas_height(size), size, 3), 128.0)
     for s in STYLES:
         rng = np.random.default_rng([seed, s.band])
         out[s.band * band_h : (s.band + 1) * band_h] = _paint_band(s, (band_h, size), rng)

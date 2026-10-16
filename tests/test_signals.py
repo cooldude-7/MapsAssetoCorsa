@@ -17,6 +17,8 @@ from driftmaps.geometry.road import RoadModel
 from driftmaps.geometry.signals import (
     ARM_Y_M,
     HEAD_CLEAR_M,
+    MAX_ARM_M,
+    MIN_ARM_M,
     SignalApproach,
     approach_lanes,
     arm_reach,
@@ -248,3 +250,32 @@ def test_a_divided_road_crossing_is_one_intersection():
         want = 492.0 if p.axis[1] > 0 else 508.0
         assert len(xs) == 2 and all(abs(x - want) <= 3.6 for x in xs)
         assert p.name == "Caroline Street"
+
+
+def test_mast_arms_stay_ontario_length_on_a_wide_divided_road():
+    # A divided arterial (four lanes each way, 34 m of pavement across both carriageways)
+    # crossing a two-lane road: the far-right pole cannot reach the inner lanes with any real
+    # arm (the user's Oakville check: arms "stretched super far"), so a median pole carries
+    # them; every head hangs from an arm of MIN_ARM_M .. MAX_ARM_M (4.5-12 m).
+    four = {"highway": "primary", "lanes": "4", "oneway": "yes", "name": "Dundas Street"}
+    side = {"highway": "secondary", "lanes": "2", "name": "Third Line"}
+    wide = ((-16.0, 18.0), (1.0, 15.0))  # the paved span, the arriving lanes
+    legs = [
+        SignalApproach(np.array([-1.0, 0.0]), 18.0, four, None, 0, True, *wide),
+        SignalApproach(np.array([1.0, 0.0]), 18.0, four, None, 0, True, *wide),
+        SignalApproach(np.array([0.0, 1.0]), 3.5, side),
+        SignalApproach(np.array([0.0, -1.0]), 3.5, side),
+    ]
+    poles, _ = plan_junction(7, np.zeros(2), legs)
+    arms = [p for p in poles if not p.post]
+    assert any(p.right_arm for p in arms)  # the median poles
+    assert MIN_ARM_M <= 4.5 and MAX_ARM_M == pytest.approx(12.0)
+    for axis in ((1.0, 0.0), (-1.0, 0.0)):
+        mine = [p for p in arms if np.allclose(p.axis, axis)]
+        hung = []
+        for p in mine:
+            along = [a for a, _ in p.arm_heads(p.xz)]
+            assert all(0.6 <= a <= MAX_ARM_M for a in along)
+            assert len(along) == len(p.heads)  # nothing planned out of reach
+            hung += along
+        assert len(hung) == 4  # a head over every lane of the approach

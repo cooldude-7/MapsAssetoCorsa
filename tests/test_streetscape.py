@@ -26,6 +26,7 @@ from driftmaps.geometry.streetscape import (
     section_offsets,
     section_width,
     sidewalk_sides,
+    smooth_runs,
     tag_context,
     walk_sides,
 )
@@ -221,3 +222,48 @@ def test_oakville_sidewalks_fetch_filters_and_caches(tmp_path):
         fetch_sidewalks(OAKVILLE_SIDEWALKS, [(-79.70, 43.45, -79.69, 43.46)],
                         cache_dir=tmp_path, offline=True)  # fmt: skip
     assert "Open Government Licence - Town of Oakville" in OAKVILLE_SIDEWALKS.attribution
+
+
+def test_sidewalks_and_urban_stretches_are_continuous():
+    # Stations every 10 m over 1 km: gaps under 150 m between sidewalk runs are filled (the
+    # user's Oakville check: "some sidewalks breaking/stopping"), unless OSM says there is
+    # none there; stretches under 150 m that reach neither end are dropped; the ends stay.
+    s = np.arange(0.0, 2000.0, 10.0)
+    m = np.zeros(len(s), bool)
+    m[0:30] = True  # 0-290 m, from the start
+    m[40:70] = True  # a 100 m gap (300-390 m) before it: filled
+    m[100:105] = True  # 50 m alone between long gaps: dropped
+    m[197:] = True  # the last 30 m: reaches the end, kept
+    out = smooth_runs(m, s, 150.0)
+    assert out[:70].all() and not out[70:197].any() and out[197:].all()
+    no = np.zeros(len(s), bool)
+    no[33] = True  # sidewalk=no at 330 m: the gap stays
+    held = smooth_runs(m, s, 150.0, fixed=no)
+    assert not held[30:40].any() and held[40:70].all()
+    # walk_sides: municipal lines found in pieces along an urban arterial -> one sidewalk.
+    n = len(s)
+    tags = [{"highway": "secondary"}] * n
+    right = np.zeros(n, bool)
+    for a in range(0, n, 12):
+        right[a : a + 8] = True  # 80 m found, 40 m missed (a wide boulevard, a driveway)
+    left, rr = walk_sides(tags, np.ones(n, bool), np.ones(n, bool), (np.zeros(n, bool), right), s)
+    assert rr.all() and not left.any()
+    # A short rural gap in a town road is filled; a short urban blip on a rural road dropped.
+    urban = np.ones(n, bool)
+    urban[50:58] = False
+    assert smooth_runs(urban, s).all()
+    assert not smooth_runs(~urban, s).any()
+
+
+def test_far_probe_finds_a_sidewalk_behind_a_wide_boulevard_but_not_across_a_median():
+    # A road along +X (half width 5 m), a municipal sidewalk 11 m beyond each edge.
+    xs = np.arange(0.0, 200.0, 5.0)
+    idx = SidewalkIndex([np.array([[0.0, 16.0], [200.0, 16.0]]),
+                         np.array([[0.0, -16.0], [200.0, -16.0]])])  # fmt: skip
+    xz = np.stack([xs, 0 * xs], 1)
+    left_dir = np.tile([0.0, -1.0], (len(xs), 1))  # +X travel: left is -Z (north)
+    hw = np.full(len(xs), 5.0)
+    left, right = idx.sides(xz, left_dir, hw)
+    assert left.all() and right.all()
+    left, right = idx.sides(xz, left_dir, hw, far=(False, True))  # left is the median
+    assert not left.any() and right.all()

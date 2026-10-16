@@ -88,7 +88,15 @@ from driftmaps.geo.project import LocalProjection
 from driftmaps.geometry.clearance import CLEARANCE_M, DrivableSurface, clear_items
 from driftmaps.geometry.primitives import MeshData, merge, split
 from driftmaps.geometry.road import RoadModel
-from driftmaps.geometry.signals import SignalApproach, SignalPlan, draw_pole, plan_signals
+from driftmaps.geometry.signals import (
+    MAX_ARM_M,
+    MIN_ARM_M,
+    SignalApproach,
+    SignalPlan,
+    draw_pole,
+    median_poles,
+    plan_signals,
+)
 from driftmaps.geometry.street_items import (
     HYDRANT,
     LIGHT_STREET,
@@ -1271,6 +1279,7 @@ def plan_furniture(
 
 _TRAFFIC_LIGHT = "object--traffic-light--"
 _UNDER_SIGNALS = (SIGN_STOP, SIGN_YIELD, SIGN_ALL_WAY)
+SIGNAL_REPLACED_M = 25.0  # other signal items this far beyond a planned junction's poles go
 UNDER_SIGNAL_M = 25.0  # stop / yield signs this far beyond a signalised junction's poles go
 UNDER_SIGNAL_NODE_M = 35.0  # ... and rule / OSM ones this close to an OSM signal node
 SIGNAL_POLE_EDGE_M = 1.2  # signal poles stand at least this far off the drivable surface
@@ -1321,12 +1330,25 @@ def _signals(
         if it.kind in _UNDER_SIGNALS and (it.ref in nodes_sig or plan.near(xz, UNDER_SIGNAL_M)):
             pl.plan.stops_under_signals += 1
             continue
-        if it.kind == SIGNAL_TRAFFIC and plan.near(xz, 5.0):
-            continue  # our corner poles replace it
+        if it.kind == SIGNAL_TRAFFIC and plan.near(xz, SIGNAL_REPLACED_M):
+            continue  # our corner poles replace it (and the side roads' rule signals there)
         keep.append(it)
     for pole in plan.poles:
         if surface is not None:
             pole.xz = _off_surface(pole.xz, pole.origin, surface)
+    # A corner pole moved out to the real pavement's edge may no longer reach the inner lanes:
+    # a far-side median pole takes them (divided roads), never a longer arm.
+    by_ref = {q.ref: q for q in plan.poles}
+    for m in median_poles(plan.poles):
+        q = by_ref.get(m.ref)
+        if q is not None:  # the planned median pole takes the heads it can reach
+            q.heads = sorted(set(q.heads) | set(m.heads))
+            continue
+        if surface is not None:
+            m.xz = _off_surface(m.xz, m.origin, surface)
+        if m.arm_heads(m.xz):
+            plan.poles.append(m)
+    for pole in plan.poles:
         facing = pole.axis if pole.axis is not None else np.array([1.0, 0.0])
         keep.append(_item(SIGNAL_TRAFFIC, pole.xz, -facing, pl.ground, "rule", ref=pole.ref))
         if not pole.post:  # Ontario signal poles carry the junction's luminaires
@@ -1919,9 +1941,12 @@ def furniture_meshes(
             if o.collide:
                 r.collider(base, 0.2)
         elif it.kind == SIGNAL_TRAFFIC:
-            st, off, _ = frame.project(np.array([[it.position[0], it.position[2]]]))
-            over = max(2.5, abs(float(off[0])) - 1.75)
-            r.signal(it, over)
+            # A lone signal (a side road's, a Mapillary light): its arm reaches over the lanes
+            # beside it, never across a whole intersection (MAX_ARM_M at most).
+            st, off, inside = frame.project(np.array([[it.position[0], it.position[2]]]))
+            o_m = abs(float(off[0]))
+            over = o_m - 1.75 if inside[0] and o_m <= MAX_ARM_M + 1.75 else MIN_ARM_M
+            r.signal(it, float(np.clip(over, MIN_ARM_M, MAX_ARM_M)))
         elif it.kind == HYDRANT:
             r.hydrant(it)
         elif it.kind == MAILBOX:

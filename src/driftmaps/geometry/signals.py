@@ -30,8 +30,12 @@ Highway Traffic Act s.124 and OTM Book 12), the rest ASSUMED:
   lines; the furniture clearance (`geometry.clearance`) then moves them off the drivable
   surface (1 m behind its edge, §3.9: at least 1.0 m from the curb). The arm keeps its
   direction (square to the approach) and its heads stay over their lanes wherever the pole
-  ends up; it is at most `MAX_ARM_M` (7.6 m, the longest standard arm, Tables 1-2) long, and
-  heads beyond its reach are left out.
+  ends up. Arms are `MIN_ARM_M` (4.5 m) to `MAX_ARM_M` (12 m) long: [TOR-SIG] Tables 1-2 list
+  standard arms up to 7.6 m, and the wide approaches of suburban arterials carry longer ones
+  (12 m ASSUMED, the user's Oakville check, 2026-10-16: arms "stretched super far" across a
+  divided road). Heads beyond the arm's reach are never hung from a longer arm: on a divided
+  road the lanes nearest the median get a far-side MEDIAN pole whose arm reaches right over
+  them (`SignalPole.right_arm`); heads that no pole reaches are left out.
 - A street name sign (white on green, the furniture atlas's blades) on each mast arm, naming
   the street the approach crosses.
 - Pedestrian signals: at both ends of a crosswalk across every leg (centred 2.5 m beyond the
@@ -57,12 +61,15 @@ from driftmaps.ac.furniture_textures import name_tile, sign_tile, swatch_uv
 __all__ = [
     "ARM_Y_M",
     "HEAD_CLEAR_M",
+    "MAX_ARM_M",
+    "MIN_ARM_M",
     "SignalApproach",
     "SignalPlan",
     "SignalPole",
     "approach_lanes",
     "arm_reach",
     "draw_pole",
+    "median_poles",
     "plan_junction",
     "plan_signals",
     "signalised",
@@ -71,7 +78,11 @@ __all__ = [
 SIGNAL_NODE_M = 40.0  # an OSM traffic_signals node this close to a route junction signals it
 MLY_LIGHT_M = 30.0  # a Mapillary traffic light this close does too
 POLE_SETBACK_M = 1.5  # corner poles stand this far behind both curb lines (before clearance)
-MAX_ARM_M = 7.6  # the longest standard mast arm ([TOR-SIG] Tables 1-2)
+STANDARD_ARM_M = 7.6  # the longest standard mast arm ([TOR-SIG] Tables 1-2)
+MAX_ARM_M = 12.0  # the longest arm drawn: wide suburban approaches (ASSUMED, module notes)
+MIN_ARM_M = 4.5  # the shortest arm drawn
+MEDIAN_POLE_M = 1.0  # a median pole stands this far left of its approach's lanes
+MIN_MEDIAN_M = 4.0  # paved width left of the arriving lanes that makes a divided road
 POLE_M = 9.1  # signal pole height above the ground (a 7.6 m arm's pole)
 HEAD_CLEAR_M = 4.9  # bottom of an overhead head's housing above the road (>= 4.5 m)
 ARM_Y_M = HEAD_CLEAR_M + 1.10 + 0.25  # the arm, above the road (head + hanger)
@@ -208,6 +219,18 @@ class SignalPole:
     name: str = ""
     go: bool = False
     post: bool = False
+    right_arm: bool = False  # a median pole: the arm reaches right over the approach
+    median_lat: float | None = None  # where this approach's median pole stands (divided road)
+
+    def arm_heads(self, xz: np.ndarray) -> list[tuple[float, str]]:
+        """(distance along the arm, kind) of the heads an arm on a pole at `xz` reaches."""
+        if self.post or self.axis is None:
+            return []
+        r = _right(_unit(self.axis))
+        lat = float((np.asarray(xz, np.float64)[:2] - self.origin) @ r)
+        sgn = -1.0 if self.right_arm else 1.0
+        out = [(sgn * (lat - off), kind) for off, kind in self.heads]
+        return [(a, k) for a, k in out if 0.6 <= a <= MAX_ARM_M]
 
 
 @dataclass
@@ -294,24 +317,28 @@ def plan_junction(
         b = (-far.across[0] if far is not None else leg.across[1]) + POLE_SETBACK_M
         heads = _lane_offsets(leg)
         name = max(across, key=lambda m: abs(float(_right(t) @ _unit(m.direction)))).name
-        poles.append(
-            SignalPole(
-                ref=f"sig:{node}:{k}",
-                xz=c + t * a + r * b,
-                origin=c,
-                axis=t,
-                heads=heads,
-                name=name,
-                go=leg.on_route,
-            )
+        lo_lane = leg.lanes_span[0]
+        median = lo_lane - leg.across[0] >= MIN_MEDIAN_M  # paved beyond: a divided road
+        corner = SignalPole(
+            ref=f"sig:{node}:{k}",
+            xz=c + t * a + r * b,
+            origin=c,
+            axis=t,
+            heads=heads,
+            name=name,
+            go=leg.on_route,
+            median_lat=lo_lane - MEDIAN_POLE_M if median else None,
         )
+        poles.append(corner)
+        poles += median_poles([corner])
         far_left.append((c + t * a - r * ((far.across[1] if far is not None else leg.half)
                                           + POLE_SETBACK_M), t))  # fmt: skip
     # Secondary heads on the far-left corner's pole (on the far-right one when there is none).
-    for pole, (corner, t) in zip(poles, far_left, strict=True):
-        dist = [float(np.hypot(*(q.xz - corner))) for q in poles]
+    corner_poles = [p for p in poles if not p.right_arm]
+    for pole, (corner, t) in zip(corner_poles, far_left, strict=True):
+        dist = [float(np.hypot(*(q.xz - corner))) for q in corner_poles]
         k = int(np.argmin(dist))
-        host = poles[k] if dist[k] <= 6.0 and poles[k] is not pole else pole
+        host = corner_poles[k] if dist[k] <= 6.0 and corner_poles[k] is not pole else pole
         host.side.append(-t)
         host.side_go.append(pole.go)  # the approach's own colour, not the host pole's
     # Pedestrian signals and push buttons at both ends of a crosswalk across every leg.
@@ -335,6 +362,41 @@ def plan_junction(
             host.buttons.append(facing)
     reach = max((float(np.hypot(*(p.xz - c))) for p in poles), default=0.0)
     return poles, reach
+
+
+def median_poles(poles: Sequence[SignalPole]) -> list[SignalPole]:
+    """For corner poles (where they stand now) whose arm cannot reach every lane of their
+    approach within MAX_ARM_M: the far-side median pole that carries the inner lanes' heads
+    (divided roads, `median_lat`). Those heads leave the corner pole; heads neither reaches
+    are dropped (never an arm stretched across the junction)."""
+    out: list[SignalPole] = []
+    for p in poles:
+        if p.post or p.right_arm or p.axis is None or not p.heads:
+            continue
+        reach = {off for off, _ in _offsets_in_reach(p, p.xz)}
+        rest = [h for h in p.heads if h[0] not in reach]
+        if not rest:
+            continue
+        p.heads = [h for h in p.heads if h[0] in reach]
+        if p.median_lat is None:
+            continue
+        t = _unit(p.axis)
+        r = _right(t)
+        a = float((p.xz - p.origin) @ t)
+        m = SignalPole(ref=f"{p.ref}m", xz=p.origin + t * a + r * p.median_lat, origin=p.origin,
+                       axis=t, heads=rest, go=p.go, right_arm=True)  # fmt: skip
+        m.heads = _offsets_in_reach(m, m.xz)
+        if m.heads:
+            out.append(m)
+    return out
+
+
+def _offsets_in_reach(p: SignalPole, xz: np.ndarray) -> list[tuple[float, str]]:
+    """The (offset, kind) heads of pole `p` that an arm on it at `xz` reaches."""
+    r = _right(_unit(p.axis))
+    lat = float((np.asarray(xz, np.float64)[:2] - p.origin) @ r)
+    sgn = -1.0 if p.right_arm else 1.0
+    return [(off, k) for off, k in p.heads if 0.6 <= sgn * (lat - off) <= MAX_ARM_M]
 
 
 def _reach(m: SignalApproach, t: np.ndarray) -> float:
@@ -547,24 +609,31 @@ def draw_pole(
         return
     t = _unit(pole.axis if pole.axis is not None else np.array([1.0, 0.0]))
     r = _right(t)
-    lat = float((pxz - pole.origin) @ r)  # the pole's offset right of the approach's axis
-    lanes = [(lat - off, kind) for off, kind in pole.heads if 0.6 <= lat - off <= MAX_ARM_M]
-    hxz = [pxz - r * along for along, _ in lanes]
+    sgn = 1.0 if pole.right_arm else -1.0  # the arm reaches left (corner) or right (median)
+    lanes = pole.arm_heads(pxz)
+    hxz = [pxz + sgn * r * along for along, _ in lanes]
+    # The road under the heads (never more than 3 m off the pole's ground: another road's
+    # deck or a bad lookup must not stretch the pole).
     ry = max([float(road_y(np.asarray(h)[None, :])[0]) for h in hxz] + [gy - 0.3])
+    ry = float(np.clip(ry, gy - 3.0, gy + 3.0))
     arm_y = ry + ARM_Y_M
     top = max(arm_y + 0.9, gy + POLE_M)
     cell.furn.prism(base + np.array([0.0, -0.4, 0.0]), top - gy + 0.4, 0.17, 0.12, 8, metal)
     f2 = -t  # heads face the arriving drivers
     f3 = np.array([f2[0], 0.0, f2[1]])
-    a3 = -np.array([r[0], 0.0, r[1]])  # the arm reaches left over the lanes
+    a3 = sgn * np.array([r[0], 0.0, r[1]])  # the arm reaches over the lanes
     if lanes:
         sign_w = float(np.clip(0.11 * len(pole.name) + 0.5, 1.2, 2.4)) if pole.name else 0.0
         near = min(a for a, _ in lanes) - HEAD_W  # free arm between the pole and the 1st head
         far = max(a for a, _ in lanes) + 0.5
         sign_at = None
         if sign_w:
-            sign_at = 0.4 + sign_w / 2 if near >= sign_w + 0.6 else far + 0.2 + sign_w / 2
-        length = max(far, (sign_at + sign_w / 2 + 0.2) if sign_at else 0.0)
+            if near >= sign_w + 0.6:
+                sign_at = 0.4 + sign_w / 2
+            elif far + 0.4 + sign_w <= MAX_ARM_M + 0.5:
+                sign_at = far + 0.2 + sign_w / 2
+        length = max(far, (sign_at + sign_w / 2 + 0.2) if sign_at else 0.0, MIN_ARM_M)
+        length = min(length, MAX_ARM_M + 0.5)
         p0 = np.array([base[0], arm_y, base[2]])
         cell.furn.box(p0 + a3 * length / 2, (length, 0.2, 0.2), a3, metal)
         for along, kind in lanes:
@@ -595,7 +664,5 @@ def arm_reach(pole: SignalPole, xz: np.ndarray) -> float:
     """How far the arm of `pole`, standing at `xz`, reaches (0 for a post)."""
     if pole.post or pole.axis is None or not pole.heads:
         return 0.0
-    r = _right(_unit(pole.axis))
-    lat = float((np.asarray(xz, np.float64)[:2] - pole.origin) @ r)
-    reach = [lat - off for off, _ in pole.heads if 0.6 <= lat - off <= MAX_ARM_M]
+    reach = [a for a, _ in pole.arm_heads(xz)]
     return max(reach, default=0.0) + 0.5

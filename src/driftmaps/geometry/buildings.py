@@ -94,7 +94,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -133,6 +133,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CATEGORIES",
+    "LANDMARK_KINDS",
     "ROOF_FLAT",
     "ROOF_GABLED",
     "ROOF_HIPPED",
@@ -351,6 +352,82 @@ _TOWN_HOUSE_ROOFS = (
 )
 _TOWN_COMMERCIAL_WALLS = (("commercial", 45), ("brick_red", 15), ("brick_buff", 15),
                           ("brick_brown", 10), ("brick_grey", 10), ("stucco", 5))  # fmt: skip
+# Commercial uses (`_use`): what a flat-roofed commercial building is for, from its OSM tags
+# (`building`, `amenity`, `shop`, `office`), the OSM land use or campus around it, or its
+# size and height; each wears its own walls (the user's Oakville check, 2026-10-16: "for
+# stores/industrial you need a different skin"; finishes ASSUMED typical of Ontario plazas,
+# business parks, schools and hospitals): retail a storefront ground storey on the walls that
+# face the road under EIFS or light brick, industrial metal panels or precast with loading
+# docks on the side and back walls, institutional brick with ribbon windows, offices a glass
+# curtain wall. All have a parapet: the flat roof sits below the wall top.
+_RETAIL_KINDS = frozenset({"retail", "supermarket", "kiosk", "shop", "mall"})
+_INDUSTRIAL_KINDS = frozenset(
+    {"industrial", "warehouse", "manufacture", "factory", "service", "hangar", "depot"}
+)
+_INSTITUTION_KINDS = frozenset(
+    {
+        "school",
+        "hospital",
+        "college",
+        "university",
+        "kindergarten",
+        "public",
+        "civic",
+        "government",
+        "fire_station",
+        "library",
+        "sports_hall",
+        "train_station",
+        "transportation",
+        "community_centre",
+    }
+)
+_APARTMENT_KINDS = frozenset({"apartments", "dormitory", "hotel"})
+_RETAIL_AMENITIES = frozenset(
+    {"restaurant", "fast_food", "cafe", "bank", "pharmacy", "fuel", "marketplace", "bar", "pub"}
+)
+_INSTITUTION_AMENITIES = frozenset(
+    {
+        "school",
+        "hospital",
+        "college",
+        "university",
+        "kindergarten",
+        "clinic",
+        "library",
+        "community_centre",
+        "townhall",
+        "fire_station",
+        "police",
+        "place_of_worship",
+    }
+)
+# Landmarks (`_landmark`): always placed within `max_distance_m`, whatever the budget.
+LANDMARK_KINDS = _INSTITUTION_KINDS | {
+    "retail", "commercial", "industrial", "warehouse", "supermarket", "office", "church",
+    "cathedral", "mosque", "temple", "synagogue", "stadium",
+}  # fmt: skip
+_USE_WALLS: dict[str, tuple[tuple[str, float], ...]] = {
+    "retail": (("eifs_light", 35), ("eifs_tan", 20), ("brick_buff", 20), ("brick_grey", 15),
+               ("brick_red", 10)),
+    "industrial": (("metal_panel", 35), ("precast", 30), ("metal_panel_blue", 20),
+                   ("steel_white", 15)),
+    "institutional": (("institutional_buff", 50), ("institutional_red", 40), ("precast", 10)),
+    "office": (("curtain_wall", 60), ("precast", 20), ("institutional_buff", 20)),
+    "apartments": (("brick_buff", 30), ("brick_grey", 25), ("brick_red", 20),
+                   ("brick_brown", 15), ("stucco", 10)),
+}  # fmt: skip
+_USE_GROUND = {"retail": "storefront", "industrial": "loading_docks"}
+_USE_PARAPET_M = {"retail": 0.9, "industrial": 0.6, "institutional": 0.9, "office": 1.0,
+                  "apartments": 0.6}  # fmt: skip
+_USE_DEFAULT_PEAK_M = {"retail": 6.0, "industrial": 8.5, "institutional": 8.0, "office": 12.0,
+                       "apartments": 12.0}  # fmt: skip
+_HOSPITAL_PEAK_M = 18.0  # an untyped-height hospital: five or six storeys (ASSUMED)
+_GROUND_STOREY_M = 3.3  # a storefront's / dock wall's ground storey
+# Storey heights of commercial uses (the wall bands stretch to them; houses keep 3 m), and the
+# tallest storey an OSM `building:levels` allows (eave <= levels x this + a parapet).
+_USE_STOREY_M = {"retail": 4.0, "industrial": 4.5, "institutional": 4.0, "office": 3.8}
+_MAX_LEVEL_M = 4.2
 _DEFAULT_PEAK_M = {"shed": 3.2, "garage": 4.0, "house": 6.0, "townhouse": 9.5, "barn": 8.5,
                    "commercial": 6.0}  # fmt: skip
 _MIN_EAVE_M = {"shed": 2.0, "garage": 2.3, "house": 2.4, "townhouse": 2.4, "barn": 3.0,
@@ -391,7 +468,17 @@ class BuildingOptions:
     max_distance_m: float = 300.0  # from the centreline: what is seen from the road
     clearance_m: float = 2.0  # kept clear of the corridor polygon / the drivable edge
     min_area_m2: float = 10.0
-    max_area_m2: float = 20_000.0
+    # No practical upper cap: a hospital or a big-box store is one footprint (the user's
+    # Oakville check, 2026-10-16: the hospital, 39,000 m2, was dropped at 20,000 m2).
+    max_area_m2: float = 250_000.0
+    # Landmarks (`_landmark`): OSM institutional / commercial / industrial buildings, named
+    # buildings of at least `landmark_named_m2`, and any footprint of `landmark_area_m2`,
+    # placed whatever the budget; where one overlaps the road or a paved side road it is cut
+    # back (when at least `landmark_keep` of it remains) instead of dropped.
+    landmark_min_m2: float = 400.0
+    landmark_named_m2: float = 1000.0
+    landmark_area_m2: float = 5000.0
+    landmark_keep: float = 0.75
     max_buildings: int = 6000  # hard cap (nearest first); the byte budget usually binds first
     # Context (`_town_context`): footprints of `min_neighbour_m2` or more within
     # `context_radius_m`; a town from `town_neighbours` (mostly not barn-sized, with some urban
@@ -447,6 +534,8 @@ class BuildingOptions:
     min_eave_m: float = 2.4
     hipped_share: float = 0.35  # share of near-square houses (aspect < 1.4) given a hip roof
     attached_garage_share: float = 0.55  # wide houses with an attached garage door in front
+    town_garage_share: float = 0.9  # ... in town (GTA subdivisions: nearly every house has one)
+    local_front_m: float = 35.0  # a local street this close takes the front wall (`local_roads`)
     doors: bool = True
     # Mesh.
     sink_m: float = 0.5
@@ -638,6 +727,14 @@ class Building:
     front_edge: int | None = None
     doors: tuple[Door, ...] = ()
     wall_u0: tuple[float, ...] | None = None
+    # Commercial use ("retail", "industrial", "institutional", "office", "apartments" or ""),
+    # the band of the ground storey (storefronts, loading docks) on the ring edges flagged in
+    # `ground_edges` (None: every edge), and a parapet: a flat roof this far below the wall top.
+    use: str = ""
+    ground_style: str | None = None
+    ground_edges: tuple[bool, ...] | None = None
+    parapet_m: float = 0.0
+    landmark: bool = False  # placed whatever the budget (`_landmark`)
     mesh: MeshData | None = field(default=None, repr=False, compare=False)
 
     @property
@@ -754,6 +851,92 @@ def _category(
     return "house"
 
 
+def _landmark(fp: Footprint, area: float, o: BuildingOptions) -> bool:
+    """A big or notable building (a school, a hospital, a plaza, a factory, a church, any
+    named building of `landmark_named_m2`, any footprint of `landmark_area_m2`): placed
+    within `max_distance_m` whatever the budget."""
+    if area >= o.landmark_area_m2:
+        return True
+    if area < o.landmark_min_m2:
+        return False
+    t = fp.tags
+    if fp.kind in LANDMARK_KINDS or t.get("amenity") in _INSTITUTION_AMENITIES:
+        return True
+    return bool(t.get("name")) and area >= o.landmark_named_m2
+
+
+def _use(
+    fp: Footprint, cat: str, area: float, length_m: float, depth_m: float, eave_h: float,
+    around: Mapping[str, str] | None = None,
+) -> str:  # fmt: skip
+    """A commercial building's use (see `_USE_WALLS`): its own tags first, then the land use
+    or campus around it (`around`: the tags of the smallest OSM landuse / amenity area that
+    holds it), then its size and height; "" for other categories."""
+    if cat != "commercial":
+        return ""
+    t, kind = fp.tags, fp.kind
+    amenity = t.get("amenity", "")
+    if kind in _INSTITUTION_KINDS or amenity in _INSTITUTION_AMENITIES:
+        return "institutional"
+    if kind in _INDUSTRIAL_KINDS or t.get("industrial") or t.get("man_made") == "works":
+        return "industrial"
+    if kind in _RETAIL_KINDS or t.get("shop") or amenity in _RETAIL_AMENITIES:
+        return "retail"
+    if kind == "office" or t.get("office"):
+        return "office"
+    if kind in _APARTMENT_KINDS:
+        return "apartments"
+    a = around or {}
+    if a.get("amenity") in _INSTITUTION_AMENITIES:
+        return "institutional"
+    landuse = a.get("landuse", "")
+    if landuse == "industrial":
+        return "industrial"
+    if landuse == "retail":
+        return "retail"
+    if landuse == "commercial":
+        return "office" if eave_h >= 9.0 else "retail"
+    if eave_h >= 10.0:
+        return "apartments"  # untyped and tall in an Ontario suburb: a condo or rental block
+    if area >= 6000.0:
+        return "industrial"  # a long, low box of this size: a warehouse or plant
+    return "retail"
+
+
+def _clip_off(
+    poly: shapely.Polygon, obstacle: shapely.Geometry | None, keep: float
+) -> shapely.Polygon | None:
+    """`poly` without `obstacle` (the road, a paved side road): its biggest remaining part,
+    clockwise, when that keeps at least `keep` of the area; None otherwise."""
+    if obstacle is None or obstacle.is_empty or not poly.intersects(obstacle):
+        return poly
+    cut = shapely.make_valid(poly.difference(obstacle.buffer(0.1)))  # clear after simplify
+    parts = [p for p in shapely.get_parts(cut) if isinstance(p, shapely.Polygon) and p.area > 0]
+    if not parts:
+        return None
+    best = shapely.Polygon(max(parts, key=lambda p: p.area).exterior).simplify(0.05)
+    if not isinstance(best, shapely.Polygon) or best.area < keep * poly.area or not best.is_valid:
+        return None
+    return shapely.orient_polygons(best, exterior_cw=True)
+
+
+def _area_tags(
+    polys: Sequence[shapely.Polygon], areas: Sequence[tuple[shapely.Geometry, Mapping[str, str]]]
+) -> list[Mapping[str, str] | None]:
+    """Per polygon: the tags of the smallest of `areas` (landuse, campuses) holding its
+    centroid, or None."""
+    if not areas or not polys:
+        return [None] * len(polys)
+    geoms = [g for g, _ in areas]
+    tree = shapely.STRtree(geoms)
+    out: list[Mapping[str, str] | None] = []
+    for p in polys:
+        c = p.centroid
+        hits = [int(j) for j in tree.query(c, predicate="within")]
+        out.append(areas[min(hits, key=lambda j: geoms[j].area)][1] if hits else None)
+    return out
+
+
 def _town_context(
     polys: Sequence[shapely.Polygon], cand: Sequence[int], landcover: LandcoverFn | None,
     o: BuildingOptions,
@@ -843,9 +1026,13 @@ def _roof_shape(
 
 
 def _styles(
-    fp: Footprint, cat: str, area: float, roof: str, seed: object, town: bool = False
-) -> tuple[str, str]:
+    fp: Footprint, cat: str, area: float, roof: str, seed: object, town: bool = False,
+    use: str = "",
+) -> tuple[str, str]:  # fmt: skip
     uw, ur = _u01(seed, fp.id, "wall"), _u01(seed, fp.id, "roofstyle")
+    if use in _USE_WALLS:
+        roof_style = "flat_membrane" if roof == ROOF_FLAT else _pick(_BARN_ROOFS[:2], ur)
+        return _pick(_USE_WALLS[use], uw), roof_style
     walls, roofs = {
         "commercial": (_COMMERCIAL_WALLS, None),
         "barn": (_BARN_WALLS, _BARN_ROOFS),
@@ -1039,7 +1226,16 @@ def _door_spans(
     cat = b.category
     if cat == "house":
         garage = None
-        if length >= 10.0 and b.area_m2 >= 110.0 and u < o.attached_garage_share:
+        share = o.town_garage_share if b.town else o.attached_garage_share
+        if b.town and 4.2 <= length < 10.0 and b.area_m2 >= 90.0 and u < share:
+            # A subdivision house whose front wall is broken up: the garage is the wall that
+            # faces the street (often a bump-out), one door filling it.
+            gs = ("garage2_" if length >= 7.0 else "garage1_") + (
+                "white" if _u01(seed, b.id, "gcol") < 0.75 else "almond")  # fmt: skip
+            d = DOORS[gs]
+            out.append((gs, 0.5 * length, d.width_m, d.height_m))
+            return out
+        if length >= 10.0 and b.area_m2 >= 110.0 and u < share:
             double = length >= 13.0 and _u01(seed, b.id, "double") < 0.6
             gs = ("garage2_" if double else "garage1_") + (
                 "white" if _u01(seed, b.id, "gcol") < 0.75 else "almond")  # fmt: skip
@@ -1189,6 +1385,8 @@ def place_buildings(
     landcover: LandcoverFn | None = None,
     paved: shapely.Geometry | None = None,
     report: dict[str, int] | None = None,
+    areas: Sequence[tuple[shapely.Geometry, Mapping[str, str]]] | None = None,
+    local_roads: Sequence[np.ndarray] | None = None,
 ) -> list[Building]:
     """Turn footprints into `Building`s (module docstring, steps 1-7), sorted by id.
 
@@ -1198,17 +1396,22 @@ def place_buildings(
     NaN means no lidar, and the measured / tag / default heights are used. `roads` are extra
     XZ polylines (side roads) a front wall may face; the route always counts. `seed` should be
     the track id. Each building's mesh is made here (for the byte budget) and kept in `mesh`.
+    `local_roads` (residential streets, XZ polylines) win the front wall over a nearer
+    arterial when within `local_front_m`: a subdivision's houses back onto the arterial.
     `landcover(xz)` (NRCan 2020 classes, e.g. `vegetation.LandcoverSampler`) tells farmland
     from town where the building density alone does not (`_town_context`). `paved` is the
     drivable surface beyond the route (side roads, junctions: `RoadNetwork.paved`); in town
     buildings only keep clear of it and of the route by `town_clearance_m`, not of the wall
     corridor. `report`, if given, receives the counts of the steps (found, dropped and why,
-    candidates, town, street front, placed, budget).
+    candidates, town, street front, landmarks, placed, budget). `areas` are OSM landuse and
+    campus polygons (XZ) with their tags: what a commercial building is for (`_use`).
+    Landmarks (`_landmark`) are placed whatever the budget, and cut back where they overlap
+    the road instead of dropped.
     """
     o = options or BuildingOptions()
     rep = report if report is not None else {}
     rep.update(dict.fromkeys(("found", "size", "far", "road", "corridor", "candidates", "town",
-                              "street_front", "placed", "budget"), 0))  # fmt: skip
+                              "street_front", "landmarks", "placed", "budget"), 0))  # fmt: skip
     rep["found"] = len(footprints)
     if not footprints:
         return []
@@ -1217,8 +1420,30 @@ def place_buildings(
     paved_out = (
         paved.buffer(o.town_clearance_m) if paved is not None and not paved.is_empty else None
     )
-    pre: list[tuple[float, Footprint, shapely.Polygon, int]] = []
+    pre: list[tuple[float, Footprint, shapely.Polygon, int, bool]] = []
     every: list[shapely.Polygon] = []  # every footprint found, for the building density
+
+    def edge_distance(poly: shapely.Polygon) -> tuple[float, float]:
+        """(distance to the centreline, to the route's drivable edge): the centreline
+        distance minus the road's half width + shoulder at the station nearest it."""
+        d_c = float(poly.distance(line))
+        p_near = np.asarray(shapely.shortest_line(poly, line).coords)[1]
+        _, j = tree.query(p_near)
+        return d_c, d_c - float(outer[j])
+
+    def route_cut(poly: shapely.Polygon, clear: float) -> shapely.Polygon | None:
+        """A landmark cut back to `clear` beyond the route's drivable edge (None: too much)."""
+        x0, z0, x1, z1 = poly.bounds
+        reach = 0.5 * math.hypot(x1 - x0, z1 - z0) + float(np.max(outer)) + clear + 5.0
+        c = poly.centroid
+        js = tree.query_ball_point([c.x, c.y], reach)
+        if not js:
+            return poly
+        js = np.asarray(sorted(js))
+        pts = shapely.points(np.asarray(line.coords)[js])
+        road = shapely.union_all(shapely.buffer(pts, outer[js] + clear, quad_segs=4))
+        return _clip_off(poly, road, o.landmark_keep)
+
     for fp in footprints:
         poly = _to_polygon(fp, projection)
         if poly is not None:
@@ -1226,37 +1451,44 @@ def place_buildings(
         if poly is None or not (o.min_area_m2 <= poly.area <= o.max_area_m2):
             rep["size"] += 1
             continue
-        d_centre = float(poly.distance(line))
+        lm = _landmark(fp, poly.area, o)
+        d_centre, d_edge = edge_distance(poly)
         if d_centre > o.max_distance_m:
             rep["far"] += 1
             continue
-        # Distance from the drivable edge: from the footprint to the centreline, minus the
-        # road's half width + shoulder at the station nearest that closest approach.
-        p_near = np.asarray(shapely.shortest_line(poly, line).coords)[1]
-        _, j = tree.query(p_near)
-        d_edge = d_centre - float(outer[j])
-        if d_edge < min(o.clearance_m, o.town_clearance_m):
+        if d_edge < min(o.clearance_m, o.town_clearance_m) and lm:
+            cut = route_cut(poly, o.town_clearance_m)
+            if cut is not None:
+                poly = cut
+                d_centre, d_edge = edge_distance(poly)
+        if d_edge < min(o.clearance_m, o.town_clearance_m) - 1e-6:
             rep["road"] += 1
             continue
-        pre.append((d_edge, fp, poly, len(every) - 1))
+        pre.append((d_edge, fp, poly, len(every) - 1, lm))
     # Context first: in town buildings stand at the sidewalk, inside the wall corridor.
     ctx_pre, urban_pre = _town_context(every, [c[3] for c in pre], landcover, o)
-    cand: list[tuple[float, Footprint, shapely.Polygon, int]] = []
-    for (d_edge, fp, poly, _), ctx, urban in zip(pre, ctx_pre, urban_pre, strict=True):
+    cand: list[tuple[float, Footprint, shapely.Polygon, int, bool]] = []
+    for (d_edge, fp, poly, _, lm), ctx, urban in zip(pre, ctx_pre, urban_pre, strict=True):
         if ctx >= 1 or urban >= o.urban_clearance:
-            if d_edge < o.town_clearance_m or (
+            if lm and paved_out is not None:
+                cut = _clip_off(poly, paved_out, o.landmark_keep)  # a lane under its canopy
+                poly = cut if cut is not None else poly
+            if d_edge < o.town_clearance_m - 1e-6 or (
                 paved_out is not None and poly.intersects(paved_out)
             ):
                 rep["road"] += 1
                 continue
-        elif d_edge < o.clearance_m:
+        elif d_edge < o.clearance_m - 1e-6:
             rep["road"] += 1
             continue
         elif keep_out is not None and poly.intersects(keep_out):
-            rep["corridor"] += 1
-            continue
-        cand.append((d_edge, fp, poly, int(ctx)))
-    cand.sort(key=lambda t: (t[0], t[1].id))
+            cut = _clip_off(poly, keep_out, o.landmark_keep) if lm else None
+            if cut is None:
+                rep["corridor"] += 1
+                continue
+            poly = cut
+        cand.append((d_edge, fp, poly, int(ctx), lm))
+    cand.sort(key=lambda t: (not t[4], t[0], t[1].id))  # landmarks first, then the nearest
     rep["candidates"] = len(cand)
     rep["town"] = sum(1 for c in cand if c[3] >= 1)
     if len(cand) > o.max_buildings:
@@ -1267,7 +1499,7 @@ def place_buildings(
 
     # Ground under every footprint, one batched call.
     g_pts, g_owner = [], []
-    for k, (_, _, poly, _) in enumerate(cand):
+    for k, (_, _, poly, _, _) in enumerate(cand):
         pts = np.concatenate([np.asarray(poly.exterior.coords)[:-1], _lattice(poly, 3.0)])
         g_pts.append(pts)
         g_owner.append(np.full(len(pts), k))
@@ -1280,7 +1512,7 @@ def place_buildings(
     eroded = np.zeros(len(cand))  # how far inside the outline the lidar was sampled
     if canopy is not None:
         c_pts, c_owner = [], []
-        for k, (_, fp, poly, _) in enumerate(cand):
+        for k, (_, fp, poly, _, _) in enumerate(cand):
             if _measured(fp)[1] is not None:  # eave and peak measured: nothing to learn
                 continue
             inner = poly.buffer(-o.erode_m)
@@ -1308,9 +1540,12 @@ def place_buildings(
 
     road_lines = [line] + [shapely.LineString(r) for r in (roads or []) if len(r) >= 2]
     road_tree = shapely.STRtree(road_lines)
+    local_lines = [shapely.LineString(r) for r in (local_roads or []) if len(r) >= 2]
+    local_tree = shapely.STRtree(local_lines) if local_lines else None
 
+    around = _area_tags([c[2] for c in cand], areas or ())
     out: list[Building] = []
-    for k, (d_edge, fp, poly, ctx) in enumerate(cand):
+    for k, (d_edge, fp, poly, ctx, lm) in enumerate(cand):
         town, dense = ctx >= 1, ctx == 2
         g = g_all[g_owner_all == k]
         g = g[np.isfinite(g)]
@@ -1329,16 +1564,37 @@ def place_buildings(
         )
         if town and cat == "house" and shape == ROOF_FLAT and poly.area >= 400.0:
             cat = "commercial"  # a big flat-roofed building in town: shops, offices, a school
-        wall_style, roof_style = _styles(fp, cat, poly.area, shape, seed, town)
+        use = _use(fp, cat, poly.area, 2.0 * hl, 2.0 * hw, eave, around[k])
+        if use and src == "default" and shape == ROOF_FLAT:
+            hosp = fp.kind == "hospital" or fp.tags.get("amenity") == "hospital"
+            eave = _HOSPITAL_PEAK_M if hosp else _USE_DEFAULT_PEAK_M[use]
+        if use and fp.levels and shape == ROOF_FLAT:  # a gym or a plant room is not a storey
+            eave = max(min(eave, fp.levels * _MAX_LEVEL_M + _PARAPET_M), _MIN_EAVE_M[cat])
+        wall_style, roof_style = _styles(fp, cat, poly.area, shape, seed, town, use)
         roof = Roof(shape, centre, L, S, hl, hw, rise if shape != ROOF_FLAT else 0.0)
         if town and d_edge > o.frontage_m and o.far_simplify_m > 0:
             poly = _simplified(poly, o.far_simplify_m)
         ring = np.asarray(poly.exterior.coords)[:-1].copy()
         cpt = poly.centroid
         nearest = road_lines[int(road_tree.nearest(cpt))]
+        if local_tree is not None and cat in ("house", "townhouse", "garage"):
+            loc = local_lines[int(local_tree.nearest(poly))]
+            if loc.distance(poly) <= o.local_front_m:
+                nearest = loc
         q = np.asarray(shapely.shortest_line(cpt, nearest).coords)
         towards = q[1] - q[0]
         nt = float(np.linalg.norm(towards))
+        front = _front_edge(ring, towards / nt) if nt > 1e-6 else None
+        flat_use = use if shape == ROOF_FLAT else ""
+        ground_style = _USE_GROUND.get(flat_use)
+        ground_edges = None
+        if ground_style and front is not None:
+            d_ = np.roll(ring, -1, axis=0) - ring
+            n_ = np.stack([-d_[:, 1], d_[:, 0]], axis=1) / np.maximum(
+                np.linalg.norm(d_, axis=1), 1e-12)[:, None]  # fmt: skip
+            facing = n_ @ n_[front] >= 0.34  # within 70 degrees of the front wall
+            # Storefronts face the street; loading docks the side and back walls.
+            ground_edges = tuple(bool(f) for f in (facing if use == "retail" else ~facing))
         out.append(
             Building(
                 id=fp.id,
@@ -1357,7 +1613,12 @@ def place_buildings(
                 u_offset=round(_u01(seed, fp.id, "u") * ATLAS_U_M, 3),
                 category=cat,
                 town=town,
-                front_edge=_front_edge(ring, towards / nt) if nt > 1e-6 else None,
+                front_edge=front,
+                use=use,
+                ground_style=ground_style,
+                ground_edges=ground_edges,
+                parapet_m=_USE_PARAPET_M.get(flat_use, 0.0),
+                landmark=lm,
             )
         )
     _match_outbuildings(out, seed)
@@ -1370,7 +1631,8 @@ def place_buildings(
     # the rest nearest the road relative to size first, within the town or country budget.
     def priority(b: Building) -> tuple[bool, float, str]:
         size = math.sqrt(np.clip(b.area_m2, 15.0, 1500.0) / 150.0)
-        return b.road_distance_m > o.frontage_m, b.road_distance_m / size, b.id
+        must = b.landmark or b.road_distance_m <= o.frontage_m
+        return not must, b.road_distance_m / size, b.id
 
     budget = o.town_budget_bytes if 2 * rep["town"] > len(cand) else o.budget_bytes
     kept: list[Building] = []
@@ -1379,7 +1641,7 @@ def place_buildings(
         m = extrude_building(b, storey_m=o.storey_m, sink_m=o.sink_m, atlas_size=o.atlas_size)
         cost = mesh_bytes(m)
         front = b.road_distance_m <= o.frontage_m
-        if not front and used + cost > budget:
+        if not (front or b.landmark) and used + cost > budget:
             log.info("building budget: %d of %d buildings (%.1f MB)", len(kept), len(out),
                      used / 1e6)  # fmt: skip
             break
@@ -1387,6 +1649,7 @@ def place_buildings(
         used += cost
         kept.append(b)
         rep["street_front"] += front
+        rep["landmarks"] += b.landmark
     rep["placed"] = len(kept)
     rep["budget"] = len(out) - len(kept)
     rep["mesh_bytes"] = used
@@ -1478,6 +1741,20 @@ _GABLE_BLANK_M = ATLAS_U_M - WINDOW_ZONE_M
 _GABLE_FULL_STYLES = WINDOWED | {"steel_white", "shed_wood"}
 
 
+def _floors(b: Building, storey_m: float = STOREY_M) -> np.ndarray:
+    """Storey lines (Y) from the ground to the eave: a whole number of equal storeys (each
+    stretched by at most 1.5x), or, under a ground-storey band (storefronts, loading docks),
+    a `_GROUND_STOREY_M` ground storey with equal storeys above it."""
+    h = b.eave_y - b.ground_y
+    storey_m = _USE_STOREY_M.get(b.use, storey_m)
+    if b.ground_style and h >= _GROUND_STOREY_M + 1.0:
+        n = max(1, round((h - _GROUND_STOREY_M) / storey_m))
+        upper = b.ground_y + _GROUND_STOREY_M + np.arange(n + 1) * ((h - _GROUND_STOREY_M) / n)
+        return np.concatenate([[b.ground_y], upper])
+    n = max(1, round(h / storey_m))
+    return b.ground_y + np.arange(n + 1) * (h / n)
+
+
 def _wall_rows(b: Building, storey_m: float, sink_m: float = 0.5) -> np.ndarray:
     """Horizontal wall rows (R, 4): (y_lo, y_hi, band fraction at y_lo, at y_hi), bottom up.
 
@@ -1489,9 +1766,8 @@ def _wall_rows(b: Building, storey_m: float, sink_m: float = 0.5) -> np.ndarray:
     ends) on the plain strip under the sills, stretched (few vertices; `_walls` maps narrow
     gables on the window-free end of the band instead).
     """
-    h = b.eave_y - b.ground_y
-    n = max(1, round(h / storey_m))
-    floors = b.ground_y + np.arange(n + 1) * (h / n)
+    floors = _floors(b, storey_m)
+    n = len(floors) - 1
     rows = [(floors[k], floors[k + 1], 1.0, 0.0) for k in range(n)]
     if b.ground_y - b.base_y > sink_m + _FOUNDATION_MIN_M:
         rows.insert(0, (b.base_y, b.ground_y, 1.0, 0.9))
@@ -1543,6 +1819,8 @@ def _ring_u(b: Building, ring: np.ndarray) -> np.ndarray:
 
 def _walls(b: Building, ring: np.ndarray, rows: np.ndarray, size: int) -> MeshData:
     v_top, v_bot = band_v(b.wall_style, size)
+    g_top, g_bot = band_v(b.ground_style or b.wall_style, size)
+    first = float(_floors(b)[1])  # rows up to this line (the foundation too): ground storey
     top = b.eave_y + b.roof.height(ring)
     n = len(ring)
     seg = np.linalg.norm(np.roll(ring, -1, axis=0) - ring, axis=1)
@@ -1553,6 +1831,11 @@ def _walls(b: Building, ring: np.ndarray, rows: np.ndarray, size: int) -> MeshDa
     full = b.wall_style in _GABLE_FULL_STYLES
     g0 = WINDOW_ZONE_M + 0.5 * (_GABLE_BLANK_M - e_len) + dist  # u (metres) of each vertex
     g_hi = max(0.0, 1.0 - (b.ridge_y - b.eave_y) / STOREY_M)
+    ground = (
+        np.ones(len(b.ring), bool)
+        if b.ground_edges is None or len(b.ground_edges) != len(b.ring)
+        else np.asarray(b.ground_edges, bool)
+    )
     pos, nrm, uvs, idx = [], [], [], []
     count = 0
     for i in range(n):
@@ -1562,6 +1845,8 @@ def _walls(b: Building, ring: np.ndarray, rows: np.ndarray, size: int) -> MeshDa
         normal = np.array([-d[1], 0.0, d[0]])  # left of the edge = outside (clockwise ring)
         ya, yb = top[i], top[(i + 1) % n]
         for lo, hi, f_lo, f_hi in rows:
+            low = bool(b.ground_style) and hi <= first + 1e-6 and bool(ground[edge[i]])
+            vt, vb = (g_top, g_bot) if low else (v_top, v_bot)
             if lo >= max(ya, yb) - 1e-9:
                 break
             poly = [(0.0, lo), (length, lo), (length, min(hi, yb)), (0.0, min(hi, ya))]
@@ -1578,7 +1863,7 @@ def _walls(b: Building, ring: np.ndarray, rows: np.ndarray, size: int) -> MeshDa
                 u = (g0[i] + uv_[:, 0]) / ATLAS_U_M
                 f_lo, f_hi = 1.0, g_hi
             t = np.clip((uv_[:, 1] - lo) / (hi - lo), 0.0, 1.0)
-            v = v_top + (f_lo + t * (f_hi - f_lo)) * (v_bot - v_top)
+            v = vt + (f_lo + t * (f_hi - f_lo)) * (vb - vt)
             pos.append(xyz)
             nrm.append(np.tile(normal, (len(poly), 1)))
             uvs.append(np.stack([u, v], axis=1))
@@ -1663,7 +1948,8 @@ def _roof(b: Building, ring: np.ndarray, size: int, margin: float) -> list[MeshD
     foot = shapely.Polygon(ring)
     if not foot.is_valid:
         foot = shapely.make_valid(foot)
-    ring_top = b.eave_y + b.roof.height(ring)
+    drop = _parapet(b)
+    ring_top = b.eave_y - drop + b.roof.height(ring)
     out = []
     for region, grad, h_c in b.roof.regions(margin):
         piece = shapely.intersection(foot, region, grid_size=1e-7)
@@ -1677,7 +1963,7 @@ def _roof(b: Building, ring: np.ndarray, size: int, margin: float) -> list[MeshD
         flat_xz, hit = _snap(tris.reshape(-1, 2), ring)
         tris = flat_xz.reshape(-1, 3, 2)
         h = h_c + (tris - b.roof.centre) @ grad
-        y = b.eave_y + h
+        y = b.eave_y - drop + h
         # Exact wall-top heights on the ring (bitwise equal to the walls').
         _, j = cKDTree(ring).query(flat_xz)
         y = np.where(hit.reshape(-1, 3), ring_top[j].reshape(-1, 3), y)
@@ -1697,6 +1983,50 @@ def _roof(b: Building, ring: np.ndarray, size: int, margin: float) -> list[MeshD
         normal /= np.linalg.norm(normal)
         out.append(_planar_piece(tris, y, normal, u, v, up=True))
     return out
+
+
+def _parapet(b: Building) -> float:
+    """How far a flat roof sits below the wall top (0 without a parapet)."""
+    if b.parapet_m <= 0.0 or b.roof.shape != ROOF_FLAT or b.roof.rise > 0.0:
+        return 0.0
+    return float(min(b.parapet_m, max(0.0, b.eave_h - _MIN_EAVE_M["commercial"])))
+
+
+def _parapet_inner(b: Building, ring: np.ndarray, size: int) -> MeshData:
+    """The parapet's inner faces, from the sunken flat roof up to the wall top, facing in
+    (the roof band: flashing and membrane grey)."""
+    drop = _parapet(b)
+    if drop <= 0.0:
+        return _empty()
+    v_top, v_bot = band_v(b.roof_style, size)
+    vm = 0.5 * (v_top + v_bot)
+    y0, y1 = b.eave_y - drop, b.eave_y
+    n = len(ring)
+    pos, nrm, uvs = [], [], []
+    for i in range(n):
+        a, c = ring[i], ring[(i + 1) % n]
+        dvec = c - a
+        length = float(np.linalg.norm(dvec))
+        if length < 1e-6:
+            continue
+        inward = np.array([dvec[1], 0.0, -dvec[0]]) / length
+        # Reversed (c -> a) so the face winds counter-clockwise seen from inside.
+        pos.append([[c[0], y0, c[1]], [a[0], y0, a[1]], [a[0], y1, a[1]], [c[0], y1, c[1]]])
+        nrm.append(np.tile(inward, (4, 1)))
+        u1 = length / ATLAS_U_M
+        dv = 0.25 * (v_bot - v_top) * drop / STOREY_M
+        uvs.append([[0.0, vm + dv], [u1, vm + dv], [u1, vm - dv], [0.0, vm - dv]])
+    if not pos:
+        return _empty()
+    k = len(pos)
+    quads = np.arange(k)[:, None] * 4 + np.array([0, 1, 2, 0, 2, 3])[None, :]
+    return MeshData(
+        np.asarray(pos, np.float64).reshape(-1, 3),
+        np.concatenate(nrm),
+        np.asarray(uvs, np.float64).reshape(-1, 2),
+        np.tile([1.0, 0.0, 0.0], (4 * k, 1)),
+        quads.reshape(-1).astype(np.int64),
+    )
 
 
 def _door_quads(b: Building, size: int, offset_m: float = 0.03) -> MeshData:
@@ -1747,7 +2077,8 @@ def extrude_building(
     margin = 1.0
     rows = _wall_rows(b, storey_m, sink_m)
     ring = _noded_ring(b, np.unique(rows[:, :2]), margin)
-    parts = [_walls(b, ring, rows, atlas_size), *_roof(b, ring, atlas_size, margin)]
+    parts = [_walls(b, ring, rows, atlas_size), *_roof(b, ring, atlas_size, margin),
+             _parapet_inner(b, ring, atlas_size)]  # fmt: skip
     if doors:
         parts.append(_door_quads(b, atlas_size))
     if floor:
