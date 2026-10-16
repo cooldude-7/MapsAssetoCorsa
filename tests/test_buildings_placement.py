@@ -66,6 +66,8 @@ def test_measured_heights_win_and_microsoft_is_mid_roof():
     assert b.height_source == "burlington"
     assert b.ridge_h == pytest.approx(6.6) and b.eave_h == pytest.approx(3.1)
     flat = _one(_fp("burlington:2", house, "burlington", peak_m=4.0, eave_m=3.8))
+    big = _one(_fp("burlington:3", _rect(-20, 30, 40, 25), "burlington", peak_m=12.0, eave_m=4.0))
+    assert big.roof.shape != ROOF_FLAT and big.eave_h == pytest.approx(4.0)  # a big barn
     assert flat.roof.shape == ROOF_FLAT and flat.eave_h == pytest.approx(4.0)
     nr = _one(_fp("nrcan:1", house, "nrcan", peak_m=7.0, lidar=True))
     assert nr.height_source == "nrcan" and nr.ridge_h == pytest.approx(7.0)

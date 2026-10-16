@@ -697,8 +697,11 @@ def _heights(
         spread = spread if spread < 0.5 * o.flat_lidar_spread_m else None
     shape = _roof_shape(fp, cat, area, half_width, aspect, None if eave_m is not None else spread,
                         o, seed)  # fmt: skip
-    if peak is not None and eave_m is not None and peak - eave_m < 0.6:
-        shape = ROOF_FLAT
+    if peak is not None and eave_m is not None:  # measured: flat exactly when it is
+        if peak - eave_m < 0.6:
+            shape = ROOF_FLAT
+        elif shape == ROOF_FLAT and half_width * 2.0 >= o.min_pitched_width_m:
+            shape = ROOF_GABLED
     if cat == "barn" and shape == ROOF_FLAT and area >= 400.0 and fp.kind not in _BARN_KINDS:
         cat = "commercial"
     lo, hi = o.height_clamp
@@ -721,7 +724,7 @@ def _heights(
     if shape == ROOF_FLAT:
         rise = 0.0
     elif peak is not None and eave_m is not None:
-        rise = min(peak - eave_m, cap)
+        rise = min(peak - eave_m, math.tan(math.radians(o.max_pitch_deg)) * half_width)
     else:
         pitch = None
         # Lidar pitch from a 1 m DSM is believed only when clearly steep, or clearly low
