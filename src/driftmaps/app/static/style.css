@@ -161,7 +161,7 @@ code { font-family: var(--mono); font-size: 12px; word-break: break-all; }
 }
 .touge-box .row .hint { flex: 1; margin: 0; }
 .touge-box .btn { flex: none; }
-.ok-text { color: var(--ok); font-weight: 550; }
+.touge-box .ok-text { color: var(--ok); font-weight: 550; }
 
 /* ---------- layout ---------- */
 
@@ -652,6 +652,8 @@ kbd {
   font-size: 12.5px;
 }
 .track-share.error { color: var(--bad); }
+.track-share.saved { flex-wrap: wrap; justify-content: flex-end; }
+.track-share.saved .share-text { flex-basis: 100%; }
 .track-share .share-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .track-share .share-path { font: 11.5px/1.4 var(--mono); color: var(--text); }
 .track-share .btn, .track-share .spinner { flex: none; }

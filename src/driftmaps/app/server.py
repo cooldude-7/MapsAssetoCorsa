@@ -1032,9 +1032,7 @@ class App:
 
     def share_track(self, track_id: str) -> dict:
         """Zip our track to `<app data>/shared/<id>.zip` (newest copy if there are two)."""
-        ours = [
-            f for f in self._our_folders(track_id, "can't be shared here") if not _skip_link(f)
-        ]
+        ours = [f for f in self._our_folders(track_id, "can't be shared here") if not _skip_link(f)]
         if not ours:
             raise ApiError(403, f"{track_id} is a link to another folder, so it can't be shared.")
         folder = max(ours, key=lambda f: marker_built_at(f) or 0.0)  # ties: AC's copy

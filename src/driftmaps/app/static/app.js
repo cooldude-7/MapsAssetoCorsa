@@ -3947,7 +3947,7 @@ function shareRow(t) {
   const size = formatSize(Number(share.size_mb));
   return h(
     "div",
-    { class: "track-share", role: "status" },
+    { class: "track-share saved", role: "status" },
     h(
       "span",
       { class: "share-text" },

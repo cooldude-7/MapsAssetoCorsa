@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import http.client
 import json
+import shutil
 import threading
 import time
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -577,6 +579,157 @@ def test_delete_only_our_tracks(env):
     assert not ours.exists() and not ours_out.exists()
     assert env.client.get("/api/tracks") == (200, [])
     assert theirs.is_dir() and clash.is_dir()
+
+
+# ---------------------------------------------------------------------------------------------
+# sharing, open folder, touge mode
+# ---------------------------------------------------------------------------------------------
+
+
+def test_share_track_zips_only_the_track_folder(env):
+    ours = write_track(env.tracks / "dm_mine", "Mine Road")
+    (ours / "LICENSE-DATA.txt").write_text("credits", encoding="utf-8")
+    (ours / "data").mkdir()
+    (ours / "data" / "surfaces.ini").write_text("[SURFACE_0]", encoding="utf-8")
+    write_track(env.out / "dm_mine", "Mine Road")  # same age: AC's copy is the one shared
+    secret = env.tmp / "secret"
+    secret.mkdir()
+    (secret / "passwords.txt").write_text("no", encoding="utf-8")
+    try:  # links could point anywhere on the PC: never followed
+        (ours / "link.txt").symlink_to(secret / "passwords.txt")
+        (ours / "linkdir").symlink_to(secret, target_is_directory=True)
+    except OSError:  # Windows without the symlink privilege
+        pass
+
+    status, body = env.client.post("/api/tracks/dm_mine/share")
+    assert status == 200, body
+    zip_path = env.settings.data_dir / "shared" / "dm_mine.zip"
+    assert body == {
+        "track_id": "dm_mine",
+        "name": "Mine Road",
+        "zip_path": str(zip_path),
+        "folder": str(zip_path.parent),
+        "size_mb": round(zip_path.stat().st_size / 1_048_576, 1),
+    }
+    with zipfile.ZipFile(zip_path) as zf:
+        assert sorted(zf.namelist()) == [
+            "HOW TO INSTALL.txt",
+            "dm_mine/.driftmaps",
+            "dm_mine/LICENSE-DATA.txt",
+            "dm_mine/data/surfaces.ini",
+            "dm_mine/dm_mine.kn5",
+            "dm_mine/ui/ui_track.json",
+        ]
+        assert zf.read("dm_mine/dm_mine.kn5") == b"x" * 2_500_000
+        readme = zf.read("HOW TO INSTALL.txt").decode("utf-8")
+    assert readme.startswith("Mine Road\r\n")
+    for text in (
+        "content\\tracks",
+        "assettocorsa\\content\\tracks\\dm_mine\\",
+        "Restart Content Manager",
+        "Made with Assetto Corsa Map Generator.",
+        "OpenStreetMap contributors",
+        "dm_mine\\LICENSE-DATA.txt",
+        "Kunos Simulazioni",
+    ):
+        assert text in readme, text
+
+    # Sharing again replaces the zip and leaves nothing else behind.
+    (ours / "extra.txt").write_text("new", encoding="utf-8")
+    assert env.client.post("/api/tracks/dm_mine/share")[0] == 200
+    assert [p.name for p in zip_path.parent.iterdir()] == ["dm_mine.zip"]
+    with zipfile.ZipFile(zip_path) as zf:
+        assert "dm_mine/extra.txt" in zf.namelist()
+
+
+def test_share_refuses_other_tracks_and_foreign_pages(env):
+    write_track(env.tracks / "dm_mine", "Mine")
+    write_track(env.tracks / "ks_nordschleife", "Nordschleife", ours=False)
+    post = lambda path, **kw: env.client.call("POST", path, **kw)[:2]  # noqa: E731
+    status, body = post("/api/tracks/ks_nordschleife/share")
+    assert status == 403 and "wasn't made by this app" in body["error"]
+    assert post("/api/tracks/dm_nothing/share")[0] == 404
+    assert post("/api/tracks/Bad-Id/share")[0] == 400
+    assert post("/api/tracks/..%2F..%2Fx/share")[0] == 400
+    assert post("/api/tracks/dm_mine/zip")[0] == 405
+    assert post("/api/tracks/dm_mine/share", headers={"Origin": "https://evil.example"})[0] == 403
+    host = {"Host": f"evil.example:{env.srv.port}"}
+    assert post("/api/tracks/dm_mine/share", headers=host)[0] == 403
+    shared = env.settings.data_dir / "shared"
+    assert not shared.exists() or list(shared.iterdir()) == []
+
+
+def test_open_folder_only_opens_app_folders(env, monkeypatch):
+    opened: list[Path] = []
+    monkeypatch.setattr(server_mod, "open_in_file_manager", opened.append)
+    write_track(env.tracks / "dm_mine", "Mine")
+    zip_path = Path(env.client.post("/api/tracks/dm_mine/share")[1]["zip_path"])
+    post = lambda body, **kw: env.client.call("POST", "/api/open-folder", body, **kw)[:2]  # noqa: E731
+
+    shared = zip_path.parent.resolve()
+    assert post({"path": str(zip_path)}) == (200, {"ok": True, "folder": str(shared)})
+    assert post({"path": str(zip_path.parent)})[0] == 200
+    assert opened == [shared, shared]
+
+    outside = env.tmp / "outside"
+    outside.mkdir()
+    for bad in (
+        str(env.tracks),
+        str(outside),
+        str(zip_path.parent / ".." / ".." / "outside"),
+        str(Path(zip_path.anchor)),
+    ):
+        status, body = post({"path": bad})
+        assert status == 403 and "only opens its own folders" in body["error"], bad
+    for bad in ("", "   ", None, 5, ["x"], "relative/folder"):
+        assert post({"path": bad})[0] == 400, bad
+    assert post({})[0] == 400
+    assert post({"path": str(zip_path.parent / "gone")})[0] == 404
+    try:  # a link inside the app folder that leads out of it
+        (zip_path.parent / "escape").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pass
+    else:
+        assert post({"path": str(zip_path.parent / "escape")})[0] == 403
+    assert post({"path": str(zip_path)}, headers={"Origin": "https://evil.example"})[0] == 403
+    assert opened == [shared, shared]
+
+
+def test_install_touge(env, tmp_path):
+    from driftmaps import csp_modes
+
+    post = lambda: env.client.call("POST", "/api/install-touge", {})[:2]  # noqa: E731
+    status, body = post()
+    assert status == 409 and "Custom Shaders Patch" in body["error"]
+    assert not (env.ac / "extension").exists()
+
+    (env.ac / "extension").mkdir()
+    dest = env.ac / "extension" / "lua" / "new-modes" / "acmg-touge"
+    for _ in range(2):  # the second time it replaces its own copy
+        status, body = post()
+        assert status == 200, body
+        assert body == {"ok": True, "mode_id": "acmg-touge", "folder": str(dest)}
+    assert (dest / "mode.lua").is_file() and csp_modes.is_ours(dest)
+    written = {p for p in env.ac.rglob("*") if p.is_file()} - {env.ac / "acs.exe"}
+    assert written and all(p.is_relative_to(dest) for p in written)
+    assert [p.name for p in dest.parent.iterdir()] == ["acmg-touge"]
+
+    shutil.rmtree(dest)  # someone else's folder of that name is left alone
+    dest.mkdir()
+    (dest / "mode.lua").write_text("theirs", encoding="utf-8")
+    status, body = post()
+    assert status == 409 and "wasn't put there by this app" in body["error"]
+    assert (dest / "mode.lua").read_text(encoding="utf-8") == "theirs"
+
+    origin = {"Origin": "https://evil.example"}
+    assert env.client.call("POST", "/api/install-touge", {}, headers=origin)[0] == 403
+    no_ac = App(Settings(tmp_path / "no_ac", discover=lambda: None))
+    try:
+        with pytest.raises(server_mod.ApiError) as exc:
+            no_ac.install_touge()
+    finally:
+        no_ac.close()
+    assert exc.value.status == 409 and "Assetto Corsa" in exc.value.message
 
 
 # ---------------------------------------------------------------------------------------------
