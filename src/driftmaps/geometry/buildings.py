@@ -402,6 +402,11 @@ class BuildingOptions:
     big_m2: float = 450.0
     town_neighbours: int = 10
     dense_neighbours: int = 20
+    urban_town: float = 0.75
+    urban_min_neighbours: int = 4
+    # Built-up land (at least this urban share) keeps buildings clear of the drivable surface
+    # only, like a town, even where they count as country for their looks.
+    urban_clearance: float = 0.5
     # Townhouse rows (in towns; untyped, residential or terrace footprints): the minimum
     # rectangle at least this long and this deep, and this big.
     row_min_length_m: float = 18.0
@@ -752,9 +757,10 @@ def _category(
 def _town_context(
     polys: Sequence[shapely.Polygon], cand: Sequence[int], landcover: LandcoverFn | None,
     o: BuildingOptions,
-) -> np.ndarray:  # fmt: skip
+) -> tuple[np.ndarray, np.ndarray]:  # fmt: skip
     """Per candidate (indices into `polys`, every footprint found): 0 in the country, 1 in a
-    town, 2 in a dense town (a subdivision or downtown: townhouse rows only stand there).
+    town, 2 in a dense town (a subdivision or downtown: townhouse rows only stand there); and
+    the urban share of the land cover around it (0 when unknown).
 
     Counted: the footprints of at least `min_neighbour_m2` (no sheds) within
     `context_radius_m`, other than the building itself (a subdivision has 40-80 houses in
@@ -763,10 +769,12 @@ def _town_context(
     `dense_neighbours` a building is in a dense town; with at least `town_neighbours` in a
     town, unless most of them are big (> `big_m2`: a farm's barns) or the land cover around
     it (its centre and 8 points 75 m out) is known and less than 30 % urban (class 17: a
-    hamlet among fields and woods); otherwise in the country.
+    hamlet among fields and woods); with at least `urban_min_neighbours` where at least
+    `urban_town` of the land cover is urban, also in a town (a district of big buildings);
+    otherwise in the country.
     """
     if not len(cand):
-        return np.zeros(0, np.int8)
+        return np.zeros(0, np.int8), np.zeros(0)
     cents = np.array([[c.x, c.y] for c in (p.centroid for p in polys)])
     area = np.array([p.area for p in polys])
     idx = np.asarray(cand, np.int64)
@@ -796,7 +804,10 @@ def _town_context(
         urban = (lc == _LC_URBAN).sum(axis=1) / np.maximum(k, 1)
     dense = n >= o.dense_neighbours
     town = dense | ((n >= o.town_neighbours) & (2 * big < n) & (~known | (urban >= 0.3)))
-    return town.astype(np.int8) + dense.astype(np.int8)
+    # A district of big buildings (shops, offices, towers by the lake) has few neighbours
+    # within 100 m, mostly big: a town where the land cover is (almost) all urban.
+    town |= known & (urban >= o.urban_town) & (n >= o.urban_min_neighbours)
+    return town.astype(np.int8) + dense.astype(np.int8), np.where(known, urban, 0.0)
 
 
 def _measured(fp: Footprint) -> tuple[float | None, float | None, str]:
@@ -1229,11 +1240,10 @@ def place_buildings(
             continue
         pre.append((d_edge, fp, poly, len(every) - 1))
     # Context first: in town buildings stand at the sidewalk, inside the wall corridor.
-    ctx_pre = _town_context(every, [c[3] for c in pre], landcover, o)
+    ctx_pre, urban_pre = _town_context(every, [c[3] for c in pre], landcover, o)
     cand: list[tuple[float, Footprint, shapely.Polygon, int]] = []
-    for (d_edge, fp, poly, _), ctx in zip(pre, ctx_pre, strict=True):
-        town = ctx >= 1
-        if town:
+    for (d_edge, fp, poly, _), ctx, urban in zip(pre, ctx_pre, urban_pre, strict=True):
+        if ctx >= 1 or urban >= o.urban_clearance:
             if d_edge < o.town_clearance_m or (
                 paved_out is not None and poly.intersects(paved_out)
             ):

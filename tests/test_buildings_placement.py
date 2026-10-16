@@ -189,8 +189,11 @@ def test_barns_only_in_the_country():
     farm = [_fp(f"ms:q:b{i}", _rect(-60 + 30 * i, 100, 25, 20), "microsoft", tags={})
             for i in range(5)] + [_fp(f"ms:q:s{i}", _rect(-60 + 8 * i, 20, 4, 4), "microsoft",
                                       tags={}) for i in range(12)]  # fmt: skip
-    got = _place([big, *farm, *_subdivision(1)[:3]], landcover=_cover(17))
+    got = _place([big, *farm, *_subdivision(1)[:3]], landcover=_cover(15))
     assert got["ms:q:big"].category == "barn" and got["ms:q:b0"].category == "barn"
+    # A district of big buildings on all-urban land cover (shops by the lake) is a town.
+    got = _place([big, *farm, *_subdivision(1)[:3]], landcover=_cover(17))
+    assert got["ms:q:big"].category != "barn" and got["ms:q:big"].town
 
 
 def test_town_houses_are_brick_rows_with_a_door_per_unit():
