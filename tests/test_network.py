@@ -452,3 +452,30 @@ def test_cul_de_sac_reaching_into_the_radius_is_built_whole():
     # A dead end too far beyond the radius is still cut at it.
     far = [sr for sr in net.side_roads if 3 in sr.way_ids.tolist()]
     assert far and max(sr.length for sr in far) < 130.0
+
+
+def test_cul_de_sac_mapped_as_a_loop_gets_its_island():
+    """A street ending in a 68 m closed loop (a bulb mapped round its island): the loop is
+    paved, its middle is a curbed island, not asphalt."""
+    model = _model(np.array([[-200.0, 0.0], [200.0, 0.0]]))
+    ang = np.linspace(-np.pi / 2, 1.5 * np.pi, 11)[:-1]
+    loop = np.stack([np.cos(ang), np.sin(ang)], axis=1) * 10.8 + [0.0, 70.8]
+    ways = [
+        NetWay(1, (1, 2, 3), np.array([[-200, 0], [0, 0], [200, 0.0]]), {"highway": "tertiary"}),
+        NetWay(2, (2, 30), np.array([[0, 0], [0, 60.0]]), {"highway": "residential"}),
+        NetWay(
+            3,
+            (30, *range(31, 40), 30),
+            np.concatenate([loop, loop[:1]]),
+            {"highway": "residential"},
+        ),  # fmt: skip
+    ]
+    net = build_network(
+        model, ways, [], route_nodes={1, 2, 3}, route_segments={(1, 2), (2, 3)},
+        route_highway=["tertiary"] * len(model), dtm=lambda xz: np.zeros(len(xz)),
+        options=OPTS, nodes_known=False,
+    )  # fmt: skip
+    centre = shapely.Point(0.0, 70.8)
+    assert any(isl.contains(centre) for isl in net.islands)
+    assert not net.polygons["asphalt"].contains(centre)
+    assert net.paved.contains(shapely.Point(0.0, 81.5))  # the loop's carriageway

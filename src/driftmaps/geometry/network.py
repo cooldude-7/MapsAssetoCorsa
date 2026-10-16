@@ -168,6 +168,10 @@ TURNING_CIRCLE_RADIUS_M = 12.0
 # end lies at most this far beyond the radius, so the bulb seen from the route is there.
 DEAD_END_REACH_M = 100.0
 TURNING_LOOP_ISLAND_M = 5.0  # a turning loop's central island (R 4-6 m, ASSUMED)
+# A closed residential loop this short is a cul-de-sac mapped round its landscaped island
+# (Oakville's "Old Brompton Way": a 68 m loop); the island is kept when at least this big.
+LOOP_CULDESAC_MAX_M = 150.0
+MIN_LOOP_ISLAND_M2 = 12.0
 
 _ROAD_CLASSES = frozenset(
     "motorway trunk primary secondary tertiary unclassified residential living_street road "
@@ -1320,6 +1324,17 @@ def build_network(
                 if tc is not None and tc.tags.get("highway") == "turning_loop":
                     end = sr.model.centre[-1, [0, 2]]
                     loop_islands.append(shapely.Point(end).buffer(TURNING_LOOP_ISLAND_M, 16))
+        if (
+            sr.start_node >= 0
+            and sr.start_node == sr.end_node
+            and sr.highway in ("residential", "living_street", "unclassified")
+            and sr.length <= LOOP_CULDESAC_MAX_M
+        ):
+            # A small closed loop at a street's end: a cul-de-sac mapped round its island.
+            ring = shapely.Polygon(sr.xz).buffer(0)
+            isl = ring.buffer(-float(np.max(sr.model.half_width)) - 0.3, quad_segs=8)
+            if not isl.is_empty and isl.area >= MIN_LOOP_ISLAND_M2:
+                loop_islands.append(isl)
         carriage.append(poly)
         if sr.shoulder > 0:
             lo, ro = road_columns(m, m.outer), road_columns(m, -m.outer)
