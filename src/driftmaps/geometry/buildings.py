@@ -8,10 +8,12 @@ builders' buildings.md (2026-10-16: sources, conflation, heights, typical Ontari
 1. Footprints (`geo.buildings.Footprint`, lon/lat, already conflated by
    `geo.buildings.conflate`) are projected to XZ, repaired, holes dropped (drawn solid), and
    kept when `min_area_m2` (10 m2: garages, sheds and barns count) <= area <= `max_area_m2`,
-   within `max_distance_m` (300 m) of the centreline, and clear of the road: a footprint that
-   touches the corridor polygon (road + verge, as the hidden walls use) grown by
-   `clearance_m`, or that comes within `clearance_m` of the road's drivable edge, is dropped
-   (never clipped).
+   within `max_distance_m` (300 m) of the centreline, and clear of the road: in the country a
+   footprint that touches the corridor polygon (road + verge, as the hidden walls use) grown
+   by `clearance_m`, or that comes within `clearance_m` of the road's drivable edge, is
+   dropped (never clipped); in a town (step 3), where buildings stand at the sidewalk inside
+   the wall corridor, only one within `town_clearance_m` (1 m) of the drivable surface (the
+   route, `paved` side roads and junctions) is.
 2. Ground: the built terrain (`ground(xz)`, not the raw DTM: cut/fill changed it) under the
    ring and a 3 m interior lattice. The walls start `sink_m` (0.5 m) below its LOWEST point;
    heights are measured from its median.
@@ -58,9 +60,12 @@ builders' buildings.md (2026-10-16: sources, conflation, heights, typical Ontari
    front door and usually a single garage door, garages their garage doors, barns a sliding
    or steel door, sheds a door. House walls show whole windows, centred per wall; garage
    walls are blank.
-7. Budget: buildings in order of how far they are from the road, relative to their size (a
-   big barn 200 m away comes before a shed at 100 m), until `budget_bytes` of mesh
-   (44 B a vertex + 6 B a triangle in the KN5).
+7. Budget: every building within `frontage_m` (60 m) of the route's drivable edge (the
+   street front) is always placed; then the rest in order of how far they are from the road,
+   relative to their size (a big barn 200 m away comes before a shed at 100 m), until
+   `budget_bytes` of mesh (44 B a vertex + 6 B a triangle in the KN5), `town_budget_bytes`
+   (12 MB) when most candidates stand in a town, where the outlines of buildings beyond the
+   street front are also simplified to 0.5 m (fewer wall quads).
 
 **Meshes** (`building_meshes`, `building_scene`): the roof is a piecewise-planar height field
 over the minimum rotated rectangle (gable: 2 planes split by the ridge; hip: 2 trapezoids + 2
@@ -350,6 +355,13 @@ _MIN_EAVE_M = {"shed": 2.0, "garage": 2.3, "house": 2.4, "townhouse": 2.4, "barn
                "commercial": 3.0}  # fmt: skip
 _MAX_RISE_M = {"shed": 2.5, "garage": 3.5, "house": 6.0, "townhouse": 4.0, "barn": 9.0,
                "commercial": 4.0}  # fmt: skip
+# A commercial building (shops, offices, apartments) with a measured eave and peak keeps its
+# flat roof unless the peak is at least this far above the eave on a low building (a real
+# pitched roof); on one this tall the peak is a rooftop penthouse (Burlington PEAKHGT,
+# ASSUMED). The flat roof then stands a parapet above the eave.
+_COMMERCIAL_PITCH_M = 2.5
+_TALL_EAVE_M = 9.0
+_PARAPET_M = 0.6
 # NRCan Land Cover 2020 classes (geometry.vegetation.sample_landcover).
 _LC_FARM = (10, 15, 16)  # temperate grassland (pasture, hay), cropland, barren
 _LC_URBAN = 17
@@ -392,6 +404,16 @@ class BuildingOptions:
     row_min_area_m2: float = 180.0
     row_unit_m: float = 6.5  # one unit (front door, garage door) per this much frontage
     budget_bytes: int = 5_000_000  # mesh bytes in the KN5 (44 B / vertex + 6 B / triangle)
+    # Towns (most candidates in a town): a bigger budget, and buildings farther than
+    # `frontage_m` from the drivable edge get outlines simplified to `far_simplify_m`.
+    town_budget_bytes: int = 12_000_000
+    far_simplify_m: float = 0.5
+    # Every building whose footprint comes within this of the route's drivable edge is placed,
+    # whatever the budget: the street front (the user's Burlington check, 2026-10-16).
+    frontage_m: float = 60.0
+    # In town buildings stand at the sidewalk: kept clear of the drivable surface (the route,
+    # `paved` side roads and junctions) by this much instead of the wall corridor.
+    town_clearance_m: float = 1.0
     # Height (see module docstring).
     erode_m: float = 1.0
     sample_step_m: float = 1.0
@@ -828,9 +850,16 @@ def _heights(
         spread = spread if spread < 0.5 * o.flat_lidar_spread_m else None
     shape = _roof_shape(fp, cat, area, half_width, aspect, None if eave_m is not None else spread,
                         o, seed)  # fmt: skip
+    flat_top = False  # a measured flat roof whose peak is a parapet or a rooftop penthouse
     if peak is not None and eave_m is not None:  # measured: flat exactly when it is
         if peak - eave_m < 0.6:
             shape = ROOF_FLAT
+        elif (
+            shape == ROOF_FLAT
+            and cat == "commercial"
+            and (peak - eave_m < _COMMERCIAL_PITCH_M or eave_m >= _TALL_EAVE_M)
+        ):
+            flat_top = True  # shops, offices, apartment towers: flat, the peak is equipment
         elif shape == ROOF_FLAT and half_width * 2.0 >= o.min_pitched_width_m:
             shape = ROOF_GABLED
     if cat == "barn" and shape == ROOF_FLAT and area >= 400.0 and fp.kind not in _BARN_KINDS:
@@ -839,6 +868,9 @@ def _heights(
     hi_cat = min(o.max_roof_rise_m, _MAX_RISE_M[cat]) if cat != "barn" else _MAX_RISE_M[cat]
     cap = min(hi_cat, math.tan(math.radians(o.max_pitch_deg)) * half_width)
     if shape == ROOF_FLAT:
+        if flat_top and eave_m is not None and peak is not None:
+            top = min(peak, eave_m + _PARAPET_M)
+            return msrc, float(np.clip(top, 2.0, hi)), 0.0, shape, cat
         if peak is not None:
             return msrc, float(np.clip(peak, 2.0, hi)), 0.0, shape, cat
         if lid is not None:
@@ -1114,6 +1146,8 @@ def place_buildings(
     seed: int | str = 0,
     roads: Sequence[np.ndarray] | None = None,
     landcover: LandcoverFn | None = None,
+    paved: shapely.Geometry | None = None,
+    report: dict[str, int] | None = None,
 ) -> list[Building]:
     """Turn footprints into `Building`s (module docstring, steps 1-7), sorted by id.
 
@@ -1124,35 +1158,66 @@ def place_buildings(
     XZ polylines (side roads) a front wall may face; the route always counts. `seed` should be
     the track id. Each building's mesh is made here (for the byte budget) and kept in `mesh`.
     `landcover(xz)` (NRCan 2020 classes, e.g. `vegetation.LandcoverSampler`) tells farmland
-    from town where the building density alone does not (`_town_context`).
+    from town where the building density alone does not (`_town_context`). `paved` is the
+    drivable surface beyond the route (side roads, junctions: `RoadNetwork.paved`); in town
+    buildings only keep clear of it and of the route by `town_clearance_m`, not of the wall
+    corridor. `report`, if given, receives the counts of the steps (found, dropped and why,
+    candidates, town, street front, placed, budget).
     """
     o = options or BuildingOptions()
+    rep = report if report is not None else {}
+    rep.update(dict.fromkeys(("found", "size", "far", "road", "corridor", "candidates", "town",
+                              "street_front", "placed", "budget"), 0))  # fmt: skip
+    rep["found"] = len(footprints)
     if not footprints:
         return []
     line, tree, outer = _road_frame(model)
     keep_out = corridor.buffer(o.clearance_m) if corridor is not None else None
-    cand: list[tuple[float, Footprint, shapely.Polygon, int]] = []
+    paved_out = (
+        paved.buffer(o.town_clearance_m) if paved is not None and not paved.is_empty else None
+    )
+    pre: list[tuple[float, Footprint, shapely.Polygon, int]] = []
     every: list[shapely.Polygon] = []  # every footprint found, for the building density
     for fp in footprints:
         poly = _to_polygon(fp, projection)
         if poly is not None:
             every.append(poly)
         if poly is None or not (o.min_area_m2 <= poly.area <= o.max_area_m2):
+            rep["size"] += 1
             continue
         d_centre = float(poly.distance(line))
         if d_centre > o.max_distance_m:
+            rep["far"] += 1
             continue
         # Distance from the drivable edge: from the footprint to the centreline, minus the
         # road's half width + shoulder at the station nearest that closest approach.
         p_near = np.asarray(shapely.shortest_line(poly, line).coords)[1]
         _, j = tree.query(p_near)
         d_edge = d_centre - float(outer[j])
-        if d_edge < o.clearance_m:
+        if d_edge < min(o.clearance_m, o.town_clearance_m):
+            rep["road"] += 1
             continue
-        if keep_out is not None and poly.intersects(keep_out):
+        pre.append((d_edge, fp, poly, len(every) - 1))
+    # Context first: in town buildings stand at the sidewalk, inside the wall corridor.
+    towns_pre = _town_context(every, [c[3] for c in pre], landcover, o)
+    cand: list[tuple[float, Footprint, shapely.Polygon, bool]] = []
+    for (d_edge, fp, poly, _), town in zip(pre, towns_pre, strict=True):
+        if town:
+            if d_edge < o.town_clearance_m or (
+                paved_out is not None and poly.intersects(paved_out)
+            ):
+                rep["road"] += 1
+                continue
+        elif d_edge < o.clearance_m:
+            rep["road"] += 1
             continue
-        cand.append((d_edge, fp, poly, len(every) - 1))
+        elif keep_out is not None and poly.intersects(keep_out):
+            rep["corridor"] += 1
+            continue
+        cand.append((d_edge, fp, poly, bool(town)))
     cand.sort(key=lambda t: (t[0], t[1].id))
+    rep["candidates"] = len(cand)
+    rep["town"] = sum(1 for c in cand if c[3])
     if len(cand) > o.max_buildings:
         log.info("building cap: keeping the %d nearest of %d", o.max_buildings, len(cand))
         cand = cand[: o.max_buildings]
@@ -1203,10 +1268,8 @@ def place_buildings(
     road_lines = [line] + [shapely.LineString(r) for r in (roads or []) if len(r) >= 2]
     road_tree = shapely.STRtree(road_lines)
 
-    towns = _town_context(every, [c[3] for c in cand], landcover, o)
     out: list[Building] = []
-    for k, (d_edge, fp, poly, _) in enumerate(cand):
-        town = bool(towns[k])
+    for k, (d_edge, fp, poly, town) in enumerate(cand):
         g = g_all[g_owner_all == k]
         g = g[np.isfinite(g)]
         if g.size == 0:
@@ -1226,6 +1289,8 @@ def place_buildings(
             cat = "commercial"  # a big flat-roofed building in town: shops, offices, a school
         wall_style, roof_style = _styles(fp, cat, poly.area, shape, seed, town)
         roof = Roof(shape, centre, L, S, hl, hw, rise if shape != ROOF_FLAT else 0.0)
+        if town and d_edge > o.frontage_m and o.far_simplify_m > 0:
+            poly = _simplified(poly, o.far_simplify_m)
         ring = np.asarray(poly.exterior.coords)[:-1].copy()
         cpt = poly.centroid
         nearest = road_lines[int(road_tree.nearest(cpt))]
@@ -1259,23 +1324,46 @@ def place_buildings(
     if o.doors:
         _place_doors(out, ground, o, seed)
 
-    # Byte budget: nearest the road relative to size first.
-    def priority(b: Building) -> tuple[float, str]:
-        return b.road_distance_m / math.sqrt(np.clip(b.area_m2, 15.0, 1500.0) / 150.0), b.id
+    # Byte budget: the street front always (within `frontage_m` of the drivable edge), then
+    # the rest nearest the road relative to size first, within the town or country budget.
+    def priority(b: Building) -> tuple[bool, float, str]:
+        size = math.sqrt(np.clip(b.area_m2, 15.0, 1500.0) / 150.0)
+        return b.road_distance_m > o.frontage_m, b.road_distance_m / size, b.id
 
+    budget = o.town_budget_bytes if 2 * rep["town"] > len(cand) else o.budget_bytes
     kept: list[Building] = []
     used = 0
     for b in sorted(out, key=priority):
         m = extrude_building(b, storey_m=o.storey_m, sink_m=o.sink_m, atlas_size=o.atlas_size)
         cost = mesh_bytes(m)
-        if used + cost > o.budget_bytes:
+        front = b.road_distance_m <= o.frontage_m
+        if not front and used + cost > budget:
             log.info("building budget: %d of %d buildings (%.1f MB)", len(kept), len(out),
                      used / 1e6)  # fmt: skip
             break
         b.mesh = m
         used += cost
         kept.append(b)
+        rep["street_front"] += front
+    rep["placed"] = len(kept)
+    rep["budget"] = len(out) - len(kept)
+    rep["mesh_bytes"] = used
+    rep["budget_bytes"] = budget
     return sorted(kept, key=lambda b: b.id)
+
+
+def _simplified(poly: shapely.Polygon, tol: float) -> shapely.Polygon:
+    """`poly` with its outline simplified to `tol` (fewer wall quads far from the road),
+    clockwise; the original when simplifying breaks it."""
+    s = poly.simplify(tol, preserve_topology=True)
+    if (
+        not isinstance(s, shapely.Polygon)
+        or s.is_empty
+        or not s.is_valid
+        or s.area < 0.8 * poly.area
+    ):
+        return poly
+    return shapely.orient_polygons(s, exterior_cw=True)
 
 
 def buildings_polygon(buildings: Sequence[Building], buffer_m: float = 2.0) -> shapely.Geometry:
@@ -1340,6 +1428,8 @@ def _noded_ring(b: Building, storey_lines: np.ndarray, margin: float) -> np.ndar
 # above the storey floor (below every painted sill, building_textures._paint_windows).
 _PLAIN_STRIP_M = (0.05, 0.8)
 _FOUNDATION_MIN_M = 0.3  # extra drop below the sink before a separate foundation row is cut
+_GABLE_COURSE_M = 1.0  # gable rows at most this tall (the 0.75 m plain strip stretched <= 1.33x)
+_GABLE_MAX_ROWS = 6  # a barn's 9 m gable: 6 rows of 1.5 m
 
 
 def _wall_rows(b: Building, storey_m: float, sink_m: float = 0.5) -> np.ndarray:
@@ -1350,7 +1440,9 @@ def _wall_rows(b: Building, storey_m: float, sink_m: float = 0.5) -> np.ndarray:
     cuts a window); the first storey reaches down to `base_y`, unless the ground under the
     building drops more than `sink_m` + 0.3 m below its median, where a plain foundation row
     (bottom 10 % of the band) is cut instead; then one row from the eave to the ridge (gable
-    ends) on the plain strip under the sills, stretched (few vertices; reads as wide boards).
+    ends) on the plain strip under the sills, in courses of at most `_GABLE_COURSE_M` so the
+    strip is stretched by at most 1.33x (a single stretched row turned brick into wood grain:
+    the "barn" look of the user's Oakville check).
     """
     h = b.eave_y - b.ground_y
     n = max(1, round(h / storey_m))
@@ -1362,7 +1454,10 @@ def _wall_rows(b: Building, storey_m: float, sink_m: float = 0.5) -> np.ndarray:
         rows[0] = (b.base_y, floors[1], 1.0, 0.0)
     if b.ridge_y > b.eave_y + 1e-6:
         p_lo, p_hi = _PLAIN_STRIP_M
-        rows.append((b.eave_y, b.ridge_y, 1.0 - p_lo / STOREY_M, 1.0 - p_hi / STOREY_M))
+        rise = b.ridge_y - b.eave_y
+        k = min(_GABLE_MAX_ROWS, max(1, math.ceil(rise / _GABLE_COURSE_M - 1e-6)))
+        ys = b.eave_y + np.arange(k + 1) * (rise / k)
+        rows += [(ys[i], ys[i + 1], 1.0 - p_lo / STOREY_M, 1.0 - p_hi / STOREY_M) for i in range(k)]
     return np.asarray(rows, np.float64)
 
 

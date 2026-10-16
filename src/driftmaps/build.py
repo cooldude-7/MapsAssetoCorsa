@@ -507,6 +507,16 @@ class BuildResult:
                 + "; heights "
                 + (", ".join(f"{k} {v}" for k, v in sorted(bd["height_source"].items())) or "-")
             )
+            pl = bd.get("placement") or {}
+            if pl.get("found"):
+                lines.append(
+                    f"         placed {pl['placed']} of {pl['candidates']} in reach "
+                    f"({pl['town']} in town, {pl['street_front']} street front within 60 m); "
+                    f"dropped: on the road {pl['road']}, wall corridor {pl['corridor']}, "
+                    f"too far {pl['far']}, size {pl['size']}, budget {pl['budget']} "
+                    f"({pl.get('mesh_bytes', 0) / 1e6:.1f} of "
+                    f"{pl.get('budget_bytes', 0) / 1e6:.0f} MB)"
+                )
             rails = ", ".join(f"{k} {v:.0f} m" for k, v in sorted(sc["barriers_m"].items()))
             lines.append(
                 f"rails    {rails or 'none'} (OSM barriers found: {sc['osm_barriers']}, "
@@ -1375,6 +1385,7 @@ class _Scenery:
     trees: TreeSet | None = None
     buildings: list[Building] = field(default_factory=list)
     footprints: BuildingFootprints | None = None
+    building_report: dict[str, int] = field(default_factory=dict)  # place_buildings' counts
     attributions: list[str] = field(default_factory=list)
     osm_barriers: int = 0
     osm_barrier_ways: list[OsmBarrier] = field(default_factory=list)  # matched to the road
@@ -1803,11 +1814,13 @@ def _buildings(
     roads = _building_roads(geo, options)
 
     landcover = _landcover_fn(geo, options)
+    paved = sc.network.paved if sc.network is not None else None
 
     def place(c: CanopyFn | None) -> list[Building]:
         return place_buildings(
             res.footprints, geo.projection, geo.model, ground,
             corridor=corridor, canopy=c, seed=track_id, roads=roads, landcover=landcover,
+            paved=paved, report=sc.building_report,
         )  # fmt: skip
 
     try:
@@ -2046,6 +2059,7 @@ def _scenery_stats(sc: _Scenery, geo: TrackGeometry, extra: Mapping[str, object]
             "footprints_found": dict(sc.footprints.found) if sc.footprints else {},
             "conflation": _conflation_stats(sc.footprints),
             "categories": dict(bld_stats.by_category),
+            "placement": dict(sc.building_report),
             "sources": dict(bld_stats.by_source),
             "doors": bld_stats.doors,
             "mesh_bytes": bld_stats.mesh_bytes,

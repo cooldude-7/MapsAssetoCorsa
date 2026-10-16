@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import shapely
 import pytest
 
 from driftmaps.ac.building_textures import (
@@ -135,7 +136,8 @@ def test_budget_lod_batches_and_distance():
     assert "osm:far" not in {b.id for b in allb}  # beyond 300 m
     total = sum(mesh_bytes(b.mesh) for b in allb)
     small = place_buildings(fps, PROJ, road, _flat, seed="t",
-                            options=BuildingOptions(budget_bytes=total // 3))  # fmt: skip
+                            options=BuildingOptions(budget_bytes=total // 3, frontage_m=0.0,
+                                                    town_budget_bytes=total // 3))  # fmt: skip
     assert 0 < len(small) < len(allb)
     near = max(b.road_distance_m for b in small)
     kept = {b.id for b in small}
@@ -216,3 +218,55 @@ def test_garages_wear_their_house_colours():
     ]
     got = _place([house, *garages])
     assert all(got[g.id].wall_style == got["osm:w10"].wall_style for g in garages)
+
+
+def test_street_front_buildings_are_always_placed():
+    # A downtown block: shops 3 m from the road's edge (inside the 4 m wall corridor), and
+    # 200 more buildings behind them; a budget too small for even the street front.
+    road = _road(1200.0)
+    front = [_fp(f"osm:f{i:02d}", _rect(-300 + 15 * i, 7, 12, 12), tags={"building": "retail"})
+             for i in range(40)]  # fmt: skip
+    back = [_fp(f"osm:b{i:03d}", _rect(-300 + 12 * (i % 50), 80 + 25 * (i // 50), 8, 8))
+            for i in range(200)]  # fmt: skip
+    corridor = shapely.box(-600, -8, 600, 8)  # road (4 m) + 4 m verge each side
+    rep: dict = {}
+    opts = BuildingOptions(budget_bytes=1000, town_budget_bytes=1000)
+    got = place_buildings(front + back, PROJ, road, _flat, seed="t", corridor=corridor,
+                          options=opts, report=rep)  # fmt: skip
+    ids = {b.id for b in got}
+    assert all(f.id in ids for f in front)  # in the wall corridor and over budget: placed
+    assert not any(b.id in ids for b in back)  # beyond 60 m, over budget: dropped
+    assert rep["street_front"] == 40 and rep["placed"] == 40 and rep["budget"] == 200
+    assert rep["town"] == 240 and rep["corridor"] == 0
+    # In the country the wall corridor still keeps buildings away from the road.
+    lone = _fp("osm:lone", _rect(0, 7, 12, 12), tags={"building": "house"})
+    rep = {}
+    assert place_buildings([lone], PROJ, road, _flat, corridor=corridor, report=rep) == []
+    assert rep["corridor"] == 1
+    # A footprint over a side road (the network's paved surface) is dropped in town too.
+    paved = shapely.box(-306, 0, -294, 300)  # a side road through the first shop
+    got = place_buildings(front + back, PROJ, road, _flat, seed="t", corridor=corridor,
+                          options=opts, paved=paved)  # fmt: skip
+    assert "osm:f00" not in {b.id for b in got} and "osm:f01" in {b.id for b in got}
+
+
+def test_commercial_roofs_stay_flat_and_gables_are_coursed():
+    from driftmaps.geometry.buildings import _wall_rows
+
+    retail = {"building": "retail"}
+    tower = _one(_fp("burlington:9", _rect(-10, 30, 20, 15), "burlington", tags=retail,
+                     peak_m=34.0, eave_m=30.0))  # fmt: skip
+    assert tower.roof.shape == ROOF_FLAT and tower.eave_h == pytest.approx(30.0)  # clamp 30
+    shop = _one(_fp("burlington:8", _rect(-10, 30, 20, 15), "burlington", tags=retail,
+                    peak_m=5.0, eave_m=4.0))  # fmt: skip
+    assert shop.roof.shape == ROOF_FLAT and shop.eave_h == pytest.approx(4.6)  # + parapet
+    plaza = _one(_fp("burlington:7", _rect(-10, 30, 20, 15), "burlington", tags=retail,
+                     peak_m=7.5, eave_m=4.0))  # fmt: skip
+    assert plaza.roof.shape != ROOF_FLAT  # a low building with a real pitched roof
+    house = _one(_fp("burlington:10", _rect(-6, 30, 12, 9), "burlington", peak_m=8.0, eave_m=5.0))
+    rows = _wall_rows(house, 3.0)
+    gable = rows[rows[:, 0] >= house.eave_y - 1e-9]
+    assert len(gable) == 3 and np.all(gable[:, 1] - gable[:, 0] <= 1.0 + 1e-9)
+    assert gable[0, 0] == pytest.approx(house.eave_y) and gable[-1, 1] == pytest.approx(
+        house.ridge_y
+    )
