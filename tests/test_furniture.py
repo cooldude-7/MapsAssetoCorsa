@@ -389,7 +389,7 @@ def test_items_on_a_side_road_move_off_it():
     (p,) = [it for it in plan.items if it.ref == "mly:p"]
     # beyond the side road's shoulder (3.5 m) by the pole offset, on its own side
     assert p.position[0] == pytest.approx(SIDE_X + 3.5 + fu.POLE_EDGE_M, abs=0.3)
-    assert p.position[2] == pytest.approx(30.0, abs=0.01)
+    assert p.position[2] == pytest.approx(30.0, abs=0.3)
     (s,) = [it for it in plan.items if it.ref == "mly:s"]
     # west of the side road, plate edge 2 m past the pavement: on the right of the drivers
     # coming south from the route, facing them (north)

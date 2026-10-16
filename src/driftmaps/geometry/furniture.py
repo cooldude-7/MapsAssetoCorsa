@@ -1007,7 +1007,7 @@ def _on_surface(items: Sequence[StreetItem], surf: DrivableSurface) -> dict[str,
         return {"on_surface": 0, "near_surface": 0}
     xz = np.array([(it.position[0], it.position[2]) for it in its])
     d = surf.distance(xz)
-    near = int((d < CLEARANCE_M - 0.05).sum())  # 0.05: the distance queries' tolerance
+    near = int((d < CLEARANCE_M - 0.02).sum())  # 0.02: the distance queries' tolerance
     return {"on_surface": int((d <= 0.0).sum()), "near_surface": near}
 
 

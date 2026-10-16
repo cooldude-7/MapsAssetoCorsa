@@ -19,8 +19,9 @@ an item may stand on one if it fits.
   facing the drivers who have them on the driving side (`SIGN_SIDE` for chevrons and
   keep-right signs; on a one-way road: facing its traffic, either side).
 - **Poles, lights, signals, hydrants, sign posts and mailboxes** on the surface or closer than
-  `CLEARANCE_M` to it move to the outside edge of the nearest road (perpendicular to it, on
-  the item's side if there is room), at the kind's offset beyond that edge: sign plates
+  `CLEARANCE_M` to it move out past the nearest edge of the surface (within
+  `NEAREST_EDGE_MOVE_M`; a sign stays at its junction corner), else square off the nearest
+  road (on the item's side if there is room), at the kind's offset beyond the edge: sign plates
   `sign_gap_m` beyond the pavement edge, poles `pole_edge_m` beyond the shoulder, lights,
   signal poles and hydrants `LIGHT_EDGE_M`, mailboxes `MAILBOX_EDGE_M`. On an island and too
   close to its edge: into the island; an island too small, or no room within `MAX_MOVE_M`:
@@ -80,6 +81,9 @@ MLY_FAR_M = 25.0
 POWER_LINE_M = 5.0  # a pole this close to an OSM power line stands on it
 # An item that would have to move farther than this has no sensible place: dropped.
 MAX_MOVE_M = 20.0
+# Moved past the nearest edge of the surface when that is at most this far (else squared off
+# its road, which also finds the way out of a wide junction or across a roundabout's apron).
+NEAREST_EDGE_MOVE_M = 8.0
 # Into an island: at most this far (else the island is too small or the item not on it).
 ISLAND_MOVE_M = 4.0
 # The search for a road's outside edge: from its centreline, in steps, this far out.
@@ -96,7 +100,7 @@ REFACE_SLACK_M = 8.0
 # drivers' right and a right-pointing one on their left (both ways of travel share the post);
 # a keep-right sign stands on a median or island, which the centreline may run through.
 SIGN_SIDE = {SIGN_CHEVRON_LEFT: "right", SIGN_CHEVRON_RIGHT: "left", SIGN_KEEP_RIGHT: "keep"}
-EDGE_SPACING_M = 0.5  # boundary points for the distance queries (error < 0.07 m at 0.5 m)
+EDGE_SPACING_M = 0.2  # boundary points for the distance queries (error < 0.01 m at 0.5 m)
 ROAD_SPACING_M = 1.0  # centreline points for the nearest-road queries
 
 _MOVABLE = (POLE_UTILITY, LIGHT_STREET, SIGNAL_TRAFFIC, HYDRANT, MAILBOX)
@@ -128,6 +132,7 @@ def _edge_tree(geom: shapely.Geometry) -> cKDTree | None:
 class _Road:
     xz: np.ndarray  # (K, 2) centreline
     oneway: np.ndarray  # (K,) +1 traffic along the polyline, -1 against, 0 both ways
+    signed: bool = True  # signs may face its traffic (not a driveway's)
 
 
 class DrivableSurface:
@@ -152,7 +157,7 @@ class DrivableSurface:
         self._drv_tree = _edge_tree(self.drivable)
         self._pav_tree = _edge_tree(self.pavement)
         self.right = driving_side != "left"
-        pts, tan, ow, rid = [], [], [], []
+        pts, tan, ow, rid, signed = [], [], [], [], []
         for n, r in enumerate(roads):
             xz = np.asarray(r.xz, float)
             if len(xz) < 2:
@@ -167,11 +172,17 @@ class DrivableSurface:
             tan.append(t)
             ow.append(np.asarray(r.oneway, np.int64)[k])
             rid.append(np.full(len(dense), n))
+            signed.append(np.full(len(dense), r.signed))
         self.road_pts = np.concatenate(pts) if pts else np.zeros((0, 2))
         self.road_tan = np.concatenate(tan) if tan else np.zeros((0, 2))
         self.road_oneway = np.concatenate(ow) if ow else np.zeros(0, np.int64)
         self.road_id = np.concatenate(rid) if rid else np.zeros(0, np.int64)  # 0: the route
+        self.road_signed = np.concatenate(signed) if signed else np.zeros(0, bool)
         self._road_tree = cKDTree(self.road_pts) if len(self.road_pts) else None
+        self._signed_ids = np.flatnonzero(self.road_signed)
+        self._signed_tree = (
+            cKDTree(self.road_pts[self._signed_ids]) if len(self._signed_ids) else None
+        )
 
     # -- construction -----------------------------------------------------------------------
 
@@ -226,7 +237,8 @@ class DrivableSurface:
             dw_polys = []
             for d in getattr(net, "driveways", ()) or ():
                 dw_polys.append(d.polygon)
-                roads.append(_Road(np.asarray(d.path, float), np.zeros(len(d.path), np.int64)))
+                path = np.asarray(d.path, float)
+                roads.append(_Road(path, np.zeros(len(path), np.int64), signed=False))
             drivable += [net.footprint, apron_all, *dw_polys]
             pav = net.paved.difference(island_full) if not island_full.is_empty else net.paved
             pavement.append(pav)
@@ -260,6 +272,12 @@ class DrivableSurface:
         d[shapely.contains_xy(self.pavement, p[:, 0], p[:, 1])] = 0.0
         return d
 
+    def nearest_edge(self, xz: np.ndarray) -> np.ndarray | None:
+        """The nearest point of the drivable surface's outline (None: no surface)."""
+        if self._drv_tree is None:
+            return None
+        return self._drv_tree.data[self._drv_tree.query(np.asarray(xz, float).reshape(2))[1]]
+
     def island_at(self, xz: np.ndarray) -> int:
         """Index of the island holding the point, -1 if none."""
         p = shapely.Point(np.asarray(xz, float).reshape(2))
@@ -270,19 +288,22 @@ class DrivableSurface:
                 return k
         return -1
 
-    def roads_near(self, xz: np.ndarray, slack: float = 0.0, k: int = 64) -> list[int]:
-        """Indices of road points: the nearest, then (with `slack`) the nearest point of each
-        other road direction within `slack` m more."""
-        if self._road_tree is None:
+    def roads_near(self, xz: np.ndarray, slack: float = 0.0, signed: bool = False) -> list[int]:
+        """Indices of road points: the nearest first, then (with `slack`) every point within
+        `slack` m more, nearest first. `signed`: only roads whose traffic signs may face."""
+        tree, ids = (self._signed_tree, self._signed_ids) if signed else (self._road_tree, None)
+        if tree is None:
             return []
-        k = min(k, len(self.road_pts))
-        d, idx = self._road_tree.query(np.asarray(xz, float).reshape(2), k=k)
-        d, idx = np.atleast_1d(d), np.atleast_1d(idx)
-        ok = np.isfinite(d)
-        d, idx = d[ok], idx[ok]
-        if not len(idx):
+        p = np.asarray(xz, float).reshape(2)
+        d0, i0 = tree.query(p)
+        if not np.isfinite(d0):
             return []
-        return [int(i) for i, dd in zip(idx, d, strict=True) if dd <= d[0] + slack]
+        near = [int(i0)]
+        if slack > 0.0:
+            ball = np.asarray(tree.query_ball_point(p, d0 + slack), np.int64)
+            order = np.argsort(np.linalg.norm(tree.data[ball] - p, axis=1), kind="stable")
+            near = ball[order].tolist()
+        return near if ids is None else [int(ids[i]) for i in near]
 
 
 # --------------------------------------------------------------------------------------------
@@ -305,7 +326,7 @@ def _left(t: np.ndarray) -> np.ndarray:
 
 def _facing(surface: DrivableSurface, xz: np.ndarray, facing: np.ndarray, kind: str) -> np.ndarray:
     """A sign's facing towards the traffic of its road (see the module notes, `SIGN_SIDE`)."""
-    cand = surface.roads_near(xz, REFACE_SLACK_M)
+    cand = surface.roads_near(xz, REFACE_SLACK_M, signed=True)
     if not cand:
         return facing
     f = facing / max(float(np.linalg.norm(facing)), 1e-9)
@@ -380,6 +401,15 @@ class _Placer:
             if float(np.linalg.norm(q - xz)) > ISLAND_MOVE_M or not self.fits(it.kind, q):
                 return None, "island"
             return q, "moved"
+        # The nearest way out: past the nearest edge (keeps a sign at its junction corner).
+        edge = self.s.nearest_edge(xz)
+        if edge is not None:
+            u = edge - xz if self.s.inside(xz)[0] else xz - edge
+            if float(np.linalg.norm(u)) > 1e-3:
+                q = self._scan(it.kind, xz, u / np.linalg.norm(u))
+                if q is not None and float(np.linalg.norm(q - xz)) <= NEAREST_EDGE_MOVE_M:
+                    return q, "moved"
+        # Else square off the nearest road: the item's side first, else the other.
         cand = self.s.roads_near(xz)
         if not cand:
             return None, "no_road"
