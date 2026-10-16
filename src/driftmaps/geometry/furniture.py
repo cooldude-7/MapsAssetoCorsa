@@ -14,7 +14,11 @@ and the road markings tied to them (stop bars, crosswalks, arrows).
    measured pole line across unphotographed gaps. The junction control of the route's own
    approaches (`street_items.approach_stops`) is always applied: a stop sign where the route
    stops is never left out because a photo missed it, and the stop bar comes with it.
+   Street lights along urban stretches (rural chevrons and urban lights: notes below).
 4. Items other builders made (`items`, e.g. side-road stop signs, roundabout signs, mailboxes).
+5. Signals (`geometry.signals`, after the pole lines): every approach of each signalised route
+   junction gets its far-side corner pole, mast arm, heads per lane and pedestrian signals;
+   stop and yield signs on signalised approaches, or by any OSM signal node, are dropped.
 
 `dedupe` merges items of the same kind within `dedupe_m` on the same side of the road, keeping
 the best source (`PRIORITY`). `geometry.clearance` keeps every item off the drivable surface
