@@ -41,6 +41,17 @@ once before the pole lines and once after them (their gap-filling poles; wires f
 - Hydro poles: Ontario wood distribution poles, 11 m above ground, 2.4 m crossarm 0.3 m below
   the top, three pin insulators; spans 30-70 m (gaps filled at the run's median span);
   wires sag 2 % of the span.
+- Street lights (`_Planner.street_lights`), on urban stretches only (`lit=yes`, a sidewalk tag,
+  or in a town; never `lit=no`): Ontario cobra heads on 8.2 m galvanized poles 1 m behind the
+  road's edge, every 40 m on arterials (primary / secondary), 45 m on collectors (tertiary)
+  and 50 m on local streets (TAC Guide for the Design of Roadway Lighting, 2006: spacing
+  about 3.5-5 mounting heights for the usual staggered / one-sided layouts; ASSUMED within
+  that range, typical of Halton municipal standards). One side on roads narrower than 14 m
+  (the side with the hydro poles, whose poles then carry the lights, else the right), both
+  sides opposite on wider ones. None within 10 m of a junction's crossing road (corners: the
+  signal poles carry their own luminaires) or on a driveway (moved up to 6 m along the road,
+  else left out); a photographed or OSM light on that side within 0.6 spacings takes the
+  place of a rule-made one.
 
 **Meshes** (`furniture_meshes`): low-poly, merged per `cell_m` cell into at most four nodes:
 `furn_<cell>` (posts, poles, backs, lights; atlas, `lod_out_far_m`), `signs_<cell>` (sign faces,
@@ -120,6 +131,13 @@ PRIORITY = ("municipal", "mapillary", "osm", "rule")
 _URBAN_HIGHWAYS = frozenset({"residential", "living_street", "service", "pedestrian"})
 _SIDEWALK_KEYS = ("sidewalk", "sidewalk:both", "sidewalk:left", "sidewalk:right")
 _SIDEWALK_YES = frozenset({"both", "left", "right", "yes", "separate"})
+# Street lights (module notes): spacing by road class, both sides from this half width.
+_LIGHT_SPACING_M = {"motorway": 40.0, "trunk": 40.0, "primary": 40.0, "secondary": 40.0,
+                    "tertiary": 45.0}  # fmt: skip
+_LIGHT_SPACING_LOCAL_M = 50.0
+LIGHT_BOTH_SIDES_HALF_M = 7.0
+LIGHT_BEHIND_EDGE_M = 1.0
+LIGHT_CORNER_M = 10.0
 # A pole with no reliable position across the road stands this far beyond the gravel shoulder
 # (ASSUMED: rural Ontario pole lines run near the right-of-way limit, ~8 m from the centre of
 # a 7 m road with 1 m shoulders).
@@ -452,6 +470,78 @@ class _Planner:
         if any(tags.get(k) in _SIDEWALK_YES for k in _SIDEWALK_KEYS):
             return False
         return not (self.town_at is not None and self.town_at(self.frame.point(s, 0.0)))
+
+    def urban_at(self, s: float) -> bool:
+        """A lit (urban) stretch at station s (module notes, "Street lights")."""
+        tags = self._tags_at(s)
+        lit = str(tags.get("lit", ""))
+        if lit == "no":
+            return False
+        if lit == "yes" or any(tags.get(k) in _SIDEWALK_YES for k in _SIDEWALK_KEYS):
+            return True
+        return self.town_at is not None and bool(self.town_at(self.frame.point(s, 0.0)))
+
+    # -- street lights ----------------------------------------------------------------------------
+
+    def street_lights(self, juncs: list[_Junction], surface: DrivableSurface | None) -> None:
+        """Rule-made street lights along the urban stretches (module notes)."""
+        f = self.frame
+        meas: dict[int, list[float]] = {-1: [], 1: []}
+        poles: dict[int, list[float]] = {-1: [], 1: []}
+        its = [it for it in self.items if it.kind in (LIGHT_STREET, POLE_UTILITY)]
+        if its:
+            st, off, inside = f.project(np.array([(it.position[0], it.position[2]) for it in its]))
+            for it, s_, o_, ins in zip(its, st, off, inside, strict=True):
+                if ins and abs(o_) <= 25.0:
+                    (meas if it.kind == LIGHT_STREET else poles)[1 if o_ > 0 else -1].append(
+                        float(s_)
+                    )
+        meas = {k: np.sort(v) for k, v in meas.items()}
+        poles = {k: np.sort(v) for k, v in poles.items()}
+        corners = [(j.s, max([_road_half(self.route.ways.get(w)) for w, _ in j.legs], default=3.5))
+                   for j in juncs]  # fmt: skip
+        last = {-1: -1e9, 1: -1e9}
+        s = f.s0
+        while s <= f.s1:
+            if not self.urban_at(s) or any(abs(s - js) < h + LIGHT_CORNER_M for js, h in corners):
+                s += 5.0
+                continue
+            hw = (self._tags_at(s).get("highway") or "").removesuffix("_link")
+            spacing = _LIGHT_SPACING_M.get(hw, _LIGHT_SPACING_LOCAL_M)
+            if f.half(s) >= LIGHT_BOTH_SIDES_HALF_M:
+                sides = (-1, 1)
+            else:
+                near = {k: int(np.sum(np.abs(v - s) < 100.0)) for k, v in poles.items()}
+                sides = (1,) if near[1] > near[-1] else (-1,)
+            for side in sides:
+                if s - last[side] < spacing:
+                    continue
+                m_ = meas[side]
+                if len(m_) and float(np.min(np.abs(m_ - s))) < 0.6 * spacing:
+                    last[side] = s  # a measured light stands here
+                    continue
+                at = s
+                p_ = poles[side]
+                if len(p_) and float(np.min(np.abs(p_ - s))) < 0.4 * spacing:
+                    at = float(p_[np.argmin(np.abs(p_ - s))])  # hung on the hydro pole
+                p = self._light_spot(at, side, surface)
+                if p is None:
+                    continue
+                facing = -side * f.at(at)[2]
+                self.items.append(_item(LIGHT_STREET, p, facing, self.ground, "rule"))
+                last[side] = at
+            s += 5.0
+
+    def _light_spot(self, s: float, side: int, surface: DrivableSurface | None):
+        """Where a light stands at station s (shifted up to 6 m off a driveway), or None."""
+        for ds in (0.0, 3.0, -3.0, 6.0, -6.0):
+            q = s + ds
+            if not self.frame.s0 <= q <= self.frame.s1:
+                continue
+            p = self.frame.point(q, side * (self.frame.edge(q) + LIGHT_BEHIND_EDGE_M))
+            if surface is None or float(surface.distance(p[None, :])[0]) >= 0.9:
+                return p
+        return None
 
     # -- measured items -----------------------------------------------------------------------
 
@@ -1032,6 +1122,7 @@ def plan_furniture(
 
     pl.items = dedupe(pl.items, o.dedupe_m, pole_radius_m=o.pole_dedupe_m, sides=sides(pl.items))
     pl.pole_lines()
+    pl.street_lights(juncs, surf)
     pl.items = dedupe(pl.items, o.dedupe_m, pole_radius_m=o.pole_dedupe_m, sides=sides(pl.items))
     _signals(pl, juncs, osm, list(mapillary))
     stats += clear(first=False)  # what the pole lines put on a side road or junction
