@@ -70,6 +70,7 @@ from driftmaps.geometry.street_items import (
     MAILBOX,
     SIGN_STOP,
     SIGN_YIELD,
+    SIGNAL_TRAFFIC,
     StreetItem,
     approach_stops,
     highway_rank,
@@ -263,6 +264,9 @@ class NetworkOptions:
     min_piece_m: float = 6.0  # side road pieces shorter than this are dropped
     turning_circles: bool = True
     stop_bars: bool = True
+    # Stop bars on the route's own approaches: off when the furniture layer paints the
+    # route's markings (`furniture.marking_meshes`), so they are never painted twice.
+    route_stop_bars: bool = True
 
 
 # --------------------------------------------------------------------------------------------
@@ -702,6 +706,7 @@ class SideRoad:
     end: tuple[str, int]
     start_node: int
     end_node: int
+    urban: np.ndarray | None = None  # (N,) curbed urban section (`geometry.streetscape`)
 
     @property
     def highway(self) -> str:
@@ -1044,6 +1049,10 @@ def build_network(
     driving_side: str = "right",
     options: NetworkOptions | None = None,
     nodes_known: bool = True,
+    route_way_id: np.ndarray | None = None,
+    route_way_tags: Mapping[int, Mapping[str, str]] | None = None,
+    urban: object | None = None,
+    route_urban: np.ndarray | None = None,
 ) -> RoadNetwork:
     """Build the network around the route `model` (see the module docstring).
 
@@ -1052,7 +1061,10 @@ def build_network(
     (including the real run-up and run-off); `route_highway` / `route_oneway`: the route's
     highway class and one-way flag (+1 legal, -1 against, 0 two-way) per station; `dtm(xz)`:
     bare-earth heights in AC Y. Returns the network with the route model (heights moved onto
-    roundabout planes) and what it replaces on the route ribbon."""
+    roundabout planes) and what it replaces on the route ribbon. `route_way_id` (N,) and
+    `route_way_tags` (way id -> tags) let a divided road's two carriageways be paired
+    (`geometry.divided`), so the median between them is built. `urban`
+    (`geometry.streetscape.UrbanContext`) tells urban side roads from rural ones."""
     from driftmaps.geometry import roundabouts as rbm
 
     options = options or NetworkOptions()
@@ -1104,7 +1116,13 @@ def build_network(
             if i1 - i0 < 1:
                 continue
             piece = st[i0 : i1 + 1]
-            if np.linalg.norm(np.diff(piece, axis=0), axis=1).sum() < options.min_piece_m:
+            whole = i0 == 0 and i1 == len(st) - 1
+            connector = whole and all(  # e.g. a crossing road between two carriageways
+                n in graph.route_nodes or n in graph.ring_nodes or len(graph.nbrs[n]) >= 3
+                for n in (chain_nodes[0], chain_nodes[-1])
+            )
+            length = np.linalg.norm(np.diff(piece, axis=0), axis=1).sum()
+            if length < (1.0 if connector else options.min_piece_m):
                 continue
             raw.append(
                 dict(
@@ -1228,6 +1246,8 @@ def build_network(
             start_node=r["start_node"],
             end_node=r["end_node"],
         )
+        if urban is not None:
+            sr.urban = urban.urban(xz, [tags] * len(xz), m0.half_width, m0.s)
         built[i] = sr.index
         sides.append(sr)
         owners.append(CentreLine(xz, y, m0.half_width, f"side{sr.index}"))
@@ -1366,8 +1386,16 @@ def build_network(
         for rb in rbs
     ]
 
+    # ---- Divided roads: the median between two carriageways ---------------------------------
+    medians = _medians(
+        model, hidden_seg, route_oneway, route_way_id, route_way_tags, sides, asphalt_q,
+        _union([*carriage, *(j.fillets for j in junctions), *(p.pavement for p in rb_parts)]),
+    )  # fmt: skip
+    raised = [(p, k) for p, k in medians if k != "grass"]
+
     # ---- What replaces the route's shoulders and lines ------------------------------------
     islands = [isl for p in rb_parts for isl, _ in p.islands] + loop_islands
+    islands += [p for p, _ in raised]
     islands_all = _union(islands)
     paved_raw = _union(
         [*carriage, *(j.fillets for j in junctions), *(p.pavement for p in rb_parts)]
@@ -1481,6 +1509,11 @@ def build_network(
         for key, mesh in rbm.island_meshes(isl, height, options.cell_m):
             batch.add(key, mesh)
             meshes.append(mesh)
+    for isl, kind in raised:  # curbed medians: drivable over the curb, no hidden walls
+        top = "island_concrete" if kind == "raised_concrete" else "island_grass"
+        for key, mesh in rbm.island_meshes(isl, height, options.cell_m, top=top):
+            batch.add(key, mesh)
+            meshes.append(mesh)
 
     # ---- Junction control, stop bars, lines -------------------------------------------------
     controls = [
@@ -1490,10 +1523,18 @@ def build_network(
     stop_paint: list[shapely.Geometry] = []
     side_cut: dict[tuple[int, str], float] = {}  # centre line ends at the stop bar
     centre_off: list[tuple[float, float]] = []
+    connectors = _connectors(sides, route_oneway, model)
     for j in junctions:
         legs = _legs(j, sides, carriage, model, route_highway, route_oneway, asphalt_q, hidden_seg)
         if len(legs) < 2:
             continue
+        if j.route_s is not None and route_urban is not None:
+            j_urban = bool(route_urban[model.index_at(j.route_s)])
+        else:
+            j_urban = any(
+                sides[k].urban is not None and bool(np.mean(sides[k].urban) > 0.5)
+                for k, _ in j.legs
+            )
         _control(
             j,
             legs,
@@ -1508,6 +1549,8 @@ def build_network(
             centre_off,
             driving_side,
             options,
+            j_urban,
+            connectors,
         )
     others_for_lines = _union(
         [
@@ -1541,7 +1584,8 @@ def build_network(
             if key != "paint_white":
                 add(key, g, lift=PAINT_LIFT_M + 0.004, tile=1.0)
     for sr, poly in zip(sides, carriage, strict=True):
-        _side_lines(sr, poly, carriage, others_for_lines, side_cut, height, batch)
+        _side_lines(sr, poly, carriage, others_for_lines, side_cut, height, batch,
+                    driving_side == "right")  # fmt: skip
 
     # ---- Terrain and walls -----------------------------------------------------------------
     foot = _union([net.paved, shoulder_all])
@@ -1578,9 +1622,64 @@ def build_network(
         "items": len(items),
         "stop_bars": sum(1 for it in items if it.kind == SIGN_STOP),
         "turning_circles": sum(1 for sr in sides if sr.end[0] == "end" and sr.end[1] in turning),
+        "medians": len(medians),
+        "medians_raised_m2": round(sum(p.area for p, _ in raised), 1),
         "verge_m": options.verge_m,
     }
     return net
+
+
+def _medians(
+    model: RoadModel,
+    hidden: np.ndarray,
+    route_oneway: np.ndarray,
+    route_way_id: np.ndarray | None,
+    route_way_tags: Mapping[int, Mapping[str, str]] | None,
+    sides: Sequence[SideRoad],
+    asphalt_q: np.ndarray,
+    paved: shapely.Geometry,
+) -> list[tuple[shapely.Polygon, str]]:
+    """(median polygon, `divided.median_kind`) between every pair of carriageways of a divided
+    road: the route's one-way stretches and the one-way side roads (`geometry.divided`)."""
+    from driftmaps.geometry import divided
+
+    cws: list[divided.Carriageway] = []
+    n = len(model)
+    if route_way_id is not None and route_way_tags is not None and len(route_way_id) == n:
+        shown = np.concatenate([~hidden, [False]]) & np.concatenate([[False], ~hidden])
+        shown[0] = shown[-1] = False
+        ow = np.asarray(route_oneway)
+        key = [divided.carriageway_key(route_way_tags.get(int(w), {})) for w in route_way_id]
+        cut = np.ones(n, bool)
+        cut[1:] = [key[i] != key[i - 1] or ow[i] != ow[i - 1] for i in range(1, n)]
+        run_id = np.cumsum(cut)
+        for a, b in _runs((ow != 0) & shown):
+            for r in np.unique(run_id[a : b + 1]):
+                idx = np.arange(a, b + 1)[run_id[a : b + 1] == r]
+                if len(idx) < 3 or not key[idx[0]]:
+                    continue
+                cw = divided.carriageway(
+                    model.centre[idx][:, [0, 2]], model.half_width[idx], int(ow[idx[0]]),
+                    route_way_tags.get(int(route_way_id[idx[0]]), {}), "route",
+                )  # fmt: skip
+                if cw is not None:
+                    cws.append(cw)
+    for sr in sides:
+        cw = divided.carriageway(sr.xz, sr.model.half_width, sr.oneway, sr.tags, f"side{sr.index}")
+        if cw is not None:
+            cws.append(cw)
+    strips = divided.median_polygons(cws)
+    if not strips:
+        return []
+    route_asphalt = _union(list(asphalt_q[~hidden]))
+    taken = _union([paved, route_asphalt]).buffer(0.02)
+    out = []
+    for p in _polygons(_union(strips).difference(taken), divided.MIN_MEDIAN_AREA_M2):
+        p = p.buffer(-0.05).buffer(0.05)  # no hair-thin spikes where edges nearly touch
+        for q in _polygons(p, divided.MIN_MEDIAN_AREA_M2):
+            if divided.median_width(q) >= 0.6:
+                out.append((q, divided.median_kind(q)))
+    return out
 
 
 def _seg_mask(idx: np.ndarray, n: int) -> np.ndarray:
@@ -1746,8 +1845,13 @@ def _control(
     centre_off: list[tuple[float, float]],
     driving_side: str,
     options: NetworkOptions,
+    urban: bool = False,
+    connectors: frozenset[int] = frozenset(),
 ) -> None:
-    """Junction control for every approach (`approach_stops`): stop bars and stop signs."""
+    """Junction control for every approach (`approach_stops`): stop bars and stop signs; at
+    signals (`urban` town junctions of arterials, or mapped) a crosswalk across every side
+    leg, the stop line behind it and a signal item. `connectors`: side roads inside a
+    divided road's junction (between its two carriageways), which get no control."""
     right = driving_side == "right"
     mapped: dict[int, str] = {}
     for c in controls:
@@ -1776,16 +1880,32 @@ def _control(
     }
     partner = {} if through is None else {through[0]: through[1], through[1]: through[0]}
     hw_route = float(model.half_width[model.index_at(j.route_s)]) if j.route_s is not None else 0.0
+    signal_extra = CROSSWALK_EDGE_M + CROSSWALK_LEN_M + STOP_LINE_SETBACK_M
     for k, leg in enumerate(legs):
         # A leg never gives way to the rest of its own road (its through partner), so a class
         # change at the junction (primary to secondary) puts no stop on the road itself.
         others = [lg.highway for n, lg in enumerate(legs) if n != k and n != partner.get(k)]
-        ctrl = approach_stops(leg.highway, others, mapped=mapped.get(k))
+        ctrl = approach_stops(
+            leg.highway, others, mapped=mapped.get(k), urban=urban, crossing=others
+        )
         if k not in mapped and highway_rank(leg.highway) <= highway_rank("service"):
             ctrl = None  # private and commercial entrances get no rule-made signs
+        if leg.kind == "side" and leg.road in connectors:
+            ctrl = None  # inside a divided road's junction: the traffic stopped before it
         j.controls.append((leg.kind, leg.highway, ctrl))
-        if ctrl not in ("stop", "yield") or not leg.approach:
+        signal = ctrl == "signal"
+        if leg.kind == "side":
+            marks, cut = _side_crosswalk(
+                sides[leg.road], leg.end, legs, k, j, hw_route, route_kept, signal
+            )
+            if signal and options.stop_bars:
+                paint += marks
+            if cut is not None:  # lines end at the junction box (or before the crosswalk)
+                side_cut.setdefault((leg.road, leg.end), cut)
+        if ctrl not in ("stop", "yield", "signal") or not leg.approach:
             continue
+        if signal and leg.kind != "side":
+            continue  # the route's signals, crosswalks and stop lines: furniture
         # The road crossed: the other legs' carriageways (the route's legs as straight bands
         # from the node, as the route ribbon also turns into them).
         crossing = _union(
@@ -1809,7 +1929,7 @@ def _control(
                 if not right and sr.oneway == 0:
                     lane = (-hw, 0.0)
                 d = _clear_distance(m, m.s[0], 1.0, lane, crossing, min(40.0, sr.length - 1.0))
-                s_bar = m.s[0] + d + STOP_BAR_SETBACK_M
+                s_bar = m.s[0] + d + (signal_extra if signal else STOP_BAR_SETBACK_M)
                 if s_bar + STOP_BAR_WIDTH_M > m.s[-1]:
                     continue
                 side_cut[(leg.road, "start")] = s_bar
@@ -1820,7 +1940,7 @@ def _control(
                 if not right and sr.oneway == 0:
                     lane = (0.0, hw)
                 d = _clear_distance(m, m.s[-1], -1.0, lane, crossing, min(40.0, sr.length - 1.0))
-                s_bar = m.s[-1] - d - STOP_BAR_SETBACK_M
+                s_bar = m.s[-1] - d - (signal_extra if signal else STOP_BAR_SETBACK_M)
                 if s_bar - STOP_BAR_WIDTH_M < m.s[0]:
                     continue
                 side_cut[(leg.road, "end")] = s_bar
@@ -1857,7 +1977,7 @@ def _control(
                 continue
             lo, hi = lane
             lo, hi = (max(lo, 0.25), hi) if lo >= 0 else (lo, min(hi, -0.25))
-            if options.stop_bars:
+            if options.stop_bars and options.route_stop_bars:
                 paint.append(_lane_quad(m, s_bar, lo, hi, STOP_BAR_WIDTH_M))
             p, f, left = m.at(sign_s)
             ii = m.index_at(sign_s)
@@ -1865,7 +1985,7 @@ def _control(
             face = f * face_dir
             if not route_through:  # the route's centre line stops at its stop bars
                 centre_off.append((min(s_bar, j.route_s), max(s_bar, j.route_s)))
-        kind = SIGN_STOP if ctrl == "stop" else SIGN_YIELD
+        kind = {"stop": SIGN_STOP, "yield": SIGN_YIELD}.get(ctrl, SIGNAL_TRAFFIC)
         fxz = np.array([face[0], face[2]])
         fxz = fxz / max(np.linalg.norm(fxz), 1e-9)
         items.append(
@@ -1877,6 +1997,15 @@ def _control(
                 ref=f"junction:{j.node}",
             )
         )
+    if j.route_s is not None and any(c == "signal" for _, _, c in j.controls):
+        # A signalized junction: the route's centre and lane lines stop at its stop lines
+        # (furniture paints those, the crosswalks and the arrows on the route).
+        side_polys = _union([lg.poly for lg in legs if lg.kind == "side"])
+        i = model.index_at(j.route_s)
+        hw = float(model.half_width[i])
+        d_in = _clear_distance(model, j.route_s, -1.0, (-hw, hw), side_polys, 40.0)
+        d_out = _clear_distance(model, j.route_s, 1.0, (-hw, hw), side_polys, 40.0)
+        centre_off.append((j.route_s - d_in - signal_extra, j.route_s + d_out + signal_extra))
     if j.route_s is not None and not route_through and through is not None:
         # The route crosses or joins a bigger road: no centre line across its carriageway.
         cross = _union([legs[n].poly for n in through if legs[n].kind == "side"])
@@ -1888,6 +2017,98 @@ def _control(
             if inside.any():
                 k = np.flatnonzero(inside)
                 centre_off.append((float(model.s[lo + k[0]]), float(model.s[lo + k[-1]])))
+
+
+# Signalized junctions (docs/research/intersections.md; furniture.py uses the same values
+# on the route): the crosswalk starts this far beyond the crossing road's edge, is this long
+# (OTM Book 11: 2.5-4.0 m wide crosswalks; ASSUMED 3.0 m), and the stop line stands this far
+# behind it (OTM Book 11: at least 1.0 m).
+CROSSWALK_EDGE_M = 1.0
+CROSSWALK_LEN_M = 3.0
+STOP_LINE_SETBACK_M = 1.0
+ZEBRA_BAR_M, ZEBRA_GAP_M = 0.5, 0.6  # ladder blocks across the road (as furniture.py)
+CONNECTOR_MAX_M = 35.0  # a side road this short between two carriageways is a connector
+
+
+def _side_crosswalk(
+    sr: SideRoad,
+    end: str,
+    legs: Sequence[_Leg],
+    k: int,
+    j: Junction,
+    hw_route: float,
+    route_kept: shapely.Geometry,
+    signal: bool = True,
+) -> tuple[list[shapely.Geometry], float | None]:
+    """(zebra (ladder) blocks across a side road's leg of a signalized junction, just beyond
+    the crossed roads (`CROSSWALK_EDGE_M`), the station where the leg's lines end): without
+    `signal` only the station where the leg leaves the junction box."""
+    m = sr.model
+    crossing = _union(
+        [
+            lg.poly
+            if lg.kind == "side"
+            else shapely.LineString([j.xz, j.xz + lg.direction * 40.0]).buffer(
+                hw_route, cap_style="flat"
+            )
+            for n, lg in enumerate(legs)
+            if n != k
+        ]
+        + [route_kept]
+    )
+    hw = float(m.half_width[0 if end == "start" else -1])
+    reach = min(40.0, sr.length - 1.0)
+    if reach <= 0:
+        return [], None
+    sign = 1.0 if end == "start" else -1.0
+    s_end = m.s[0] if end == "start" else m.s[-1]
+    d = _clear_distance(m, s_end, sign, (-hw, hw), crossing, reach)
+    s_clear = s_end + sign * d
+    if not signal:
+        return [], s_clear
+    s_c = s_end + sign * (d + CROSSWALK_EDGE_M + CROSSWALK_LEN_M / 2)
+    if not m.s[0] + CROSSWALK_LEN_M / 2 <= s_c <= m.s[-1] - CROSSWALK_LEN_M / 2:
+        return [], s_clear
+    hw = float(np.interp(s_c, m.s, m.half_width))
+    width = 2 * hw
+    n = max(1, int((width + ZEBRA_GAP_M) // (ZEBRA_BAR_M + ZEBRA_GAP_M)))
+    used = n * ZEBRA_BAR_M + (n - 1) * ZEBRA_GAP_M
+    out = []
+    for b in range(n):
+        lo = -hw + (width - used) / 2 + b * (ZEBRA_BAR_M + ZEBRA_GAP_M)
+        out.append(_lane_quad(m, s_c, lo, lo + ZEBRA_BAR_M, CROSSWALK_LEN_M))
+    return out, s_c + sign * (CROSSWALK_LEN_M / 2 + 0.3)
+
+
+def _connectors(
+    sides: Sequence[SideRoad], route_oneway: np.ndarray, model: RoadModel
+) -> frozenset[int]:
+    """Side roads inside a divided road's junction: short (`CONNECTOR_MAX_M`), attached at
+    both ends, and every end node also holds a one-way carriageway (the route's or a side
+    road's)."""
+    oneway_nodes: set[int] = set()
+    for sr in sides:
+        if sr.oneway != 0:
+            for kind, node in (sr.start, sr.end):
+                if kind in ("route", "road"):
+                    oneway_nodes.add(node)
+    route_one = bool(np.any(route_oneway != 0))
+    out = set()
+    for sr in sides:
+        if sr.length > CONNECTOR_MAX_M:
+            continue
+        ends = (sr.start, sr.end)
+        if not all(kind in ("route", "road") for kind, _ in ends):
+            continue
+        ok = True
+        for kind, node in ends:
+            if kind == "route":
+                ok &= route_one or node in oneway_nodes
+            else:
+                ok &= node in oneway_nodes
+        if ok:
+            out.add(sr.index)
+    return frozenset(out)
 
 
 def _offset_line(xz: np.ndarray, off: float) -> np.ndarray:
@@ -1960,34 +2181,31 @@ def _side_lines(
     side_cut: Mapping[tuple[int, str], float],
     height: HeightField,
     batch: Batcher,
+    right_hand: bool = True,
 ) -> None:
-    """Centre and edge lines of one side road, left out where another road or a junction
-    takes over and before its stop bars."""
+    """Centre, lane and edge lines of one side road (`geometry.lanes`), left out where another
+    road or a junction takes over and before its stop bars."""
     m = sr.model
     if not sr.paved or len(m) < 2:
         return
+    from driftmaps.geometry import lanes as lanes_mod
+
+    n = len(m)
     hw = m.half_width
     cls = _base_class(sr.highway)
-    rural = sr.tags.get("sidewalk", "no") in ("no", "none", "")
-    lines: list[tuple[str, np.ndarray, float]] = []
-    if sr.oneway == 0 and m.centre_line[0]:
-        g = CENTRE_GAP_M / 2 + CENTRE_LINE_WIDTH_M / 2
-        lines += [
-            ("paint_yellow", np.full(len(m), g), CENTRE_LINE_WIDTH_M),
-            ("paint_yellow", np.full(len(m), -g), CENTRE_LINE_WIDTH_M),
-        ]
-    if cls in _EDGE_LINE_CLASSES and rural:
-        inset = hw - EDGE_LINE_INSET_M
-        if sr.oneway == 0:
-            lines += [
-                ("paint_white", inset, EDGE_LINE_WIDTH_M),
-                ("paint_white", -inset, EDGE_LINE_WIDTH_M),
-            ]
-        else:  # one-way: yellow on the drivers' left, white on their right
-            left_key = "paint_yellow" if sr.oneway > 0 else "paint_white"
-            right_key = "paint_white" if sr.oneway > 0 else "paint_yellow"
-            lines += [(left_key, inset, EDGE_LINE_WIDTH_M), (right_key, -inset, EDGE_LINE_WIDTH_M)]
-    if not lines:
+    wl = lanes_mod.way_lanes(sr.tags)
+    if sr.oneway < 0:  # traffic runs against s: its lanes are the "backward" ones
+        wl = lanes_mod.WayLanes(0, wl.forward, (), wl.turn_forward, 0, wl.tagged)
+    layout = lanes_mod.road_lanes(hw, [wl] * n, right_hand=right_hand)
+    urban = sr.urban if sr.urban is not None else np.zeros(n, bool)
+    plines = lanes_mod.paint_lines(
+        m.s, layout, urban=urban, highway=[sr.highway] * n,
+        centre_ok=np.full(n, bool(m.centre_line[0])),
+        edge_ok=np.full(n, cls in _EDGE_LINE_CLASSES and not _sidewalk_tagged(sr.tags)),
+        oneway=np.full(n, sr.oneway), centre_width=CENTRE_LINE_WIDTH_M,
+        centre_gap=CENTRE_GAP_M, edge_width=EDGE_LINE_WIDTH_M, edge_inset=EDGE_LINE_INSET_M,
+    )  # fmt: skip
+    if not plines:
         return
     other_roads = _union([c for k, c in enumerate(carriage) if k != sr.index])
     block = _union([others, other_roads.buffer(0.3)])
@@ -1996,18 +2214,25 @@ def _side_lines(
     seg_ok = np.ones(len(m) - 1, bool)
     a, b = side_cut.get((sr.index, "start")), side_cut.get((sr.index, "end"))
     mid = 0.5 * (s[:-1] + s[1:])
-    for key, off, width in lines:
+    for ln in plines:
+        off, width = ln.offset, ln.width
         le = road_columns(m, off + width / 2)[:, [0, 2]]
         ri = road_columns(m, off - width / 2)[:, [0, 2]]
         c = 0.5 * (le + ri)
         ok = ~shapely.contains_xy(block, c[:, 0], c[:, 1])
-        keep = seg_ok & ok[:-1] & ok[1:]
-        if key == "paint_yellow" and abs(float(np.mean(off))) < 0.5:  # centre lines
+        keep = seg_ok & ok[:-1] & ok[1:] & ln.keep
+        if ln.role != "edge":  # centre and lane lines stop at the stop bars
             if a is not None:
                 keep &= mid > a
             if b is not None:
                 keep &= mid < b
-        batch.add(key, strip_mesh(le, ri, keep, height))
+        batch.add(f"paint_{ln.colour}", strip_mesh(le, ri, keep, height))
+
+
+def _sidewalk_tagged(tags: Mapping[str, str]) -> bool:
+    from driftmaps.geometry.streetscape import sidewalk_sides
+
+    return any(sidewalk_sides(tags))
 
 
 # --------------------------------------------------------------------------------------------

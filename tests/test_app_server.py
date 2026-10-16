@@ -464,6 +464,7 @@ def test_build_installs_and_lists(env, forks_route):
         "trees": 1234,
         "buildings": 56,
         "loop": False,
+        "warnings": [],
     }
     assert "Planting trees" in job["log"] and any("KN5" in line for line in job["log"])
     assert (env.tracks / tid / MARKER_FILE).is_file()

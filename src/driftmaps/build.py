@@ -189,6 +189,7 @@ from driftmaps.geo.mapillary import (
 from driftmaps.geo.overpass import (
     OSM_ATTRIBUTION,
     NetworkData,
+    OsmNode,
     OverpassError,
     default_cache_dir,
     fetch_network,
@@ -231,6 +232,7 @@ from driftmaps.geometry.furniture import (
     plan_furniture,
     street_names,
 )
+from driftmaps.geometry.lanes import PaintLine, RoadLanes, paint_lines, road_lanes, way_lanes
 from driftmaps.geometry.network import (
     MATERIALS as NETWORK_MATERIALS,
 )
@@ -256,6 +258,7 @@ from driftmaps.geometry.road import (
 )
 from driftmaps.geometry.roundabouts import pavers_texture
 from driftmaps.geometry.street_items import POLE_UTILITY, StreetItem
+from driftmaps.geometry.streetscape import UrbanContext
 from driftmaps.geometry.terrain import (
     Terrain,
     TerrainExtra,
@@ -706,6 +709,11 @@ class TrackGeometry:
     osm_polyline: np.ndarray  # (M, 3) the OSM node polyline (Y = 0), A..B
     # (N,) OSM way id per station (its tags: route.ways), clamped at the run-up/run-off.
     way_id: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
+    # (N,) curbed urban section (`geometry.streetscape`); the lane layout (`geometry.lanes`)
+    # and the lines painted on the route (None: the default edge and centre lines).
+    urban: np.ndarray = field(default_factory=lambda: np.zeros(0, bool))
+    lane_layout: RoadLanes | None = None
+    paint: list[PaintLine] | None = None
 
     @property
     def length_m(self) -> float:
@@ -1491,6 +1499,45 @@ def _fetch_network(route: Route, options: BuildOptions) -> NetworkData | None:
     return None
 
 
+def _urban_context(geo: TrackGeometry, osm: NetworkData | None) -> UrbanContext:
+    """Urban or rural for the route and its side roads (`geometry.streetscape`)."""
+    streets = [(_xz(geo.projection, w.lonlat), w.tags) for w in (osm.ways if osm else ())]
+    return UrbanContext(streets)
+
+
+def _route_lanes(geo: TrackGeometry, ctx: UrbanContext) -> None:
+    """The route's urban flags, lane layout and painted lines (`geometry.lanes`; North
+    American roads only, elsewhere the default lines stay)."""
+    m, route = geo.model, geo.route
+    if len(geo.way_id) != len(m):
+        geo.urban = np.zeros(len(m), bool)
+        return
+    tags = [route.ways.get(int(w), {}) for w in geo.way_id.tolist()]
+    geo.urban = ctx.urban(m.centre[:, [0, 2]], tags, m.half_width, m.s)
+    if geo.region != "na":
+        return
+    dirs: dict[int, int] = {}
+    for e in route.edges:
+        dirs.setdefault(int(e.way), int(e.dir))
+    cache: dict[tuple[int, bool], object] = {}
+    ways = []
+    for w, t, ow in zip(geo.way_id.tolist(), tags, np.asarray(geo.oneway).tolist(), strict=True):
+        key = (int(w), ow < 0)
+        if key not in cache:
+            wl = way_lanes(t, dirs.get(int(w), 1) > 0)
+            if ow < 0:  # driving against a one-way: its lanes run towards us
+                wl = dataclasses.replace(wl, forward=0, backward=wl.forward, turn_forward=(),
+                                         turn_backward=wl.turn_forward)  # fmt: skip
+            cache[key] = wl
+        ways.append(cache[key])
+    geo.lane_layout = road_lanes(m.half_width, ways, right_hand=geo.driving_side == "right")
+    n = len(m)
+    geo.paint = paint_lines(
+        m.s, geo.lane_layout, urban=geo.urban, highway=[t.get("highway", "") for t in tags],
+        centre_ok=m.centre_line, edge_ok=np.ones(n, bool), oneway=np.asarray(geo.oneway),
+    )  # fmt: skip
+
+
 def _xz(projection: LocalProjection, lonlat: np.ndarray) -> np.ndarray:
     en = projection.to_xy(np.asarray(lonlat, np.float64).reshape(-1, 2))
     return np.stack([en[:, 0], -en[:, 1]], axis=1)
@@ -1501,6 +1548,7 @@ def _network(
     osm: NetworkData,
     ends: tuple[Continuation | None, Continuation | None],
     options: BuildOptions,
+    urban: UrbanContext | None = None,
 ) -> RoadNetwork:
     """Side roads, junctions and roundabouts around the route (`geometry.network`)."""
     proj = geo.projection
@@ -1540,6 +1588,7 @@ def _network(
         max_vertical_curvature=options.max_vertical_curvature,
         shoulder_m=options.shoulder_m,
         verge_m=options.verge_m,
+        route_stop_bars=not options.furniture,  # else furniture paints the route's markings
     )
     return build_network(
         geo.model,
@@ -1553,6 +1602,10 @@ def _network(
         driving_side=geo.driving_side,
         options=nopt,
         nodes_known=osm.nodes_known,
+        route_way_id=geo.way_id if len(geo.way_id) == len(geo.model) else None,
+        route_way_tags=route.ways,
+        urban=urban,
+        route_urban=geo.urban if len(geo.urban) == len(geo.model) else None,
     )
 
 
@@ -1563,6 +1616,7 @@ def _driveways(
     options: BuildOptions,
     sc: _Scenery,
     roads: RoadMeshes,
+    paint: list[PaintLine] | None = None,
 ) -> RoadMeshes:
     """OSM and inferred driveways (they need the placed buildings) with their mailboxes; the
     route meshes are rebuilt when driveway mouths cut its edge lines or shoulders."""
@@ -1573,7 +1627,7 @@ def _driveways(
     net.stats.update(res.stats)
     sc.pieces += res.pieces
     if res.masks_changed:
-        return build_road_meshes(m, chunk_m=options.chunk_m, keep=net.masks)
+        return build_road_meshes(m, chunk_m=options.chunk_m, keep=net.masks, lines=paint)
     return roads
 
 
@@ -1890,25 +1944,45 @@ def _short(e: Exception) -> str:
     return text[0][:160] if text else type(e).__name__
 
 
+_NOT_FETCHED = object()
+
+
+def _street_features(geo: TrackGeometry, options: BuildOptions) -> StreetFeatures | None:
+    """OSM signs, poles, lights and control nodes along the route (failing soft)."""
+    if options.street_features is not None:
+        return options.street_features
+    try:
+        return fetch_street_features(
+            _route_lonlat(geo), cache_dir=options.cache_dir, offline=options.offline
+        )
+    except _DATA_ERRORS as e:
+        warnings.warn(f"OSM signs and poles unavailable ({_short(e)})", stacklevel=2)
+        return None
+
+
+def _control_nodes(feats: StreetFeatures) -> tuple[OsmNode, ...]:
+    """The street features' junction control nodes as the network's tagged nodes."""
+    keep = ("stop", "give_way", "traffic_signals")
+    return tuple(
+        OsmNode(n.id, (n.lon, n.lat), dict(n.tags))
+        for n in feats.nodes
+        if n.tags.get("highway") in keep
+    )
+
+
 def _furniture(
     geo: TrackGeometry,
     ground: Callable[[np.ndarray], np.ndarray],
     options: BuildOptions,
     sc: _Scenery,
     street_items: Sequence[StreetItem],
+    feats: object = _NOT_FETCHED,
 ) -> None:
     """Street furniture (`geometry.furniture`): fetch OSM nodes and Mapillary detections
     (each failing soft), plan every item with the other stages' `street_items`, and build the
     meshes and the route's markings."""
     ll = _route_lonlat(geo)
-    if options.street_features is not None:
-        osm: StreetFeatures | None = options.street_features
-    else:
-        try:
-            osm = fetch_street_features(ll, cache_dir=options.cache_dir, offline=options.offline)
-        except _DATA_ERRORS as e:
-            warnings.warn(f"OSM signs and poles unavailable ({_short(e)})", stacklevel=2)
-            osm = None
+    osm = _street_features(geo, options) if feats is _NOT_FETCHED else feats
     sc.street_features = osm
     mly: list[MapFeature] = []
     coverage = options.mapillary_coverage
@@ -1937,7 +2011,7 @@ def _furniture(
     plan = plan_furniture(
         m, geo.projection, geo.route, ground, s_range=(geo.s_a, geo.s_b), way_id=geo.way_id,
         items=street_items, osm=osm, mapillary=mly, coverage=coverage, surface=surface,
-        options=options.furniture_options,
+        options=options.furniture_options, lanes=geo.lane_layout, urban=geo.urban,
     )  # fmt: skip
     sc.furniture = plan
     names = street_names(plan.items)
@@ -2346,15 +2420,26 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
                 route, osm_net.ways, run_up_length_m(options), options.run_off_m
             )
         geo = prepare_geometry(route, options, ends)
+        urban_ctx = _urban_context(geo, osm_net)
+        _route_lanes(geo, urban_ctx)
+        feats: StreetFeatures | None | object = _NOT_FETCHED
+        if osm_net is not None and options.network and not osm_net.nodes:
+            # The tile fallback knows no tagged nodes: take the junction controls from the
+            # street features (fetched once, for the furniture too), when they can be had.
+            feats = _street_features(geo, options)
+            if feats is not None:
+                osm_net = dataclasses.replace(osm_net, nodes=_control_nodes(feats))
         street_items: list[StreetItem] = []
         net: RoadNetwork | None = None
         if osm_net is not None and options.network:
             progress("Building side roads, junctions and roundabouts", 0.3)
-            net = _network(geo, osm_net, ends, options)
+            net = _network(geo, osm_net, ends, options, urban_ctx)
             geo.model = net.model  # heights moved onto roundabout planes
         m = geo.model
         progress("Building the road and terrain", 0.35)
-        roads = build_road_meshes(m, chunk_m=options.chunk_m, keep=net.masks if net else None)
+        roads = build_road_meshes(
+            m, chunk_m=options.chunk_m, keep=net.masks if net else None, lines=geo.paint
+        )
         terrain = build_terrain(
             m,
             roads.left_outer,
@@ -2400,11 +2485,11 @@ def build_track(route: Route, out_dir: Path, options: BuildOptions | None = None
             progress("Placing buildings", 0.55)
             _buildings(geo, ground, corridor, canopy, options, track_id, sc)
         if net is not None:  # driveways need the placed houses
-            roads = _driveways(net, m, ground, options, sc, roads)
+            roads = _driveways(net, m, ground, options, sc, roads, geo.paint)
             street_items += net.street_items(ground)
         if options.furniture:
             progress("Adding signs, poles and lights", 0.62)
-            _furniture(geo, ground, options, sc, street_items)
+            _furniture(geo, ground, options, sc, street_items, feats)
         if options.trees:
             progress("Planting trees", 0.7)
             _trees(geo, canopy, options, track_id, sc)

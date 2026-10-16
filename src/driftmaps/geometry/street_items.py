@@ -85,6 +85,8 @@ def approach_stops(
     *,
     mapped: str | None = None,
     roundabout: bool = False,
+    urban: bool = False,
+    crossing: list[str] | None = None,
 ) -> str | None:
     """Control for traffic arriving at a junction on one approach: "stop", "yield",
     "signal" or None (it has the right of way).
@@ -95,7 +97,11 @@ def approach_stops(
     Without data: an approach entering a roundabout yields; otherwise, as on Ontario roads
     (Highway Traffic Act s.136/138 practice, OTM Book 5), the approach of a lower class than
     the busiest other road at the junction stops, and equal classes get no inferred control
-    (all-way stops are only placed where the data says so).
+    (all-way stops are only placed where the data says so). In a town (`urban`), a junction
+    of two arterials, or of an arterial and a collector, is signalized: every approach gets
+    "signal" (`signalized`, ASSUMED: the volumes there meet the OTM Book 12 signal warrants;
+    docs/research/intersections.md). `crossing`: the roads this approach crosses or turns
+    into, without its own continuation (default `other_highways`).
     """
     if mapped:
         return "stop" if mapped == "all_way" else mapped
@@ -103,6 +109,23 @@ def approach_stops(
         return "yield"
     if not other_highways:
         return None
+    if urban and signalized(approach_highway, other_highways if crossing is None else crossing):
+        return "signal"
     if highway_rank(approach_highway) < max(highway_rank(h) for h in other_highways):
         return "stop"
     return None
+
+
+SIGNAL_MAJOR_RANK = HIGHWAY_RANK["secondary"]  # an arterial (Ontario: OSM primary / secondary)
+SIGNAL_MINOR_RANK = HIGHWAY_RANK["tertiary"]  # ... meeting at least a collector
+
+
+def signalized(approach_highway: str, crossing: list[str]) -> bool:
+    """Whether a town junction is signalized for an approach when no data says (ASSUMED rule,
+    see `approach_stops`): the approach and the busiest road it crosses are both at least
+    collectors, and one of them an arterial. Ramps (`_link`) never count."""
+    ranks = [highway_rank(h) for h in crossing if not h.endswith("_link")]
+    if approach_highway.endswith("_link") or not ranks:
+        return False
+    a, c = highway_rank(approach_highway), max(ranks)
+    return min(a, c) >= SIGNAL_MINOR_RANK and max(a, c) >= SIGNAL_MAJOR_RANK

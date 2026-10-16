@@ -617,17 +617,23 @@ class RoadMeshes:
     chunk_bounds: list[tuple[int, int]]
     left_outer: np.ndarray  # (N, 3) outer shoulder edge, fold-over fixed
     right_outer: np.ndarray
+    # The urban section per chunk (`geometry.streetscape`): "curb" (gutter, curb face and
+    # top), "boulevard" (grass), "sidewalk" (concrete), "apron" (driveway curb cuts).
+    urban: dict[str, list[MeshData | None]] = field(default_factory=dict)
 
     @property
     def vertex_counts(self) -> dict[str, int]:
         def total(items: list) -> int:
             return sum(m.vertex_count for m in items if m is not None)
 
-        return {
+        out = {
             "road": total(self.road),
             "gravel": total(self.gravel),
             "paint": total(self.paint_white) + total(self.paint_yellow),
         }
+        if self.urban:
+            out["urban"] = sum(total(v) for v in self.urban.values())
+        return out
 
 
 def chunk_ranges(s: np.ndarray, chunk_m: float) -> list[tuple[int, int]]:
@@ -715,13 +721,20 @@ def build_road_meshes(
     lateral_segments: int = 4,
     edge_lines: bool = True,
     keep: object | None = None,
+    lines: list | None = None,
+    section: object | None = None,
 ) -> RoadMeshes:
     """Asphalt, gravel shoulders and painted lines, chunked every ~`chunk_m` metres.
 
     `keep` (e.g. `geometry.network.RouteMasks`): per segment (N - 1,) boolean arrays
     `hidden` (no road, shoulders or lines: a roundabout replaces them), `shoulder_left`,
     `shoulder_right`, `edge_left`, `edge_right` and `centre` (True = draw), where junction
-    mouths and islands take the shoulder's and the lines' place."""
+    mouths and islands take the shoulder's and the lines' place. `lines`
+    (`geometry.lanes.PaintLine`s) replace the default lines (edge lines, centre line) with a
+    lane layout's; the masks still apply (edge lines by side, the others like the centre).
+    `section` (`geometry.streetscape.RouteSection`): where the road is urban, its gutter,
+    curb, boulevard and sidewalks replace the gravel shoulders (`keep.cut_left` /
+    `cut_right`, per segment: driveway curb cuts, the curb lowered and the boulevard paved)."""
     hw, outer = model.half_width, model.outer
     n_seg = len(model) - 1
     ones = np.ones(n_seg, bool)
@@ -739,6 +752,14 @@ def build_road_meshes(
     road_cols = [road_columns(model, f * hw) for f in fracs]
     left_outer = road_columns(model, outer)
     right_outer = road_columns(model, -outer)
+    urban_st = None
+    if section is not None and np.asarray(section.urban, bool).any():
+        urban_st = np.asarray(section.urban, bool)
+        useg = urban_st[:-1] & urban_st[1:]
+        keep_sl, keep_sr = keep_sl & ~useg, keep_sr & ~useg  # no gravel on the urban section
+        urb = _urban_columns(model, section, keep)
+        left_outer = np.where(urban_st[:, None], urb["left"][-1], left_outer)
+        right_outer = np.where(urban_st[:, None], urb["right"][-1], right_outer)
     road_u = [(hw - f * hw) / ROAD_U_TILE_M for f in fracs]
     gravel_u_l = [np.zeros(len(model)), model.shoulder / GRAVEL_TILE_M]
     gravel_u_r = gravel_u_l
@@ -760,7 +781,14 @@ def build_road_meshes(
 
     ranges = chunk_ranges(model.s, chunk_m)
     road, gravel, white, yellow = [], [], [], []
+    urban_out: dict[str, list[MeshData | None]] = {}
+    if urban_st is not None:
+        urban_out = {k: [] for k in ("curb", "boulevard", "sidewalk", "apron")}
     for i0, i1 in ranges:
+        if urban_st is not None:
+            for key, parts in _urban_strips(model, urb, i0, i1, mask("shoulder_left") & shown,
+                                            mask("shoulder_right") & shown).items():  # fmt: skip
+                urban_out[key].append(_merge(parts))
         rm = _strip(road_cols, model, i0, i1, road_u, ROAD_V_TILE_M, keep_quads=shown)
         gl = _strip([left_outer, road_cols[0]], model, i0, i1, gravel_u_l, GRAVEL_TILE_M,
                     keep_quads=keep_sl)  # fmt: skip
@@ -769,6 +797,18 @@ def build_road_meshes(
         road.append(rm)
         gravel.append(_merge([m for m in (gl, gr) if m is not None]))
         w_parts: list[MeshData] = []
+        if lines is not None:
+            y_parts: list[MeshData] = []
+            for ln in lines:
+                if ln.role == "edge":
+                    side = keep_el if float(np.mean(ln.offset)) > 0 else keep_er
+                else:
+                    side = keep_c
+                part = _lines(model, [ln.offset], ln.width, i0, i1, ln.keep & side)
+                (w_parts if ln.colour == "white" else y_parts).extend(part)
+            white.append(_merge(w_parts))
+            yellow.append(_merge(y_parts))
+            continue
         if edge_lines:
             w_parts += _lines(model, [edge_off], EDGE_LINE_WIDTH_M, i0, i1, keep_el)
             w_parts += _lines(model, [-edge_off], EDGE_LINE_WIDTH_M, i0, i1, keep_er)
@@ -790,7 +830,67 @@ def build_road_meshes(
                 m is not None and m.vertex_count > MAX_MESH_VERTICES
             ):
                 raise ValueError(f"{name} chunk is empty or too large; use a smaller chunk_m")
-    return RoadMeshes(road, gravel, white, yellow, ranges, left_outer, right_outer)
+    return RoadMeshes(road, gravel, white, yellow, ranges, left_outer, right_outer, urban_out)
+
+
+def _urban_columns(model: RoadModel, section, keep) -> dict:
+    """The urban section's column lines per side (asphalt edge outwards, lifted) and its
+    per-segment masks: urban, sidewalk, curb cut."""
+    from driftmaps.geometry.streetscape import DEPRESSED_CURB_M, section_offsets
+
+    n = len(model)
+    hw = model.half_width
+    urban = np.asarray(section.urban, bool)
+    useg = urban[:-1] & urban[1:]
+    offs, lifts = section_offsets(np.asarray(section.walk_w, np.float64))
+    out: dict = {"useg": useg}
+    for side, sign in (("left", 1.0), ("right", -1.0)):
+        cut_seg = getattr(keep, f"cut_{side}", None) if keep is not None else None
+        cut_seg = np.zeros(n - 1, bool) if cut_seg is None else np.asarray(cut_seg, bool)
+        cut_st = np.concatenate([cut_seg, [False]]) | np.concatenate([[False], cut_seg])
+        cols = []
+        for k, (o, lift) in enumerate(zip(offs, lifts, strict=True)):
+            lift = np.broadcast_to(np.asarray(lift, np.float64), (n,)).copy()
+            if k in (2, 3):  # the curb drops to a lip across a driveway
+                lift = np.where(cut_st, DEPRESSED_CURB_M, lift)
+            off = hw + np.broadcast_to(np.asarray(o, np.float64), (n,))
+            cols.append(road_columns(model, sign * off) + lift[:, None] * WORLD_UP)
+        out[side] = cols
+        out[f"u_{side}"] = [np.broadcast_to(np.asarray(o, np.float64), (n,)) for o in offs]
+        walk = np.asarray(getattr(section, f"walk_{side}"), bool)
+        out[f"walk_{side}"] = walk[:-1] & walk[1:]
+        out[f"cut_{side}"] = cut_seg
+    return out
+
+
+def _urban_strips(
+    model: RoadModel, urb: dict, i0: int, i1: int, keep_l: np.ndarray, keep_r: np.ndarray
+) -> dict[str, list[MeshData]]:
+    """The urban section's meshes for stations i0..i1, both sides."""
+    parts: dict[str, list[MeshData]] = {k: [] for k in ("curb", "boulevard", "sidewalk", "apron")}
+    for side, keep_side in (("left", keep_l), ("right", keep_r)):
+        cols, us = urb[side], urb[f"u_{side}"]
+        base = urb["useg"] & keep_side
+        walk, cut = urb[f"walk_{side}"], urb[f"cut_{side}"]
+        bands = [
+            (0, 3, "curb", base, 1.0),
+            (3, 4, "boulevard", base & ~cut, 2.0),
+            (3, 4, "apron", base & cut, 2.0),
+            (4, 5, "sidewalk", base & walk, 1.5),
+            (4, 5, "boulevard", base & ~walk, 2.0),
+            (5, 6, "boulevard", base, 2.0),
+        ]
+        for a, b, key, m, tile in bands:
+            if not m[i0:i1].any():
+                continue
+            for k in range(a, b):
+                pair = [cols[k + 1], cols[k]] if side == "left" else [cols[k], cols[k + 1]]
+                u = [us[k + 1] / tile, us[k] / tile] if side == "left" else [
+                    us[k] / tile, us[k + 1] / tile]  # fmt: skip
+                mesh = _strip(pair, model, i0, i1, u, tile, keep_quads=m)
+                if mesh is not None:
+                    parts[key].append(mesh)
+    return parts
 
 
 def split_all(items: list[MeshData | None]) -> list[list[MeshData]]:
