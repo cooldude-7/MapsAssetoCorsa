@@ -423,3 +423,32 @@ def test_turning_circle_bulb_and_stop_from_osm_nodes():
     # The bulb: a 12 m disc at the dead end is paved and drivable.
     assert net.paved.contains(shapely.Point(10.0, -80.0))
     assert net.corridor(4.0).contains(shapely.Point(0.0, -91.0))
+
+
+def test_cul_de_sac_reaching_into_the_radius_is_built_whole():
+    """A residential dead end 190 m from the route (radius 120 m): the street is built to its
+    end, with the rule-made bulb (OSM nodes unknown, as with the map-tile fallback)."""
+    model = _model(np.array([[-200.0, 0.0], [200.0, 0.0]]))
+    ways = [
+        NetWay(1, (1, 2, 3), np.array([[-200, 0], [0, 0], [200, 0.0]]), {"highway": "tertiary"}),
+        NetWay(
+            2, (2, 10, 11), np.array([[0, 0], [0, 100], [0, 190.0]]), {"highway": "residential"}
+        ),  # fmt: skip
+        NetWay(
+            3,
+            (3, 20, 21),
+            np.array([[200, 0], [200, 150], [200, 400.0]]),
+            {"highway": "residential"},
+        ),  # fmt: skip
+    ]
+    net = build_network(
+        model, ways, [], route_nodes={1, 2, 3}, route_segments={(1, 2), (2, 3)},
+        route_highway=["tertiary"] * len(model), dtm=lambda xz: np.zeros(len(xz)),
+        options=OPTS, nodes_known=False,
+    )  # fmt: skip
+    culdesac = [sr for sr in net.side_roads if 2 in sr.way_ids.tolist()]
+    assert len(culdesac) == 1 and culdesac[0].length > 185.0 and culdesac[0].end[0] == "end"
+    assert net.paved.contains(shapely.Point(10.0, 190.0))  # the bulb is wider than the street
+    # A dead end too far beyond the radius is still cut at it.
+    far = [sr for sr in net.side_roads if 3 in sr.way_ids.tolist()]
+    assert far and max(sr.length for sr in far) < 130.0

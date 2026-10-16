@@ -164,6 +164,9 @@ ROUTE_BLEND_M = 5.0  # mouths blend from the route's height to the side road's o
 # Cul-de-sac bulb curb radius: standards say 13-15 m (Hamilton RD-116.01, Richmond Hill C-15),
 # measured bulbs 9-14 m (median 11.7 m Brampton): 12 m, clamped 9-15 m (streetscape research).
 TURNING_CIRCLE_RADIUS_M = 12.0
+# A dead-end street (cul-de-sac) that reaches into the network radius is built whole when its
+# end lies at most this far beyond the radius, so the bulb seen from the route is there.
+DEAD_END_REACH_M = 100.0
 TURNING_LOOP_ISLAND_M = 5.0  # a turning loop's central island (R 4-6 m, ASSUMED)
 
 _ROAD_CLASSES = frozenset(
@@ -1126,6 +1129,12 @@ def build_network(
         way_ids = np.asarray(chain_ways)[seg_i]
         dist, _ = route_tree.query(st)
         inside = dist <= options.radius_m
+        dead_end = any(
+            len(graph.nbrs[n]) == 1 and n not in graph.route_nodes
+            for n in (chain_nodes[0], chain_nodes[-1])
+        )
+        if dead_end and inside.any() and dist.max() <= options.radius_m + DEAD_END_REACH_M:
+            inside[:] = True  # a cul-de-sac reaching into the radius: built whole, with its bulb
         for k, w in enumerate(way_ids.tolist()):  # no side-road bridges/tunnels (yet)
             t = graph.ways[w].tags
             if t.get("bridge", "no") not in ("no", "") or t.get("tunnel", "no") not in ("no", ""):
