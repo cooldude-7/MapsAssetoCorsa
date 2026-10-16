@@ -537,6 +537,15 @@ class BuildResult:
                     f"{fu['mapillary_used']} items, photos on "
                     f"{100 * fu['mapillary_photo_coverage']:.0f}% of the road"
                 )
+                sg = fu.get("signals") or {}
+                if sg.get("junctions"):
+                    lines.append(
+                        f"signals  {sg['junctions']} junctions, {sg['approaches']} approaches: "
+                        f"{sg['poles']} poles, {sg['heads']} heads ({sg['arrow_heads']} "
+                        f"left arrows), {sg['ped_heads']} pedestrian heads "
+                        f"({sg['ped_posts']} posts); stop signs dropped: {sg['stops_dropped']}; "
+                        f"at {', '.join(f'{v:.0f}' for v in sg.get('stations', []))} m"
+                    )
             for b in sc["bridges"]:
                 lines.append(
                     f"bridge   {b['length_m']:.0f} m at {b['from_a_m']:.0f} m from A, deck up to "
@@ -1935,7 +1944,7 @@ def _furniture(
         options=options.furniture_options, town_at=_town_at(sc),
     )  # fmt: skip
     sc.furniture = plan
-    names = street_names(plan.items)
+    names = street_names(plan.items, plan.signals)
     sc.furniture_names = tuple(sorted(names, key=names.get))
     way_id = geo.way_id if len(geo.way_id) == len(m) else None
     tree = cKDTree(m.centre[:, [0, 2]])
@@ -2111,6 +2120,8 @@ def _furniture_stats(sc: _Scenery) -> dict:
         "route_controls": [c for c in plan.controls if c["control"]],
         "mapillary_driveways": plan.driveways,
         "clearance": plan.clearance,
+        "signals": plan.signals.stats()
+        | {"stops_dropped": plan.stops_under_signals, "stations": plan.signal_stations},
     }
 
 

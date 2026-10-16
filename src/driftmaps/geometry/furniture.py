@@ -73,6 +73,7 @@ from driftmaps.geo.project import LocalProjection
 from driftmaps.geometry.clearance import CLEARANCE_M, DrivableSurface, clear_items
 from driftmaps.geometry.primitives import MeshData, merge, split
 from driftmaps.geometry.road import RoadModel
+from driftmaps.geometry.signals import SignalApproach, SignalPlan, draw_pole, plan_signals
 from driftmaps.geometry.street_items import (
     HYDRANT,
     LIGHT_STREET,
@@ -173,6 +174,9 @@ class FurniturePlan:
     # `geometry.clearance`: items moved off / dropped, signs re-faced, and what still stands
     # on the drivable surface ("on_surface", "near_surface": within CLEARANCE_M; both 0)
     clearance: dict[str, int] = field(default_factory=dict)
+    signals: SignalPlan = field(default_factory=SignalPlan)  # signalised junctions, poles
+    stops_under_signals: int = 0  # stop / yield signs dropped from signalised approaches
+    signal_stations: list[float] = field(default_factory=list)  # metres from the start (A)
 
 
 @dataclass
@@ -646,8 +650,6 @@ class _Planner:
                     h = self.frame.half(s_bar)
                     l0, l1 = (-h + 0.2, -0.2) if forward else (0.2, h - 0.2)
                     self.markings.append(Marking("stop_bar", s_bar, l0, l1, "rule"))
-                if ctl == "signal":
-                    self._signal(s_bar, forward)
         # OSM stop / give-way nodes on the route away from any routed junction (a side road
         # the router does not know, a rail crossing): the node is the stop line; its
         # `direction` says who stops.
@@ -665,15 +667,36 @@ class _Planner:
                 l0, l1 = (-h + 0.2, -0.2) if fwd else (0.2, h - 0.2)
                 self.markings.append(Marking("stop_bar", s, l0, l1, "osm"))
 
-    def _signal(self, s_bar: float, forward: bool) -> None:
-        """A signal pole with a mast arm on the near right corner, and its luminaire."""
-        side = -1 if forward else 1
-        _, fwd, _ = self.frame.at(s_bar)
-        lat = side * (self.frame.edge(s_bar) + 1.0)
-        p = self.frame.point(s_bar, lat)
-        facing = -fwd if forward else fwd
-        self.items.append(_item(SIGNAL_TRAFFIC, p, facing, self.ground, "rule"))
-        self.items.append(_item(LIGHT_STREET, p, facing, self.ground, "rule"))
+    def signal_junctions(self, juncs: list[_Junction]):
+        """(node, centre XZ, legs) of every route junction for `signals.plan_signals`: the
+        route's two legs (widths from the built road, lanes from their ways and the
+        direction the route runs along them) and the side roads (widths from their tags)."""
+        path = self.route.node_path()
+        at = {node: k for k, node in enumerate(path)}
+        out = []
+        for j in juncs:
+            k = at.get(j.node)
+            if k is None or not 0 < k < len(path) - 1:
+                continue
+            e_in, e_out = self.route.edges[k - 1], self.route.edges[k]
+            _, fwd, _ = self.frame.at(j.s)
+            legs = []
+            for edge, d, s_leg, arrive_dir in ((e_in, -fwd, j.s - 15.0, 1),
+                                               (e_out, fwd, j.s + 15.0, -1)):  # fmt: skip
+                tags = self.route.ways.get(edge.way) or {}
+                toward = edge.dir * arrive_dir > 0  # arriving traffic moves along the way
+                ow = str(tags.get("oneway", ""))
+                oneway = 0
+                if ow in ("yes", "1", "true", "-1"):
+                    flows = toward if ow != "-1" else not toward
+                    oneway = -1 if flows else 1
+                legs.append(SignalApproach(np.asarray(d, float), self.frame.half(s_leg), tags,
+                                           toward, oneway, on_route=True))  # fmt: skip
+            for way, d in j.legs:
+                tags = self.route.ways.get(way) or {}
+                legs.append(SignalApproach(np.asarray(d, float), _road_half(tags), tags))
+            out.append((j.node, self.frame.point(j.s, 0.0), legs))
+        return out
 
     # -- speed limits ---------------------------------------------------------------------------
 
@@ -1010,6 +1033,7 @@ def plan_furniture(
     pl.items = dedupe(pl.items, o.dedupe_m, pole_radius_m=o.pole_dedupe_m, sides=sides(pl.items))
     pl.pole_lines()
     pl.items = dedupe(pl.items, o.dedupe_m, pole_radius_m=o.pole_dedupe_m, sides=sides(pl.items))
+    _signals(pl, juncs, osm, list(mapillary))
     stats += clear(first=False)  # what the pole lines put on a side road or junction
     pl.items = _attach_lights(pl.items)
     plan = pl.plan
@@ -1026,6 +1050,47 @@ def plan_furniture(
         plan.counts[key][mk.source] = plan.counts[key].get(mk.source, 0) + 1
     plan.osm_nodes = sorted(set(plan.osm_nodes))
     return plan
+
+
+_TRAFFIC_LIGHT = "object--traffic-light--"
+_UNDER_SIGNALS = (SIGN_STOP, SIGN_YIELD, SIGN_ALL_WAY)
+UNDER_SIGNAL_M = 25.0  # stop / yield signs this far beyond a signalised junction's poles go
+
+
+def _signals(pl: _Planner, juncs: list[_Junction], osm, mapillary: Sequence) -> None:
+    """Ontario signals on every approach of each signalised route junction
+    (`geometry.signals`): corner poles (signal items, moved off the surface by the next
+    clearance pass) with a luminaire each; stop and yield signs on those approaches, and any
+    other signal item there, are dropped."""
+    nodes = [n for n in (osm.nodes if osm is not None else ()) if
+             n.tags.get("highway") == "traffic_signals"]  # fmt: skip
+    sig_xz = _xz_of(pl.proj, np.array([(n.lon, n.lat) for n in nodes])) if nodes else np.zeros(
+        (0, 2))  # fmt: skip
+    lights = [f for f in mapillary if f.value.startswith(_TRAFFIC_LIGHT)]
+    light_xz = (_xz_of(pl.proj, np.array([(f.lon, f.lat) for f in lights])) if lights
+                else np.zeros((0, 2)))  # fmt: skip
+    plan = plan_signals(pl.signal_junctions(juncs), sig_xz, light_xz)
+    pl.plan.signals = plan
+    if not plan.junctions:
+        return
+    st, _, _ = pl.frame.project(np.array([c for _, c, _ in plan.junctions]))
+    pl.plan.signal_stations = sorted(round(float(v) - pl.frame.s0, 1) for v in st)
+    nodes_sig = {f"junction:{node}" for node, _, _ in plan.junctions}
+    keep = []
+    for it in pl.items:
+        xz = np.array([it.position[0], it.position[2]])
+        if it.kind in _UNDER_SIGNALS and (it.ref in nodes_sig or plan.near(xz, UNDER_SIGNAL_M)):
+            pl.plan.stops_under_signals += 1
+            continue
+        if it.kind == SIGNAL_TRAFFIC and plan.near(xz, 5.0):
+            continue  # our corner poles replace it
+        keep.append(it)
+    for pole in plan.poles:
+        facing = pole.axis if pole.axis is not None else np.array([1.0, 0.0])
+        keep.append(_item(SIGNAL_TRAFFIC, pole.xz, -facing, pl.ground, "rule", ref=pole.ref))
+        if not pole.post:  # Ontario signal poles carry the junction's luminaires
+            keep.append(_item(LIGHT_STREET, pole.xz, -facing, pl.ground, "rule"))
+    pl.items = keep
 
 
 def _on_surface(items: Sequence[StreetItem], surf: DrivableSurface) -> dict[str, int]:
@@ -1509,6 +1574,7 @@ def furniture_meshes(
 
     r = _Renderer(road_y, walls, frame, o, dict(names or {}))
     items = plan.items
+    sig_poles = {p.ref: p for p in plan.signals.poles}
     # Poles first: their wire attachment points depend on the line direction.
     poles = [it for it in items if it.kind == POLE_UTILITY]
     att: dict[int, list[np.ndarray]] = {}
@@ -1578,6 +1644,11 @@ def furniture_meshes(
                 else np.array(it.facing)
             )
             r.light(it, toward)
+        elif it.kind == SIGNAL_TRAFFIC and it.ref in sig_poles:
+            base = np.array(it.position, float)
+            draw_pole(r.cell(base[0], base[2]), sig_poles[it.ref], base, road_y, r.names, r.metal)
+            if o.collide:
+                r.collider(base, 0.2)
         elif it.kind == SIGNAL_TRAFFIC:
             st, off, _ = frame.project(np.array([[it.position[0], it.position[2]]]))
             over = max(2.5, abs(float(off[0])) - 1.75)
@@ -1607,9 +1678,12 @@ def furniture_meshes(
     return out
 
 
-def street_names(items: Sequence[StreetItem]) -> dict[str, int]:
-    """Atlas index per street name on the blades (the first MAX_NAMES names, sorted)."""
-    names = sorted({it.text for it in items if it.kind == SIGN_STREET_NAME and it.text})
+def street_names(items: Sequence[StreetItem], signals: SignalPlan | None = None) -> dict[str, int]:
+    """Atlas index per street name on the blades and the signal mast arms (the first
+    MAX_NAMES names, sorted)."""
+    names = {it.text for it in items if it.kind == SIGN_STREET_NAME and it.text}
+    names |= {p.name for p in (signals.poles if signals is not None else ()) if p.name}
+    names = sorted(names)
     return {n: k for k, n in enumerate(names[:MAX_NAMES])}
 
 
