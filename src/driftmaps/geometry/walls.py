@@ -62,8 +62,16 @@ class WallLines:
         return float(sum(np.linalg.norm(np.diff(r, axis=0), axis=1).sum() for r in self.rings))
 
 
-def wall_lines(corridor: shapely.Geometry, spacing_m: float = 2.0) -> WallLines:
-    """Exterior and interior rings of the corridor, densified to `spacing_m`."""
+def wall_lines(
+    corridor: shapely.Geometry,
+    spacing_m: float = 2.0,
+    *,
+    fine_zone: shapely.Geometry | None = None,
+    coarse_m: float = 4.0,
+) -> WallLines:
+    """Exterior and interior rings of the corridor, densified to `spacing_m`; with
+    `fine_zone` (e.g. the route's own corridor, grown), points outside it are thinned to
+    about `coarse_m` (side-road walls: the same collision for half the vertices)."""
     polys = list(corridor.geoms) if isinstance(corridor, shapely.MultiPolygon) else [corridor]
     rings = []
     for poly in polys:
@@ -72,8 +80,22 @@ def wall_lines(corridor: shapely.Geometry, spacing_m: float = 2.0) -> WallLines:
         for ring in [poly.exterior, *poly.interiors]:
             if ring.length < 5.0:  # slivers
                 continue
-            dense = shapely.segmentize(ring, spacing_m)
-            rings.append(np.asarray(dense.coords)[:, :2])
+            if fine_zone is None or coarse_m <= spacing_m:
+                rings.append(np.asarray(shapely.segmentize(ring, spacing_m).coords)[:, :2])
+                continue
+            # Per piece of the ring (3 coarse steps at most): `spacing_m` where its midpoint
+            # is in the fine zone, `coarse_m` elsewhere; shorter pieces stay as they are.
+            pts = np.asarray(shapely.segmentize(ring, 3.0 * coarse_m).coords)[:, :2]
+            a, b = pts[:-1], pts[1:]
+            length = np.linalg.norm(b - a, axis=1)
+            mid = 0.5 * (a + b)
+            fine = shapely.contains_xy(fine_zone, mid[:, 0], mid[:, 1])
+            step = np.where(fine, spacing_m, coarse_m)
+            n = np.maximum(1, np.ceil(length / step - 1e-9)).astype(int)
+            seg = np.repeat(np.arange(len(a)), n)
+            t = (np.arange(n.sum()) - np.repeat(np.cumsum(n) - n, n)) / np.repeat(n, n)
+            dense = a[seg] + t[:, None] * (b - a)[seg]
+            rings.append(np.vstack([dense, pts[-1:]]))
     return WallLines(rings)
 
 

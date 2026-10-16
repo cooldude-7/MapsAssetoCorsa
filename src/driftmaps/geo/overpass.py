@@ -38,21 +38,28 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+import numpy.typing as npt
 
 __all__ = [
     "DEFAULT_BUFFER_M",
     "DEFAULT_MIRRORS",
     "ENV_CACHE_DIR",
     "ENV_OVERPASS_URL",
+    "NETWORK_AROUND_M",
     "OSM_ATTRIBUTION",
+    "NetworkData",
     "OsmData",
+    "OsmNode",
     "OverpassError",
     "Way",
     "build_bbox_query",
+    "build_network_query",
     "build_query",
     "default_cache_dir",
     "fetch_corridor",
+    "fetch_network",
     "load_cached",
+    "parse_network",
     "parse_overpass",
     "query_cache_key",
 ]
@@ -416,3 +423,155 @@ def fetch_corridor(
     tmp.write_bytes(gzip.compress(body, mtime=0))
     tmp.replace(path)
     return osm
+
+
+# --------------------------------------------------------------------------------------------
+# The road network around a route (side roads, driveways, roundabouts, junction control)
+# --------------------------------------------------------------------------------------------
+
+# Every highway a car can use, also driveways, parking aisles and farm tracks: the network
+# stage (`geometry.network`) sorts them into side roads, driveways and what it leaves out.
+NETWORK_HIGHWAY_RE = (
+    "^((motorway|trunk|primary|secondary|tertiary)(_link)?"
+    "|unclassified|residential|living_street|service|track|road|busway)$"
+)
+# Tagged nodes that shape the network: cul-de-sac bulbs and junction control.
+NETWORK_NODE_RE = "^(turning_circle|turning_loop|mini_roundabout|stop|give_way|traffic_signals)$"
+NETWORK_AROUND_M = 150.0  # = the scenery radius (buildings, near terrain)
+
+
+@dataclass(frozen=True)
+class OsmNode:
+    """One tagged OSM node: (lon, lat) degrees and its tags."""
+
+    id: int
+    lonlat: tuple[float, float]
+    tags: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class NetworkData:
+    """Highway ways (whole, with node ids) and tagged highway nodes near a route.
+
+    `nodes_known` is False when the tagged nodes could not be fetched (the region database
+    answered the ways but Overpass was out of reach): cul-de-sacs then fall back to rules.
+    """
+
+    ways: tuple[Way, ...] = ()
+    nodes: tuple[OsmNode, ...] = ()
+    osm_base: str | None = None
+    nodes_known: bool = True
+
+
+def _line_latlon(route_lonlat: np.ndarray, tolerance_m: float) -> np.ndarray:
+    """The (lon, lat) line simplified to within `tolerance_m`, as rounded (lat, lon)."""
+    import shapely
+
+    from driftmaps.geo.project import LocalProjection
+
+    ll = np.asarray(route_lonlat, np.float64).reshape(-1, 2)
+    proj = LocalProjection(float(ll[0, 1]), float(ll[0, 0]))
+    xy = proj.to_xy(ll)
+    if len(xy) >= 2 and tolerance_m > 0:
+        xy = np.asarray(shapely.LineString(xy).simplify(tolerance_m).coords)
+    return np.round(proj.from_xy(xy)[:, ::-1], 6)
+
+
+def build_network_query(
+    route_latlon: npt.ArrayLike, around_m: float, *, ways: bool = True, timeout_s: int = 120
+) -> str:
+    """Overpass QL for every highway way (`NETWORK_HIGHWAY_RE`) and the tagged highway nodes
+    (`NETWORK_NODE_RE`) within `around_m` of the (lat, lon) line; `ways=False`: nodes only."""
+    pts = np.asarray(route_latlon, np.float64).reshape(-1, 2)
+    if len(pts) == 0:
+        raise ValueError("need at least one route point")
+    coords = ",".join(f"{_fmt(lat)},{_fmt(lon)}" for lat, lon in pts)
+    near = f"(around:{_fmt(around_m)},{coords})"
+    parts = [f'node["highway"~"{NETWORK_NODE_RE}"]{near};']
+    if ways:
+        parts.insert(0, f'way["highway"~"{NETWORK_HIGHWAY_RE}"]["area"!="yes"]{near};')
+    return _union_query(parts, timeout_s)
+
+
+def parse_network(payload: bytes | str | Mapping, nodes_known: bool = True) -> NetworkData:
+    """Overpass JSON (`build_network_query`) -> NetworkData (ways and nodes sorted by id)."""
+    if isinstance(payload, bytes | str):
+        try:
+            payload = json.loads(payload)
+        except ValueError as exc:
+            raise OverpassError(f"not an Overpass JSON response: {exc}") from exc
+    osm = parse_overpass(payload)
+    nodes = {}
+    for el in payload.get("elements", ()):
+        if el.get("type") == "node" and "lat" in el and "lon" in el:
+            tags = {str(k): str(v) for k, v in (el.get("tags") or {}).items()}
+            nid = int(el["id"])
+            nodes[nid] = OsmNode(nid, (float(el["lon"]), float(el["lat"])), tags)
+    ways = tuple(w for w in osm.ways if w.tags.get("highway") and w.tags.get("area") != "yes")
+    return NetworkData(ways, tuple(nodes[k] for k in sorted(nodes)), osm.osm_base, nodes_known)
+
+
+def _cached_query(
+    query: str,
+    cache_dir: Path | str | None,
+    offline: bool,
+    mirrors: Sequence[str] | None,
+    **post_kwargs,
+) -> bytes:
+    """The answer to `query` from the gzip cache, else from Overpass (then cached)."""
+    cache = Path(cache_dir) if cache_dir is not None else default_cache_dir()
+    key = query_cache_key(query)
+    path = _cache_path(cache, key)
+    if path.is_file():
+        try:
+            return gzip.decompress(path.read_bytes())
+        except OSError:
+            pass  # corrupt cache entry: refetch
+    if offline:
+        raise OverpassError(f"no cached Overpass data for this query (key {key[:12]}...)")
+    body = post_query(query, mirrors, **post_kwargs)
+    parse_overpass(body)  # never cache an error page
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_bytes(gzip.compress(body, mtime=0))
+    tmp.replace(path)
+    return body
+
+
+def fetch_network(
+    route_lonlat: npt.ArrayLike,
+    *,
+    around_m: float = NETWORK_AROUND_M,
+    cache_dir: Path | str | None = None,
+    simplify_m: float = 5.0,
+    mirrors: Sequence[str] | None = None,
+    offline: bool = False,
+    **post_kwargs,
+) -> NetworkData:
+    """Every highway way and the tagged highway nodes within `around_m` of the route line
+    (N, 2) (lon, lat).
+
+    The ways come from the downloaded region database when it covers the route. It stores
+    no nodes: those then come from the cache or one small Overpass query, and when that
+    fails the result says `nodes_known=False`. Without a region database everything comes
+    from the cache or one Overpass query. `offline=True` never touches the network
+    (OverpassError on a cache miss)."""
+    line = _line_latlon(np.asarray(route_lonlat, np.float64), simplify_m)
+    radius = around_m + max(simplify_m, 0.0)
+    from driftmaps.geo import offline as region_db
+
+    lat, lon = line[:, 0], line[:, 1]
+    pad = (radius + 200.0) / 111_320.0
+    clip = (lat.min() - pad, lon.min() - 1.5 * pad, lat.max() + pad, lon.max() + 1.5 * pad)
+    found = region_db.roadside_payload(line, 0.0, radius, tuple(float(v) for v in clip))
+    if found is not None:
+        ways = parse_network(found).ways
+        base = (found.get("osm3s") or {}).get("timestamp_osm_base")
+        try:
+            query = build_network_query(line, radius, ways=False)
+            nodes = parse_network(_cached_query(query, cache_dir, offline, mirrors, **post_kwargs))
+        except (OverpassError, OSError):
+            return NetworkData(ways, (), base, nodes_known=False)
+        return NetworkData(ways, nodes.nodes, base)
+    query = build_network_query(line, radius)
+    return parse_network(_cached_query(query, cache_dir, offline, mirrors, **post_kwargs))
