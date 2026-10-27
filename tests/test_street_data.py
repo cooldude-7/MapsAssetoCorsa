@@ -209,3 +209,76 @@ def test_image_points(tmp_path):
     pts = gm.fetch_image_points(LINE, token=TOKEN, cache_dir=tmp_path, opener=FakeApi(rows))
     assert pts.shape == (2, 2) and np.allclose(pts[0], [-79.8195, 43.4405])
     assert gm.parse_image_points([{"id": "x"}]).shape == (0, 2)
+
+
+# -- the built-in token ------------------------------------------------------------------------
+
+BUILTIN = "MLY|9999999999|builtin0000000000000000000000001308"
+
+
+def test_token_precedence_own_then_env_then_builtin(monkeypatch):
+    assert gm.resolve_token() == (None, "none")  # tests run without the built-in token
+    monkeypatch.setattr(gm, "DEFAULT_CLIENT_TOKEN", BUILTIN)
+    assert gm.resolve_token() == (BUILTIN, "built-in")
+    monkeypatch.setenv(gm.ENV_TOKEN, "MLY|env")
+    assert gm.resolve_token() == ("MLY|env", "env")
+    assert gm.resolve_token("  MLY|own ") == ("MLY|own", "own")
+
+
+def test_a_revoked_builtin_token_warns_once_and_is_dropped(tmp_path, monkeypatch):
+    monkeypatch.setattr(gm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(gm, "DEFAULT_CLIENT_TOKEN", BUILTIN)
+    api = FakeApi([], status=401)
+    with pytest.raises(gm.MapillaryRevoked) as exc:
+        gm.fetch_map_features(LINE, token=None, cache_dir=tmp_path, opener=api)
+    assert "paste your own" in str(exc.value) and BUILTIN not in str(exc.value)
+    assert api.requests and all(r.get_header("Authorization") == f"OAuth {BUILTIN}"
+                                for r in api.requests)  # fmt: skip
+    assert gm.take_revoked_notice() is True and gm.take_revoked_notice() is False
+    # From now on the built-in token is gone: no token, no request.
+    assert gm.default_token() is None and gm.resolve_token() == (None, "none")
+    with pytest.raises(gm.MapillaryError, match="no cached"):
+        gm.fetch_map_features(LINE, token=None, cache_dir=tmp_path / "b", opener=api)
+    # A user's own refused token is their problem to fix, not a revocation.
+    gm.reset_builtin_state()
+    with pytest.raises(gm.MapillaryError) as exc:
+        gm.fetch_map_features(LINE, token=TOKEN, cache_dir=tmp_path / "c", opener=api)
+    assert not isinstance(exc.value, gm.MapillaryRevoked) and gm.default_token() == BUILTIN
+
+
+def test_build_uses_the_builtin_token_skips_when_off_and_warns_once_if_revoked(
+    tmp_path, monkeypatch
+):
+    import warnings
+
+    from driftmaps import build as b
+
+    monkeypatch.setattr(gm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(gm, "DEFAULT_CLIENT_TOKEN", BUILTIN)
+    seen: list[str] = []
+
+    def refuse(req, timeout):
+        seen.append(req.get_header("Authorization"))
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    real_feats, real_points = gm.fetch_map_features, gm.fetch_image_points
+    monkeypatch.setattr(
+        b, "fetch_map_features", lambda ll, **kw: real_feats(ll, opener=refuse, **kw)
+    )
+    monkeypatch.setattr(
+        b, "fetch_image_points", lambda ll, **kw: real_points(ll, opener=refuse, **kw)
+    )
+
+    def layer(**kw):
+        opts = b.BuildOptions(cache_dir=tmp_path, **kw)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            got = b._mapillary_layer(LINE, opts)
+        return got, [str(w.message) for w in caught]
+
+    assert layer(mapillary=False) == (([], None), []) and not seen  # off: no request at all
+    (mly, cov), warned = layer()
+    assert (mly, cov) == ([], None) and set(seen) == {f"OAuth {BUILTIN}"}
+    assert len(warned) == 1 and "paste your own" in warned[0] and BUILTIN not in warned[0]
+    seen.clear()
+    assert layer() == (([], None), []) and not seen  # revoked: no more requests, no warning

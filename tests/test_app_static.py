@@ -422,10 +422,23 @@ const out = {
     legLabel({ kind: "close", name: "Snake Road" }),
   ],
   build: [
-    buildLabel({ version: "3", commit: "abcdef1234567", date: "2026-10-15T21:58:39Z" }),
-    buildLabel({ version: "Update 4", date: "2026-10-16" }),
+    buildLabel({ version: "v0.4.0", commit: "abcdef1234567", date: "2026-10-15T21:58:39Z" }),
+    buildLabel({ version: "dev", commit: "abcdef1234567", date: "2026-10-16 01:02 UTC" }),
+    buildLabel({ version: "0.4.1", date: "2026-10-16" }),
     buildLabel({ version: "dev" }), buildLabel(null), buildLabel({}),
   ],
+  upd: [
+    updateButton({ available: true, latest: "v0.5.0", can_install: true, phase: "idle" }),
+    updateButton({ available: true, latest: "v0.5.0", can_install: false, phase: "idle" }),
+    updateButton({
+      available: true, latest: "v0.5.0", can_install: true, phase: "downloading", progress: 0.426,
+    }),
+    updateButton({ available: true, latest: "v0.5.0", can_install: true, phase: "installing" }),
+    updateButton({ available: false, latest: "v0.4.0" }), updateButton(null),
+  ],
+  mly: ["off", "own", "built-in", "none"].map((s) => mapillaryText({
+    mapillary_source: s, mapillary_token_hint: s === "own" ? "MLY|…1308" : "built-in",
+  })),
   tile: tileKeyAt(-79.885, 43.31),
   tileBox: tileBounds("14/4556/6000"),
   tilesView: tilesForBounds(-79.89, 43.305, -79.88, 43.315, 1),
@@ -495,12 +508,21 @@ def test_turn_by_turn_helpers_under_node(tmp_path: Path):
         "Back to A on Snake Road",
     ]
     assert out["build"] == [
-        "Update 3 · 2026-10-15 · abcdef1",
-        "Update 4 · 2026-10-16",
+        "v0.4.0 · 2026-10-15 · abcdef1",
+        "dev · 2026-10-16 · abcdef1",
+        "v0.4.1 · 2026-10-16",
         "dev build",
         "dev build",
         "dev build",
     ]
+    install, download, downloading, installing, none, nothing = out["upd"]
+    assert install == {"text": "Update available: v0.5.0 — Install", "action": "install"}
+    assert download["action"] == "download" and "Download the new version" in download["text"]
+    assert downloading == {"text": "Downloading v0.5.0… 43%", "busy": True}
+    assert installing["busy"] and none is None and nothing is None
+    off, own, builtin, missing = out["mly"]
+    assert "off" in off and "MLY|…1308" in own and "built-in shared access" in builtin
+    assert "paste your own" in missing
     assert out["tile"] == "14/4556/6000"
     w, s_, e, n = out["tileBox"]
     assert w < -79.885 < e and s_ < 43.31 < n

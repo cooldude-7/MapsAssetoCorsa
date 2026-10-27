@@ -23,6 +23,8 @@
 # reprojects with PROJ, draws text with FreeType, reads the map page, builds a tiny offline road
 # database with pyosmium; see packaging/launcher.py).
 
+import os
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -121,6 +123,10 @@ def make_icon(path: Path) -> None:
 
 
 def _version() -> str:
+    """$ACMG_VERSION (CI: the release tag's X.Y.Z), else pyproject.toml's version."""
+    env = os.environ.get("ACMG_VERSION", "").strip().lstrip("v")
+    if re.fullmatch(r"\d+(\.\d+){1,3}", env):
+        return env
     with open(ROOT / "pyproject.toml", "rb") as f:
         return tomllib.load(f)["project"]["version"]
 

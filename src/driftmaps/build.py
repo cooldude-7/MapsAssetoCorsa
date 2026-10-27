@@ -183,10 +183,12 @@ from driftmaps.geo.mapillary import (
     MAPILLARY_ATTRIBUTION,
     MapFeature,
     MapillaryError,
+    MapillaryRevoked,
     drop_stale,
     fetch_image_points,
     fetch_map_features,
-    token_from_env,
+    resolve_token,
+    take_revoked_notice,
 )
 from driftmaps.geo.overpass import (
     OSM_ATTRIBUTION,
@@ -446,8 +448,10 @@ class BuildOptions:
     municipal_sidewalks: bool = True
     # Street furniture (geometry.furniture): signs, poles and wires, lights, signals, hydrants,
     # mailboxes and the route's stop bars. Mapillary detections need a client token
-    # (None: $DRIFTMAPS_MAPILLARY_TOKEN; without one, OSM and the rules only).
+    # (None: $DRIFTMAPS_MAPILLARY_TOKEN, else the built-in one, `geo.mapillary.resolve_token`);
+    # `mapillary=False` (or no token at all) leaves OSM and the rules only.
     furniture: bool = True
+    mapillary: bool = True
     mapillary_token: str | None = field(default=None, repr=False)
     furniture_options: FurnitureOptions = field(default_factory=FurnitureOptions)
     offline: bool = False  # scenery downloads (Overpass, Microsoft) come from the cache only
@@ -2200,6 +2204,39 @@ def _town_at(sc: _Scenery) -> Callable[[np.ndarray], bool] | None:
     return at
 
 
+def _mapillary_layer(
+    ll: np.ndarray, options: BuildOptions
+) -> tuple[list[MapFeature], np.ndarray | None]:
+    """Mapillary's detections and photo coverage along the route (`geo.mapillary`): the
+    user's token, else $DRIFTMAPS_MAPILLARY_TOKEN, else the built-in one. Nothing when
+    `options.mapillary` is off; on failure nothing either, with a warning (once per run for a
+    revoked built-in token; none without any token, as the layer is simply off then)."""
+    coverage = options.mapillary_coverage
+    if options.mapillary_features is not None:
+        return list(options.mapillary_features), coverage
+    if not options.mapillary:
+        return [], coverage
+    token = resolve_token(options.mapillary_token)[0]
+    try:
+        mly = drop_stale(
+            fetch_map_features(ll, token=token, cache_dir=options.cache_dir,
+                               offline=options.offline or not token)
+        )  # fmt: skip
+        if coverage is None:
+            coverage = fetch_image_points(
+                ll, token=token, cache_dir=options.cache_dir,
+                offline=options.offline or not token,
+            )  # fmt: skip
+        return mly, coverage
+    except MapillaryRevoked as e:
+        if take_revoked_notice():
+            warnings.warn(str(e), stacklevel=3)
+    except (MapillaryError, *_DATA_ERRORS) as e:
+        if token:  # without a token the layer is simply off
+            warnings.warn(f"Mapillary signs and poles unavailable ({_short(e)})", stacklevel=3)
+    return [], None
+
+
 def _furniture(
     geo: TrackGeometry,
     ground: Callable[[np.ndarray], np.ndarray],
@@ -2214,26 +2251,7 @@ def _furniture(
     ll = _route_lonlat(geo)
     osm = _street_features(geo, options) if feats is _NOT_FETCHED else feats
     sc.street_features = osm
-    mly: list[MapFeature] = []
-    coverage = options.mapillary_coverage
-    if options.mapillary_features is not None:
-        mly = list(options.mapillary_features)
-    else:
-        token = options.mapillary_token or token_from_env()
-        try:
-            mly = drop_stale(
-                fetch_map_features(ll, token=token, cache_dir=options.cache_dir,
-                                   offline=options.offline or not token)
-            )  # fmt: skip
-            if coverage is None:
-                coverage = fetch_image_points(
-                    ll, token=token, cache_dir=options.cache_dir,
-                    offline=options.offline or not token,
-                )  # fmt: skip
-        except (MapillaryError, *_DATA_ERRORS) as e:
-            if token:  # without a token the layer is simply off
-                warnings.warn(f"Mapillary signs and poles unavailable ({_short(e)})", stacklevel=2)
-            mly, coverage = [], None
+    mly, coverage = _mapillary_layer(ll, options)
     m = geo.model
     surface = DrivableSurface.build(
         m, oneway=geo.oneway, net=sc.network, driving_side=geo.driving_side

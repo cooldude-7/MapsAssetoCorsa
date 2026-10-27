@@ -7,8 +7,13 @@ OpenStreetMap road data and real (lidar) elevation, with trees, buildings, bridg
 guardrails where Ontario's road rules call for them, and installs it so it shows up in Content
 Manager (a loop is a circuit you can race lap after lap).
 
-Status: **M5 (the map app)**. Players: get the Windows app from
-[`docs/INSTALL_APP.md`](docs/INSTALL_APP.md) and test it with
+**Want to try it?** Download the installer from the
+[latest release](https://github.com/cooldude-7/MapsAssetoCorsa/releases/latest) and follow
+[`docs/FOR_FRIENDS.md`](docs/FOR_FRIENDS.md) (what you need, the two download warnings and why,
+privacy, first steps). After that the app updates itself with one click.
+
+Status: **M5 (the map app)**. Testers: builds of every push are in
+[`docs/INSTALL_APP.md`](docs/INSTALL_APP.md); test them with
 [`docs/checklists/M5-app.md`](docs/checklists/M5-app.md). The full plan is in
 [`docs/PLAN.md`](docs/PLAN.md); older in-game checklists are in [`docs/checklists/`](docs/checklists/).
 
@@ -20,7 +25,10 @@ data, built tracks, `app.log`) is in `%LOCALAPPDATA%\AssettoCorsaMapGenerator` o
 (`~/.local/share/AssettoCorsaMapGenerator` elsewhere). It only lists or deletes tracks it made.
 Roads for turn by turn load in z14 map tiles round the view (cached per tile), and the page
 works out the junctions and turns itself, so picking each turn is instant. The version is shown
-next to the app's name ("Update N · date · commit", or "dev build").
+next to the app's name ("vX.Y.Z · date · commit" for a release, "dev · date · commit" for other
+CI builds, or "dev build"). A release checks GitHub for a newer one (at most once a day; a
+setting turns it off) and the installed app updates itself when you click Install
+(`driftmaps.app.updates`, `packaging/installer.iss`).
 
 ## Development
 

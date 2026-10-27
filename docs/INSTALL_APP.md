@@ -4,6 +4,10 @@ Click two points on a map and the app turns the real road between them into an A
 track, installs it, and you drive it from Content Manager. Everything runs on your own PC.
 You don't install Python or anything else: you download a zip, unzip it and double-click.
 
+**Just want to play?** Use the installer from the latest release instead:
+[`FOR_FRIENDS.md`](FOR_FRIENDS.md) walks you through it, and the installed app updates itself.
+This page is for testers running the portable zip or a build of the newest changes.
+
 You need: Windows 10 or 11, Assetto Corsa (Steam), Content Manager and Custom Shaders Patch
 (CSP), and an internet connection (the app downloads road and elevation data).
 
@@ -18,7 +22,9 @@ Both need you to be signed in to GitHub with an account that can see the project
 
 1. Go to <https://github.com/cooldude-7/MapsAssetoCorsa/releases>.
 2. Find the newest release at the top. Under **Assets** (click the word to open it if it's
-   folded), click **AssettoCorsaMapGenerator-windows.zip**.
+   folded), click **AssettoCorsaMapGenerator-windows.zip** (the portable app; the
+   **AssettoCorsaMapGenerator-Setup-....exe** next to it is the installer, see
+   [`FOR_FRIENDS.md`](FOR_FRIENDS.md)).
 3. The zip downloads to your **Downloads** folder.
 
 If the page says there aren't any releases yet, use option B.
@@ -31,7 +37,10 @@ If the page says there aren't any releases yet, use option B.
    green one.)
 3. Scroll down to **Artifacts** at the bottom of the run page and click
    **AssettoCorsaMapGenerator-windows**.
-4. It downloads as **AssettoCorsaMapGenerator-windows.zip** to your Downloads folder.
+4. It downloads as **AssettoCorsaMapGenerator-windows.zip** to your Downloads folder. Inside are
+   the installer (**AssettoCorsaMapGenerator-Setup-dev-....exe**), **SHA256SUMS.txt** and the
+   portable app, a second **AssettoCorsaMapGenerator-windows.zip**: extract the outer zip
+   first, then continue with the inner one below (or just run the Setup).
 
 GitHub keeps these builds for 90 days. To make a fresh one: on the page from step 1 click
 **Run workflow** (right side), leave the branch as it is, click the green **Run workflow**

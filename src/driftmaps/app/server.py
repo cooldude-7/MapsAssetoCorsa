@@ -4,9 +4,15 @@ Binds 127.0.0.1 only. Endpoints (all JSON; errors are `{"error": "<plain English
 
 - `GET /` and other GETs: the single-page app from `driftmaps/app/static/` (read through
   `importlib.resources`, so it also works when frozen by PyInstaller).
-- `GET /api/status`, `POST /api/settings {ac_root}`: app name/version and where AC is;
-  `build` is `{version, commit (7 characters), date}` from `_build_info.py` (written by CI),
-  else `{version: "dev"}`.
+- `GET /api/status`, `POST /api/settings {ac_root, mapillary_token, use_mapillary,
+  check_updates}` (any of them): app name/version, where AC is, the Mapillary source (never a
+  token) and the switches; `build` is `{version, commit (7 characters), date}` from
+  `_build_info.py` (written by CI: "vX.Y.Z" on a release tag, else "dev"), else
+  `{version: "dev"}`; `update` is the `GET /api/update` body.
+- `GET /api/update`: the newer-version state (`driftmaps.app.updates`; waits briefly for the
+  start-up check); `POST /api/update/check` asks GitHub again; `POST /api/update/install`
+  downloads, verifies and runs the new installer, then the app closes (the installer starts
+  the new version). Install is refused (409) while a build runs or for a portable copy.
 - `POST /api/route {pins: [[lat, lon], ...], reverse, loop}`: route over real roads; the route
   is kept by `route_id` (in memory and as `<app data>/routes/<route_id>.json`).
   `snapped[i]` is where request pin i landed on the road (request order, even with
@@ -104,6 +110,7 @@ from driftmaps.app.jobs import (
     is_network_error,
 )
 from driftmaps.app.settings import APP_NAME, Settings, SettingsError
+from driftmaps.app.updates import UpdateError, Updater
 
 if TYPE_CHECKING:
     from driftmaps.app.tiles import TileStore
@@ -131,6 +138,9 @@ ROUTE_FILES_KEPT = 200
 _ROUTE_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
 _OFFLINE_ACTIONS = ("download", "cancel", "delete")
+_SWITCHES = ("use_mapillary", "check_updates")
+UPDATE_WAIT_S = 4.0  # GET /api/update waits this long for the start-up check
+AFTER_UPDATE_REOPEN_S = 15.0  # after an update, open the page unless the old tab came back
 
 MAP_SERVERS_MESSAGE = "Couldn't reach the map servers - check your internet and try again."
 STALE_MAP_WARNING = (
@@ -612,6 +622,15 @@ class App:
         offline_dir = self.settings.data_dir / "offline"
         region_db.configure(offline_dir)  # the builder and router look there too
         self.offline = OfflineManager(offline_dir)
+        self.updater = Updater(
+            self.settings.data_dir,
+            build_info()["version"],
+            enabled=lambda: self.settings.check_updates,
+        )
+        # Set by AppServer: its port and a way to stop serving (the updater closes the app).
+        self.port: int | None = None
+        self.shutdown_hook: Callable[[], None] | None = None
+        self.page_seen = threading.Event()  # the page has called the API since the start
 
     @property
     def tiles(self) -> TileStore:
@@ -655,11 +674,22 @@ class App:
     # -- status and settings ------------------------------------------------------------------
 
     def status(self) -> dict:
-        return {**self.settings.status(), "build": build_info()}
+        return {**self.settings.status(), "build": build_info(), "update": self.updater.state()}
 
     def set_settings(self, body: dict) -> dict:
-        if "ac_root" not in body and "mapillary_token" not in body:
-            raise ApiError(400, "Nothing to change: send ac_root or mapillary_token.")
+        if not any(k in body for k in ("ac_root", "mapillary_token", *_SWITCHES)):
+            raise ApiError(
+                400,
+                "Nothing to change: send ac_root, mapillary_token, use_mapillary or check_updates.",
+            )
+        for key in _SWITCHES:
+            if key in body:
+                if not isinstance(body[key], bool):
+                    raise ApiError(400, f"{key} must be true or false.")
+                try:
+                    self.settings.set_switch(key, body[key])
+                except OSError as exc:
+                    raise ApiError(500, f"Couldn't save the settings: {exc}") from None
         if "mapillary_token" in body:
             token = body["mapillary_token"]
             if token is not None and not isinstance(token, str):
@@ -670,8 +700,8 @@ class App:
                 raise ApiError(400, str(exc)) from None
             except OSError as exc:
                 raise ApiError(500, f"Couldn't save the settings: {exc}") from None
-            if "ac_root" not in body:
-                return self.status()
+        if "ac_root" not in body:
+            return self.status()
         value = body["ac_root"]
         if value is not None and not isinstance(value, str):
             raise ApiError(400, "ac_root must be a folder path.")
@@ -682,6 +712,36 @@ class App:
         except OSError as exc:
             raise ApiError(500, f"Couldn't save the settings: {exc}") from None
         return self.status()
+
+    # -- updates --------------------------------------------------------------------------------
+
+    def update_state(self) -> dict:
+        self.updater.wait_for_check(UPDATE_WAIT_S)
+        return self.updater.state()
+
+    def update_check(self) -> dict:
+        return self.updater.check(force=True)
+
+    def _update_blocker(self) -> str | None:
+        if self.jobs.active():
+            return "A track is being built - wait for it to finish, then click Install again."
+        if self.offline.busy():
+            return (
+                "Ontario's roads are downloading - wait for that (or cancel it), then click "
+                "Install again."
+            )
+        return None
+
+    def update_install(self) -> dict:
+        """The user clicked Install: refused while a build or road download runs."""
+        if self.shutdown_hook is None:
+            raise ApiError(409, "This copy of the app can't restart itself for an update.")
+        try:
+            return self.updater.install(
+                busy=self._update_blocker, shutdown=self.shutdown_hook, port=self.port
+            )
+        except UpdateError as exc:
+            raise ApiError(409, str(exc)) from None
 
     # -- routing --------------------------------------------------------------------------------
 
@@ -957,6 +1017,8 @@ class App:
     # -- builds ---------------------------------------------------------------------------------
 
     def build(self, body: dict) -> dict:
+        if self.updater.busy():
+            raise ApiError(409, "The app is installing an update - build again once it's back.")
         route_id, route = self._route_for(body)
         loop = body.get("loop")
         if loop is not None and bool(loop) != bool(route.closed):
@@ -1316,6 +1378,7 @@ class _Handler(BaseHTTPRequestHandler):
         app = self.server.app
         segs = [urllib.parse.unquote(s) for s in path.split("/")[2:] if s]
         key = (method, segs[0] if segs else "", len(segs))
+        app.page_seen.set()
         if key == ("GET", "status", 1):
             self._json(200, app.status())
         elif key == ("POST", "settings", 1):
@@ -1342,6 +1405,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, app.open_folder(self._body()))
         elif key == ("POST", "install-touge", 1):
             self._json(200, app.install_touge())
+        elif key == ("GET", "update", 1):
+            self._json(200, app.update_state())
+        elif key == ("POST", "update", 2) and segs[1] == "check":
+            self._json(200, app.update_check())
+        elif key == ("POST", "update", 2) and segs[1] == "install":
+            self._json(200, app.update_install())
         elif key == ("GET", "offline", 1):
             self._json(200, app.offline_status())
         elif key[:2] == ("POST", "offline") and key[2] == 2 and segs[1] in _OFFLINE_ACTIONS:
@@ -1360,6 +1429,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "open-folder",
                 "install-touge",
                 "offline",
+                "update",
             }
             if segs and segs[0] in known:
                 raise ApiError(405, "Not allowed.")
@@ -1420,6 +1490,8 @@ class AppServer:
         self.app = app or App()
         self.httpd = self._bind(port)
         self._thread: threading.Thread | None = None
+        self.app.port = self.port
+        self.app.shutdown_hook = self.request_stop
 
     def _bind(self, port: int | None) -> AppHTTPServer:
         if port is not None:
@@ -1449,6 +1521,10 @@ class AppServer:
 
     def serve_forever(self) -> None:
         self.httpd.serve_forever()
+
+    def request_stop(self) -> None:
+        """Stop serving, from any thread (the updater): `serve_forever` returns."""
+        threading.Thread(target=self.httpd.shutdown, name="drift-maps-stop", daemon=True).start()
 
     def stop(self) -> None:
         if self._thread is not None:
@@ -1507,10 +1583,14 @@ def run(
     port: int | None = None,
     open_browser: bool = True,
     data_dir: Path | str | None = None,
+    after_update: bool = False,
 ) -> None:
-    """Start the app and serve until Ctrl+C: print the URL and open it in the browser.
+    """Start the app and serve until Ctrl+C (or an update closes it): print the URL and open
+    it in the browser.
 
-    With `port=None`, if this app already runs on 8765 its page is just opened again.
+    With `port=None`, if this app already runs on 8765 its page is just opened again. With
+    `after_update` (the installer restarted it) the page the user had open reloads itself, so
+    the browser opens only if no page has called within AFTER_UPDATE_REOPEN_S.
     """
     settings = Settings(data_dir)
     _setup_logging(settings.data_dir)
@@ -1530,8 +1610,20 @@ def run(
     _say(f"{APP_NAME} is running at {url}")
     _say("Keep this window open while you use the app. Press Ctrl+C to stop it.")
     log.info("serving at %s (data folder %s)", url, settings.data_dir)
-    if open_browser:
+    app = server.app
+    if after_update:
+        app.updater.record(f"started after an update, now {app.updater.current}")
+
+        def reopen() -> None:
+            if not app.page_seen.is_set():
+                webbrowser.open(url)
+
+        timer = threading.Timer(AFTER_UPDATE_REOPEN_S, reopen)
+        timer.daemon = True
+        timer.start()
+    elif open_browser:
         threading.Timer(0.3, webbrowser.open, args=(url,)).start()
+    app.updater.start_background_check()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

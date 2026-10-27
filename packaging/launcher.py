@@ -3,13 +3,17 @@
 Starts the local app (`driftmaps.app.run()`): the map page opens in the web browser and this
 console window stays open while the app runs; closing the window quits it.
 
-    AssettoCorsaMapGenerator [--port N] [--no-browser] [--data-dir DIR]
+    AssettoCorsaMapGenerator [--port N] [--no-browser] [--data-dir DIR] [--after-update]
     AssettoCorsaMapGenerator --self-test [--network]
 
 `--self-test` checks that the build has everything it needs (every driftmaps module, the map
 page, numpy/scipy/shapely, Pillow with FreeType, rasterio opening a GeoTIFF and reprojecting with
 PROJ's data) and exits 0 or 1; `--network` also reads a real elevation tile and OpenStreetMap
 over HTTPS. Built by packaging/acmg.spec; also runs unfrozen: `uv run python packaging/launcher.py`.
+
+While it runs, the app holds the named mutex APP_MUTEX (Windows): the installer
+(packaging/installer.iss) waits for it to go before replacing the files, and starts the app
+again with `--after-update` when the in-app updater ran it (the open page then reloads itself).
 """
 
 from __future__ import annotations
@@ -27,6 +31,8 @@ APP_TITLE = "Assetto Corsa Map Generator"
 BANNER = "Assetto Corsa Map Generator is running - keep this window open. Close it to quit."
 # Modules the packaged app leaves out (see SKIP_MODULES in acmg.spec).
 SKIPPED_MODULES = {"driftmaps.cli", "driftmaps.__main__", "driftmaps.spike"}
+APP_MUTEX = "AssettoCorsaMapGenerator.Running"  # = AppMutexName in packaging/installer.iss
+_mutex_handle: object = None
 
 
 def frozen() -> bool:
@@ -347,9 +353,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-dir", default=None, help="App data folder (settings, cache).")
     parser.add_argument("--self-test", action="store_true", help="Check the build and exit.")
     parser.add_argument(
+        "--after-update",
+        action="store_true",
+        help="Started by the installer after an update: the open page reloads itself.",
+    )
+    parser.add_argument(
         "--network", action="store_true", help="With --self-test: also check internet access."
     )
     return parser.parse_args(argv)
+
+
+def _hold_app_mutex() -> None:
+    """Windows: create the named mutex APP_MUTEX and keep it until the process ends."""
+    global _mutex_handle
+    if sys.platform != "win32" or _mutex_handle is not None:
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+        _mutex_handle = kernel32.CreateMutexW(None, False, APP_MUTEX)
+    except (OSError, AttributeError):
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -357,8 +384,9 @@ def main(argv: list[str] | None = None) -> int:
     _console_setup()
     if args.self_test:
         return self_test(network=args.network)
+    _hold_app_mutex()
 
-    already = _already_running() if args.port is None else None
+    already = _already_running() if args.port is None and not args.after_update else None
     if already:
         if not args.no_browser:
             _say(f"{APP_TITLE} is already open - showing it in your web browser again.")
@@ -367,13 +395,17 @@ def main(argv: list[str] | None = None) -> int:
         _say(BANNER)
         _say("=" * len(BANNER))
         _say()
-        if not args.no_browser:
+        if args.after_update:
+            _say("Updated! Your map page reloads by itself in a moment.")
+            _say()
+        elif not args.no_browser:
             _say("Your web browser will open the map page in a moment.")
             _say()
     try:
         from driftmaps.app import run
 
-        run(port=args.port, open_browser=not args.no_browser, data_dir=args.data_dir)
+        extra = {"after_update": True} if args.after_update else {}
+        run(port=args.port, open_browser=not args.no_browser, data_dir=args.data_dir, **extra)
     except KeyboardInterrupt:
         return 0
     except SystemExit as exc:

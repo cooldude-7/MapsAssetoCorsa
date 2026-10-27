@@ -6,9 +6,10 @@ class (`object_value`, e.g. `regulatory--stop--g1`, `object--support--utility-po
 compass direction it faces (`aligned_direction`) and when it was first and last seen.
 
 - **Token.** The API needs a client token (`MLY|...`, free at
-  https://mapillary.com/dashboard/developers): `$DRIFTMAPS_MAPILLARY_TOKEN` or the app's
-  settings. Without one this layer is skipped. The token is sent in the `Authorization` header,
-  never in a URL, a cache key, a log line or an error message.
+  https://mapillary.com/dashboard/developers): the user's own (the app's settings, or
+  `$DRIFTMAPS_MAPILLARY_TOKEN`), else the app's built-in `DEFAULT_CLIENT_TOKEN`
+  (`resolve_token`). Without one this layer is skipped. The token is sent in the
+  `Authorization` header, never in a URL, a cache key, a log line or an error message.
 - **Requests.** One request per 0.01 x 0.01 degree tile along the route (the API wants boxes
   under 0.01 deg^2 and returns at most 2000 features; 0.05 degree boxes gave HTTP 500 on
   2026-10-16), aligned to a 0.01 degree grid so neighbouring routes share cached tiles. A tile
@@ -30,8 +31,10 @@ import concurrent.futures
 import gzip
 import hashlib
 import json
+import logging
 import math
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -46,6 +49,8 @@ import numpy as np
 from driftmaps.geo.overpass import USER_AGENT, default_cache_dir
 from driftmaps.geo.project import LocalProjection
 
+log = logging.getLogger(__name__)
+
 __all__ = [
     "ENV_TOKEN",
     "MAPILLARY_ATTRIBUTION",
@@ -59,9 +64,26 @@ __all__ = [
     "parse_map_features",
     "tiles_along",
     "token_from_env",
+    "default_token",
+    "resolve_token",
+    "MapillaryRevoked",
+    "take_revoked_notice",
 ]
 
 ENV_TOKEN = "DRIFTMAPS_MAPILLARY_TOKEN"
+# Built-in Mapillary access, so the app's users get Mapillary's signs and poles with no setup
+# (the repository owner chose to ship it). It is a public, read-only Mapillary *client* token
+# (MLY|...): Mapillary designs client tokens to be embedded in apps, and this one can only read
+# public map data. Its per-app rate limits are shared by everyone using the app. A user's own
+# token (app settings, or $DRIFTMAPS_MAPILLARY_TOKEN) always wins, and the app's "Use Mapillary"
+# switch turns the layer off. If Mapillary ever revokes it (HTTP 401/403), builds warn once and
+# carry on with OpenStreetMap and Ontario's road rules. Read it only through `default_token()`
+# (the tests blank it, so they never use it).
+DEFAULT_CLIENT_TOKEN = "MLY|29514967621437915|046ac295251d9fcabb7983504e2c1308"
+REVOKED_MESSAGE = (
+    "The built-in Mapillary access was revoked; paste your own Mapillary token in the app's "
+    "settings to get Mapillary's signs and poles again"
+)
 API_URL = "https://graph.mapillary.com/map_features"
 IMAGES_URL = "https://graph.mapillary.com/images"
 IMAGE_FIELDS = "id,computed_geometry,captured_at"
@@ -87,6 +109,10 @@ class MapillaryError(RuntimeError):
     """The Mapillary API could not be used (no token, refused token, network)."""
 
 
+class MapillaryRevoked(MapillaryError):
+    """Mapillary refused the built-in token (HTTP 401/403): it has been revoked."""
+
+
 @dataclass(frozen=True)
 class MapFeature:
     """One Mapillary map feature: class, (lon, lat), facing (compass degrees, None if
@@ -104,6 +130,53 @@ class MapFeature:
 def token_from_env() -> str | None:
     tok = os.environ.get(ENV_TOKEN, "").strip()
     return tok or None
+
+
+_revoked = {"builtin": False, "noticed": False}
+_revoked_lock = threading.Lock()
+
+
+def default_token() -> str | None:
+    """The built-in token, or None once Mapillary has refused it in this run."""
+    with _revoked_lock:
+        if _revoked["builtin"]:
+            return None
+    return DEFAULT_CLIENT_TOKEN.strip() or None
+
+
+def resolve_token(own: str | None = None) -> tuple[str | None, str]:
+    """`(token, source)`: the user's own token, else `$DRIFTMAPS_MAPILLARY_TOKEN`, else the
+    built-in one; source is "own", "env", "built-in" or "none"."""
+    own = (own or "").strip()
+    if own:
+        return own, "own"
+    env = token_from_env()
+    if env:
+        return env, "env"
+    builtin = default_token()
+    return (builtin, "built-in") if builtin else (None, "none")
+
+
+def _revoke_builtin() -> None:
+    with _revoked_lock:
+        if not _revoked["builtin"]:
+            _revoked["builtin"] = True
+            log.warning(REVOKED_MESSAGE)
+
+
+def take_revoked_notice() -> bool:
+    """True exactly once after the built-in token was refused (the build warns then)."""
+    with _revoked_lock:
+        if _revoked["builtin"] and not _revoked["noticed"]:
+            _revoked["noticed"] = True
+            return True
+        return False
+
+
+def reset_builtin_state() -> None:
+    """Forget a refusal of the built-in token (tests)."""
+    with _revoked_lock:
+        _revoked.update(builtin=False, noticed=False)
 
 
 def _safe(text: str, token: str) -> str:
@@ -186,6 +259,10 @@ def _get(
         try:
             return opener(req, timeout_s)
         except urllib.error.HTTPError as e:
+            builtin = DEFAULT_CLIENT_TOKEN.strip()
+            if e.code in (401, 403) and builtin and token == builtin:
+                _revoke_builtin()
+                raise MapillaryRevoked(REVOKED_MESSAGE) from None
             if e.code in (400, 401, 403):
                 hint = " (check the Mapillary token)" if e.code in (401, 403) else ""
                 raise MapillaryError(
@@ -330,7 +407,7 @@ def fetch_map_features(
 
 
 def _fetch(route_lonlat, ep, token, pad_m, cache_dir, offline, refresh, opener, timeout_s, workers):
-    token = (token or token_from_env() or "").strip() or None
+    token = (token or resolve_token()[0] or "").strip() or None
     cache = Path(cache_dir) if cache_dir is not None else default_cache_dir()
     boxes = tiles_along(route_lonlat, pad_m)
     rows: list[dict] = []

@@ -24,6 +24,9 @@ const API = {
   openFolder: "/api/open-folder",
   installTouge: "/api/install-touge",
   offline: "/api/offline",
+  update: "/api/update",
+  updateCheck: "/api/update/check",
+  updateInstall: "/api/update/install",
 };
 
 const MAP_STYLES = {
@@ -760,15 +763,49 @@ function legLabel(leg, prevName) {
   return `${word[0].toUpperCase()}${word.slice(1)} onto ${name}`;
 }
 
-/** "Update 3 · 2026-10-15 · abc1234", or "dev build". */
+/** "v0.4.0 · 2026-10-15 · abc1234" (a release), "dev · 2026-10-15 · abc1234" (another CI
+ * build), or "dev build" (a checkout without build info). */
 function buildLabel(build) {
   if (!build || typeof build !== "object") return "dev build";
-  const v = String(build.version == null ? "" : build.version).trim();
-  if (!v || v === "dev") return "dev build";
-  const parts = [/^update\b/i.test(v) ? v : `Update ${v}`];
+  let v = String(build.version == null ? "" : build.version).trim();
+  if (!v || (v === "dev" && !build.date && !build.commit)) return "dev build";
+  if (/^\d+(\.\d+)+$/.test(v)) v = `v${v}`;
+  const parts = [v];
   if (build.date) parts.push(String(build.date).slice(0, 10));
   if (build.commit) parts.push(String(build.commit).slice(0, 7));
   return parts.join(" · ");
+}
+
+/** The header button for a newer version (`GET /api/update`), or null when there's none:
+ * `action` "install" (the installed app updates itself) or "download" (a portable copy). */
+function updateButton(u) {
+  if (!u || typeof u !== "object" || !u.available || !u.latest) return null;
+  const v = String(u.latest);
+  if (u.phase === "downloading") {
+    const pct = Number.isFinite(u.progress) ? ` ${Math.round(u.progress * 100)}%` : "";
+    return { text: `Downloading ${v}…${pct}`, busy: true };
+  }
+  if (u.phase === "verifying") return { text: `Checking ${v}…`, busy: true };
+  if (u.phase === "installing") return { text: `Installing ${v}…`, busy: true };
+  if (u.can_install) return { text: `Update available: ${v} — Install`, action: "install" };
+  return { text: `${v} is out — Download the new version`, action: "download" };
+}
+
+/** The Mapillary line in the settings panel (no token value ever reaches the page). */
+function mapillaryText(st) {
+  if (!st || typeof st !== "object") return "";
+  switch (st.mapillary_source) {
+    case "off":
+      return "Mapillary is off. Tracks get signs and poles from OpenStreetMap and Ontario's road rules.";
+    case "own":
+      return `Your own token is saved (${st.mapillary_token_hint || "hidden"}). New builds add Mapillary's signs and poles.`;
+    case "env":
+      return `Using the token from DRIFTMAPS_MAPILLARY_TOKEN (${st.mapillary_token_hint || "hidden"}).`;
+    case "built-in":
+      return "Mapillary: built-in shared access. New builds add Mapillary's signs and poles.";
+    default:
+      return "No Mapillary token: paste your own to add Mapillary's signs and poles.";
+  }
 }
 
 /** The first `m` metres of a [lon, lat] line (all of it if it is shorter). */
@@ -1085,6 +1122,7 @@ const state = {
   profileGeom: null,
   hoverIndex: -1,
   status: null,
+  update: null, // GET /api/update
   nameTouched: false,
   jobId: null,
   jobName: "",
@@ -3542,6 +3580,7 @@ function setPill(kind, text, title) {
 
 function applyStatus(st) {
   state.status = st || null;
+  if (st && st.update) applyUpdate(st.update);
   const label = $("build-label");
   label.textContent = buildLabel(st && st.build);
   const b = (st && st.build) || {};
@@ -3572,13 +3611,128 @@ function openAcPanel(byUser) {
   if (byUser) input.focus();
 }
 
-/** The Mapillary token row: only whether one is saved and its masked tail ever reach the page. */
+/** The Mapillary token row: only where the token comes from and a masked hint reach the page. */
 function renderMapillary(st) {
   const set = !!(st && st.mapillary_token_set);
-  $("mly-state").textContent = set
-    ? `Token saved (${st.mapillary_token_hint || "hidden"}). New builds add Mapillary's signs and poles.`
-    : "No token saved.";
+  $("mly-state").textContent = mapillaryText(st);
   $("mly-clear").hidden = !set;
+  $("mly-use").checked = !(st && st.use_mapillary === false);
+  $("upd-auto").checked = !(st && st.check_updates === false);
+}
+
+async function saveSwitch(key, value) {
+  try {
+    const st = await api(API.settings, { method: "POST", body: { [key]: value } });
+    state.status = { ...(state.status || {}), ...st };
+    renderMapillary(st);
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+/* ------------------------------------------------------------------------------------------
+ * Updates: the header button, "Check for updates", and reloading after the app restarts
+ * ---------------------------------------------------------------------------------------- */
+
+function applyUpdate(u) {
+  state.update = u || null;
+  const btn = $("update-btn");
+  const b = updateButton(u);
+  btn.hidden = !b;
+  if (b) {
+    btn.textContent = b.text;
+    btn.disabled = !!b.busy;
+    btn.dataset.action = b.action || "";
+    btn.title = b.action === "download"
+      ? "This copy wasn't installed with the Setup program: download the new version from GitHub."
+      : b.action === "install" ? "Download, check and install the new version; the app restarts by itself." : "";
+  }
+  renderUpdateMsg(u);
+}
+
+function renderUpdateMsg(u, checkedNow) {
+  const el = $("upd-msg");
+  if (!u) return;
+  let text = `This is ${buildLabel((state.status && state.status.build) || null)}.`;
+  if (u.phase === "error" && u.error) text += ` The last update didn't work: ${u.error}`;
+  else if (u.available) text += ` ${u.latest} is available.`;
+  else if (u.checked && u.latest) text += u.dev ? ` The latest release is ${u.latest}.` : " It's the newest version.";
+  else if (checkedNow && u.check_error) text += ` ${u.check_error}`;
+  el.textContent = text;
+}
+
+async function loadUpdate() {
+  try {
+    applyUpdate(await api(API.update));
+  } catch {
+    /* the check is optional: say nothing */
+  }
+}
+
+async function checkForUpdates() {
+  const btn = $("btn-upd-check");
+  btn.disabled = true;
+  try {
+    const u = await api(API.updateCheck, { method: "POST", body: {} });
+    applyUpdate(u);
+    renderUpdateMsg(u, true);
+  } catch (err) {
+    $("upd-msg").textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function onUpdateClick() {
+  const u = state.update;
+  if (!u) return;
+  if ($("update-btn").dataset.action === "download") {
+    window.open(u.page, "_blank", "noopener");
+    return;
+  }
+  const ok = window.confirm(
+    `Install ${u.latest} now?\n\nThe app downloads it from GitHub, checks it, closes for a moment and opens again by itself. Your settings, tracks and road data stay.`,
+  );
+  if (!ok) return;
+  try {
+    applyUpdate(await api(API.updateInstall, { method: "POST", body: {} }));
+  } catch (err) {
+    toast(err.message, "error");
+    return;
+  }
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 700));
+    let now;
+    try {
+      now = await api(API.update);
+    } catch {
+      break; // the app has closed for the installer
+    }
+    applyUpdate(now);
+    if (now.phase === "error") {
+      toast(now.error || "The update didn't work.", "error");
+      return;
+    }
+    if (now.phase === "idle") return;
+  }
+  waitForNewVersion();
+}
+
+/** The app is being replaced: wait until it answers again, then reload the page. */
+async function waitForNewVersion() {
+  toast("Installing the update - the app opens again in a moment.", "ok");
+  const until = Date.now() + 5 * 60 * 1000;
+  while (Date.now() < until) {
+    await new Promise((r) => setTimeout(r, 1500));
+    try {
+      await api(API.status);
+      window.location.reload();
+      return;
+    } catch {
+      /* not back yet */
+    }
+  }
+  toast("The update is taking long. If the app doesn't come back, open it from the Start menu.", "error");
 }
 
 async function saveMapillaryToken(value) {
@@ -4219,6 +4373,10 @@ function bindUi() {
     saveMapillaryToken($("mly-token").value);
   });
   $("mly-clear").addEventListener("click", () => saveMapillaryToken(""));
+  $("mly-use").addEventListener("change", (e) => saveSwitch("use_mapillary", e.target.checked));
+  $("upd-auto").addEventListener("change", (e) => saveSwitch("check_updates", e.target.checked));
+  $("btn-upd-check").addEventListener("click", checkForUpdates);
+  $("update-btn").addEventListener("click", onUpdateClick);
   $("track-name").addEventListener("input", (e) => {
     state.nameTouched = e.target.value.trim() !== "";
   });
@@ -4289,7 +4447,7 @@ function boot() {
   renderRouteInfo();
   resetProfile();
   enterMode();
-  loadStatus();
+  loadStatus().then(loadUpdate);
   loadOffline();
   loadTracks();
   resumeJob();

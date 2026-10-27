@@ -4,6 +4,11 @@
   `$XDG_DATA_HOME/AssettoCorsaMapGenerator` (default `~/.local/share/...`) elsewhere, or
   `$DRIFTMAPS_APP_DIR` when set. It holds `settings.json`, routed roads (`routes/`), built
   tracks (`tracks/`) and, unless `$DRIFTMAPS_CACHE_DIR` is set, the download cache (`cache/`).
+- **Switches** in `settings.json`: `use_mapillary` (Mapillary's signs and poles in builds) and
+  `check_updates` (ask GitHub for a newer version at start), both on unless saved as false.
+- **Mapillary token** for builds: the user's own (saved here), else
+  `$DRIFTMAPS_MAPILLARY_TOKEN`, else the app's built-in one (`geo.mapillary.resolve_token`).
+  No token value ever leaves through `status()`: only where it comes from and a masked hint.
 - **Assetto Corsa**: the folder saved in `settings.json` (`ac_root`, set from the app) wins
   while it is still a valid AC folder; otherwise `config.find_ac_root()` searches (env var,
   registry, Steam libraries, common folders). The search result is remembered for the session.
@@ -109,6 +114,8 @@ class Settings:
         self._searched = False
         self.ac_root_override: str | None = None
         self._mapillary_token: str | None = None
+        self.use_mapillary = True
+        self.check_updates = True
         self._load()
 
     # -- folders ------------------------------------------------------------------------------
@@ -143,6 +150,10 @@ class Settings:
             self.ac_root_override = data["ac_root"]
         if isinstance(data, dict) and isinstance(data.get("mapillary_token"), str):
             self._mapillary_token = data["mapillary_token"].strip() or None
+        if isinstance(data, dict):
+            for key in ("use_mapillary", "check_updates"):
+                if isinstance(data.get(key), bool):
+                    setattr(self, key, data[key])
 
     def _save(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -150,6 +161,9 @@ class Settings:
         data = {"ac_root": self.ac_root_override}
         if self._mapillary_token:
             data["mapillary_token"] = self._mapillary_token
+        for key in ("use_mapillary", "check_updates"):
+            if not getattr(self, key):  # saved only when switched off (the default is on)
+                data[key] = False
         tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         tmp.replace(self.config_path)
 
@@ -189,12 +203,35 @@ class Settings:
 
     # -- Mapillary ------------------------------------------------------------------------------
 
-    def mapillary_token(self) -> str | None:
-        """The Mapillary client token for builds: the saved one, else $DRIFTMAPS_MAPILLARY_TOKEN.
-        Never sent back to the browser (see `status`)."""
+    def _mapillary(self) -> tuple[str | None, str]:
+        """`(token, source)`: source "off", "own", "env", "built-in" or "none"."""
+        from driftmaps.geo.mapillary import default_token
+
         with self._lock:
-            saved = self._mapillary_token
-        return saved or (self._env.get(ENV_MAPILLARY_TOKEN, "").strip() or None)
+            saved, on = self._mapillary_token, self.use_mapillary
+        if not on:
+            return None, "off"
+        if saved:
+            return saved, "own"
+        env = self._env.get(ENV_MAPILLARY_TOKEN, "").strip()
+        if env:
+            return env, "env"
+        builtin = default_token()
+        return (builtin, "built-in") if builtin else (None, "none")
+
+    def mapillary_token(self) -> str | None:
+        """The Mapillary client token for builds: the saved one, else $DRIFTMAPS_MAPILLARY_TOKEN,
+        else the built-in one; None when Mapillary is switched off. Never sent back to the
+        browser (see `status`)."""
+        return self._mapillary()[0]
+
+    def set_switch(self, key: str, value: bool) -> None:
+        """Turn `use_mapillary` or `check_updates` on or off (saved)."""
+        if key not in ("use_mapillary", "check_updates"):
+            raise KeyError(key)
+        with self._lock:
+            setattr(self, key, bool(value))
+            self._save()
 
     def set_mapillary_token(self, text: str | None) -> None:
         """Save the user's Mapillary client token (empty/None forgets it)."""
@@ -212,15 +249,21 @@ class Settings:
         """The `/api/status` body. The Mapillary token appears only masked (its last 4
         characters), never whole."""
         root = self.ac_root()
-        token = self.mapillary_token()
+        source = self._mapillary()[1]
+        with self._lock:
+            own = self._mapillary_token or self._env.get(ENV_MAPILLARY_TOKEN, "").strip() or None
         return {
             "app": APP_NAME,
             "version": app_version(),
             "ac_found": root is not None,
             "ac_root": str(root) if root is not None else None,
             "tracks_dir": str(config.tracks_dir(root)) if root is not None else None,
-            "mapillary_token_set": token is not None,
-            "mapillary_token_hint": mask_token(token),
+            "mapillary_token_set": own is not None,
+            "mapillary_token_hint": mask_token(own)
+            or ("built-in" if source == "built-in" else None),
+            "mapillary_source": source,
+            "use_mapillary": self.use_mapillary,
+            "check_updates": self.check_updates,
         }
 
 

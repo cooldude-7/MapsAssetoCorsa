@@ -110,6 +110,26 @@ code { font-family: var(--mono); font-size: 12px; word-break: break-all; }
 
 .topbar-right { display: flex; align-items: center; gap: 8px; flex: none; }
 
+.update-btn {
+  max-width: 300px;
+  padding: 5px 12px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.update-btn:disabled { opacity: 0.8; cursor: progress; }
+.update-btn:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+#update-box .row { justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+#mly-form .switch { margin: 0 0 8px; }
+
 .pill {
   display: inline-flex;
   align-items: center;

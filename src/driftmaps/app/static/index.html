@@ -19,6 +19,7 @@
       <span id="build-label" class="build-label" title="Which version of the app this is">dev build</span>
     </div>
     <div class="topbar-right">
+      <button id="update-btn" class="update-btn" type="button" hidden></button>
       <button id="ac-pill" class="pill" type="button" data-kind="pending" aria-controls="ac-panel"
               aria-expanded="false">Checking for Assetto Corsa…</button>
       <button id="style-toggle" class="btn ghost small" type="button">Dark map</button>
@@ -68,12 +69,14 @@
       <p id="offline-error" class="error-text" role="alert" hidden></p>
     </div>
     <form id="mly-form" class="offline-box" autocomplete="off">
-      <h3 class="offline-title">Signs and poles from street photos (optional)</h3>
-      <p class="hint">With a free Mapillary token, tracks get the stop signs, speed limits,
-        hydro poles and street lights that Mapillary found in street-level photos. Get one at
-        <a href="https://www.mapillary.com/dashboard/developers" target="_blank" rel="noopener">mapillary.com/dashboard/developers</a>:
-        sign in, register an application, then copy its <strong>Client Token</strong> (it starts with MLY|).
-        Without one, tracks still get signs and poles from OpenStreetMap and Ontario's road rules.</p>
+      <h3 class="offline-title">Signs and poles from street photos</h3>
+      <p class="hint">Tracks get the stop signs, speed limits, hydro poles and street lights that
+        Mapillary found in street-level photos. The app has built-in shared access, so this
+        works out of the box. You can paste your own free token instead: get one at
+        <a href="https://www.mapillary.com/dashboard/developers" target="_blank" rel="noopener">mapillary.com/dashboard/developers</a>
+        (sign in, register an application, copy its <strong>Client Token</strong>, which starts with MLY|).
+        With Mapillary off, tracks still get signs and poles from OpenStreetMap and Ontario's road rules.</p>
+      <label class="switch"><input id="mly-use" type="checkbox" checked><span>Use Mapillary</span></label>
       <label for="mly-token">Mapillary token</label>
       <div class="row">
         <input id="mly-token" type="password" spellcheck="false" placeholder="MLY|..." autocomplete="off">
@@ -83,6 +86,17 @@
       <p id="mly-state" class="hint" role="status"></p>
       <p id="mly-error" class="error-text" role="alert" hidden></p>
     </form>
+    <div id="update-box" class="offline-box">
+      <h3 class="offline-title">Updates</h3>
+      <p class="hint">The app can ask GitHub once a day whether a newer version is out. Only that
+        question is sent: nothing about you or your PC. Updates are installed only when you click
+        Install.</p>
+      <div class="row">
+        <label class="switch"><input id="upd-auto" type="checkbox" checked><span>Check for new versions when the app starts</span></label>
+        <button id="btn-upd-check" class="btn small" type="button">Check for updates</button>
+      </div>
+      <p id="upd-msg" class="hint" role="status"></p>
+    </div>
   </section>
 
   <main class="layout">

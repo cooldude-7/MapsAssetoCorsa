@@ -24,6 +24,9 @@ LAUNCHER = PACKAGING / "launcher.py"
 ICON = PACKAGING / "icon.ico"
 WORKFLOW = ROOT / ".github" / "workflows" / "windows-app.yml"
 GUIDE = ROOT / "docs" / "INSTALL_APP.md"
+FRIENDS = ROOT / "docs" / "FOR_FRIENDS.md"
+NOTES = ROOT / "docs" / "RELEASE_NOTES_TEMPLATE.md"
+INSTALLER = PACKAGING / "installer.iss"
 STATIC = ROOT / "src" / "driftmaps" / "app" / "static"
 APP_NAME = "AssettoCorsaMapGenerator"
 
@@ -496,10 +499,16 @@ def test_workflow_has_the_steps_in_order() -> None:
 
     order = [
         index("pytest"),
+        index("APP_VERSION="),
         index("pyinstaller --noconfirm --clean packaging/acmg.spec"),
         index("AssettoCorsaMapGenerator.exe --self-test"),
         index("--no-browser"),
         index("Compress-Archive"),
+        index("packaging\\installer.iss"),
+        index("unins000.exe"),
+        index("SHA256SUMS.txt"),
+        index("actions/attest-build-provenance"),
+        index("gh attestation verify"),
         index("actions/upload-artifact"),
         index("gh release"),
     ]
@@ -519,13 +528,99 @@ def test_workflow_zips_uploads_and_releases() -> None:
     assert wf["env"]["ZIP"] == "AssettoCorsaMapGenerator-windows.zip"
     zip_step = step_with("Compress-Archive")
     assert "dist\\AssettoCorsaMapGenerator" in zip_step["run"]
+    assert "release\\$env:ZIP" in zip_step["run"]
     upload = step_with("actions/upload-artifact")
     assert upload["with"]["name"] == "AssettoCorsaMapGenerator-windows"
-    assert upload["with"]["path"].startswith("dist/AssettoCorsaMapGenerator")
+    assert upload["with"]["path"] == "release/"
     release = step_with("gh release")
-    assert "refs/tags/v" in release["if"]
-    assert "$env:ZIP" in release["run"]
-    assert wf["permissions"]["contents"] == "write"
+    assert "refs/tags/v" in release["if"] and "steps.tests.outcome == 'success'" in release["if"]
+    for text in ("$env:ZIP", "RELEASE_NOTES_TEMPLATE.md", "{{VERSION}}", "--notes-file"):
+        assert text in release["run"], text
+    assert wf["permissions"] == {
+        "contents": "write",
+        "id-token": "write",
+        "attestations": "write",
+    }
+
+
+def test_workflow_version_installer_and_attestations() -> None:
+    version = step_with("APP_VERSION=")["run"]
+    assert "refs/tags/v" in version and '"dev"' in version
+    assert "AssettoCorsaMapGenerator-Setup-$file.exe" in version
+    assert 'VERSION = `"$env:APP_VERSION`"' in step_with("_build_info.py")["run"]
+    assert "$env:APP_VERSION" in step_with("--no-browser")["run"]  # the smoke test checks it
+    find = step_with("ISCC=")["run"]
+    assert "Inno Setup 6" in find and "choco install innosetup" in find
+    test = step_with("unins000.exe")["run"]
+    for text in ("/VERYSILENT", "/CURRENTUSER", "--self-test", "/relaunch=1", "ci-keep-me"):
+        assert text in test, text
+    attest = step_with("actions/attest-build-provenance")
+    assert re.fullmatch(r"actions/attest-build-provenance@[0-9a-f]{40}", attest["uses"])
+    assert "env.SETUP" in attest["with"]["subject-path"]
+    assert "env.ZIP" in attest["with"]["subject-path"]
+
+
+# ---------------------------------------------------------------------------------------------
+# Installer (Inno Setup)
+# ---------------------------------------------------------------------------------------------
+
+
+def iss_setting(name: str) -> str:
+    m = re.search(rf"^{name}=(.*)$", INSTALLER.read_text(encoding="utf-8"), re.M)
+    assert m, name
+    return m.group(1).strip()
+
+
+def test_installer_is_per_user_and_keeps_user_data(launcher: ModuleType) -> None:
+    from driftmaps.app import settings, updates
+
+    iss = INSTALLER.read_text(encoding="utf-8")
+    assert iss_setting("PrivilegesRequired") == "lowest"
+    assert iss_setting("DefaultDirName") == "{localappdata}\\Programs\\{#AppName}"
+    assert '#define AppName "Assetto Corsa Map Generator"' in iss
+    assert iss_setting("SetupIconFile") == "icon.ico" and ICON.is_file()
+    assert iss_setting("OutputBaseFilename") == "AssettoCorsaMapGenerator-Setup-{#AppVersion}"
+    assert f'#define AppMutexName "{launcher.APP_MUTEX}"' in iss
+    assert f'#define DataDirName "{settings.APP_DIR_NAME}"' in iss
+    assert '"desktopicon"' in iss and "{autoprograms}" in iss and "{autodesktop}" in iss
+    # The in-app updater's flags, and the restart after a silent update.
+    assert updates.INSTALLER_ARGS[-1] == "/relaunch=1" and "{param:relaunch|0}" in iss
+    assert "--after-update --port {param:port|8765}" in iss and "Check: RelaunchAfterUpdate" in iss
+    # Uninstall asks before deleting the user data (and keeps it when silent).
+    assert "UninstallSilent" in iss and "MB_YESNO" in iss and "DelTree(DataDir" in iss
+    # The app's data folder is outside the install folder.
+    assert "Programs" not in str(settings.app_data_dir({"LOCALAPPDATA": "C:\\L"}))
+
+
+# ---------------------------------------------------------------------------------------------
+# Friends' guide and release notes
+# ---------------------------------------------------------------------------------------------
+
+
+def test_friends_guide_and_release_notes() -> None:
+    guide = FRIENDS.read_text(encoding="utf-8")
+    notes = NOTES.read_text(encoding="utf-8")
+    for text in (guide, notes):
+        for phrase in (
+            "Windows 10",
+            "Content Manager",
+            "Custom Shaders Patch",
+            "https://github.com/cooldude-7/MapsAssetoCorsa/releases/latest",
+            "Keep",
+            "More info",
+            "Run anyway",
+            "Get-FileHash",
+            "SHA256SUMS.txt",
+            "gh attestation verify",
+            "127.0.0.1",
+            "content\\tracks",
+            "Mapillary",
+            "Install",
+            "Download Ontario roads",
+        ):
+            assert phrase in text, phrase
+    assert "{{VERSION}}" in notes and "{{SETUP}}" in notes
+    assert "FOR_FRIENDS.md" in (ROOT / "README.md").read_text(encoding="utf-8")
 
 
 def test_mini_yaml_is_strict() -> None:

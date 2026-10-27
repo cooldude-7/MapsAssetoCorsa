@@ -297,7 +297,7 @@ def build(
     furniture: bool = typer.Option(
         True,
         help="Signs, hydro poles, street lights and stop bars (OSM, Ontario rules, and "
-        "Mapillary with $DRIFTMAPS_MAPILLARY_TOKEN).",
+        "Mapillary: $DRIFTMAPS_MAPILLARY_TOKEN, else the app's built-in access).",
     ),
     guardrails: bool = typer.Option(
         True,

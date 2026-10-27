@@ -12,8 +12,9 @@ def run(
     port: int | None = None,
     open_browser: bool = True,
     data_dir: Path | str | None = None,
+    after_update: bool = False,
 ) -> None:
     """Serve the app until Ctrl+C (see `driftmaps.app.server.run`)."""
     from driftmaps.app.server import run as _run
 
-    _run(port=port, open_browser=open_browser, data_dir=data_dir)
+    _run(port=port, open_browser=open_browser, data_dir=data_dir, after_update=after_update)

@@ -332,6 +332,7 @@ class BuildRunner:
             track_id=req.track_id,
             cache_dir=self.settings.cache_dir,
             mapillary_token=self.settings.mapillary_token(),
+            mapillary=self.settings.use_mapillary,
             debug_png=False,
             trees=req.trees,
             buildings=req.buildings,

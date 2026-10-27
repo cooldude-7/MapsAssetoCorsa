@@ -1,6 +1,12 @@
-# Builds the double-click Windows app "Assetto Corsa Map Generator" (packaging/acmg.spec) on
-# every push, smoke-tests the .exe and uploads it. Tags v* also get a GitHub Release with
-# AssettoCorsaMapGenerator-windows.zip attached. Player instructions: docs/INSTALL_APP.md.
+# Builds the Windows app "Assetto Corsa Map Generator" on every push:
+# - the PyInstaller one-folder app (packaging/acmg.spec), self-tested and smoke-tested;
+# - the portable zip and the per-user installer (packaging/installer.iss, Inno Setup), which is
+#   installed silently, upgraded over itself (settings must survive, the app must restart),
+#   self-tested and uninstalled;
+# - SHA256SUMS.txt and GitHub build provenance attestations for the installer and the zip.
+# The run's artifact holds the installer, the zip and SHA256SUMS.txt. A vX.Y.Z tag also
+# publishes them as a GitHub Release, with docs/RELEASE_NOTES_TEMPLATE.md as the notes, unless
+# the tests failed. Guides: docs/FOR_FRIENDS.md, docs/INSTALL_APP.md.
 name: Windows app
 
 on:
@@ -10,7 +16,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # attach the zip to a Release on v* tags
+  contents: write # publish the GitHub Release on v* tags
+  id-token: write # build provenance attestations (Sigstore)
+  attestations: write
 
 concurrency:
   group: windows-app-${{ github.ref }}
@@ -54,13 +62,30 @@ jobs:
         continue-on-error: true
         run: uv run --locked pytest -m "not network"
 
-      # The app shows "Update 3 · <date> · <commit>" in its header (GET /api/status -> build).
+      # vX.Y.Z on a release tag, "dev" otherwise. The app's header shows
+      # "<version> · <date> · <commit>" and compares the version with the latest release.
+      - name: Work out the version
+        run: |
+          if ($env:GITHUB_REF -match '^refs/tags/v(\d+\.\d+\.\d+)$') {
+            $num = $Matches[1]; $version = "v$num"; $file = $num; $numeric = "$num.0"
+          } elseif ($env:GITHUB_REF.StartsWith("refs/tags/")) {
+            throw "Release tags look like v1.2.3, not $env:GITHUB_REF_NAME"
+          } else {
+            $num = ""; $version = "dev"; $file = "dev-" + $env:GITHUB_SHA.Substring(0, 7); $numeric = "0.0.0.0"
+          }
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
+          "ACMG_VERSION=$num" >> $env:GITHUB_ENV
+          "SETUP_VERSION=$file" >> $env:GITHUB_ENV
+          "SETUP_NUMERIC=$numeric" >> $env:GITHUB_ENV
+          "SETUP=AssettoCorsaMapGenerator-Setup-$file.exe" >> $env:GITHUB_ENV
+          Write-Host "Version $version; installer AssettoCorsaMapGenerator-Setup-$file.exe"
+
       - name: Write the build info
         run: |
           $date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
           $lines = @(
             '"""Written by CI (windows-app.yml) before PyInstaller; never committed."""',
-            'VERSION = "Update 3"',
+            "VERSION = `"$env:APP_VERSION`"",
             "COMMIT = `"$env:GITHUB_SHA`"",
             "DATE = `"$date`""
           )
@@ -97,7 +122,7 @@ jobs:
             $st = $json | ConvertFrom-Json
             if ($st.app -ne "Assetto Corsa Map Generator") { throw "unexpected /api/status" }
             # The header label: the frozen app must have picked up _build_info.py.
-            if ($st.build.version -ne "Update 3" -or -not $st.build.commit) { throw "no build info in /api/status" }
+            if ($st.build.version -ne $env:APP_VERSION -or -not $st.build.commit) { throw "no build info in /api/status" }
             curl.exe -fsS -o $page http://127.0.0.1:8765/
             if ($LASTEXITCODE -ne 0) { throw "GET / failed" }
             if (-not (Select-String -Path $page -Pattern "<html" -Quiet)) { throw "GET / is not the map page" }
@@ -109,32 +134,141 @@ jobs:
           }
           $global:LASTEXITCODE = 0
 
-      - name: Zip the app folder
-        run: Compress-Archive -Path dist\AssettoCorsaMapGenerator -DestinationPath $env:ZIP -CompressionLevel Optimal
+      - name: Zip the app folder (the portable version)
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Compress-Archive -Path dist\AssettoCorsaMapGenerator -DestinationPath "release\$env:ZIP" -CompressionLevel Optimal
 
-      # GitHub wraps every artifact in a zip of its own, so the artifact is the app folder itself:
-      # the download (AssettoCorsaMapGenerator-windows.zip) unzips straight to the .exe.
-      - name: Upload the app (workflow artifact)
+      # Inno Setup 6 comes with the windows-latest image; Chocolatey only if it's missing.
+      - name: Find Inno Setup
+        run: |
+          $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) {
+            $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") |
+              Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $iscc) {
+            Write-Host "Inno Setup 6 isn't installed: installing it with Chocolatey"
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed" }
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found" }
+          Write-Host "Inno Setup compiler: $iscc"
+          "ISCC=$iscc" >> $env:GITHUB_ENV
+
+      - name: Build the installer (Inno Setup)
+        run: |
+          & $env:ISCC /Q "/DAppVersion=$env:SETUP_VERSION" "/DVersionNumeric=$env:SETUP_NUMERIC" "/DOutputDir=..\release" packaging\installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
+          Get-ChildItem release | Format-Table Name, Length
+
+      # As a player would: install (no admin), self-test, update over it the way the in-app
+      # updater does (silent, /relaunch=1: the new version must start again with the user's
+      # settings), then uninstall silently (the app goes, the user data stays).
+      - name: Test the installer (install, self-test, update, uninstall)
+        run: |
+          $setup = (Resolve-Path "release\$env:SETUP").Path
+          $app = Join-Path $env:LOCALAPPDATA "Programs\Assetto Corsa Map Generator"
+          $exe = Join-Path $app "AssettoCorsaMapGenerator.exe"
+          $data = Join-Path $env:LOCALAPPDATA "AssettoCorsaMapGenerator"
+          $settings = Join-Path $data "settings.json"
+          $menu = Join-Path ([Environment]::GetFolderPath("Programs")) "Assetto Corsa Map Generator.lnk"
+          $log = Join-Path $env:RUNNER_TEMP "setup.log"
+          function Install-App([string[]] $extra) {
+            $argv = @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/CURRENTUSER", "/NORESTART", "/LOG=$log") + $extra
+            # WaitForExit, not -Wait: -Wait would also wait for the app the update restarts.
+            $p = Start-Process -FilePath $setup -ArgumentList $argv -PassThru
+            $null = $p.Handle
+            $p.WaitForExit()
+            if ($p.ExitCode -ne 0) { Get-Content $log -Tail 40; throw "setup exited with $($p.ExitCode)" }
+          }
+          # Settings from an earlier version (no update checks: CI never asks GitHub).
+          New-Item -ItemType Directory -Force $data | Out-Null
+          '{"ac_root": null, "mapillary_token": "MLY|ci-keep-me-0000001308", "check_updates": false}' |
+            Set-Content -Path $settings -Encoding utf8
+          Install-App @()
+          foreach ($f in @($exe, (Join-Path $app "unins000.exe"), $menu)) {
+            if (-not (Test-Path $f)) { throw "missing after install: $f" }
+          }
+          & $exe --self-test
+          if ($LASTEXITCODE -ne 0) { throw "the installed app failed its self-test" }
+          Install-App @("/relaunch=1", "/port=8799")
+          try {
+            $status = Join-Path $env:RUNNER_TEMP "status-after-update.json"
+            curl.exe -fsS --retry 60 --retry-connrefused --retry-delay 1 -o $status http://127.0.0.1:8799/api/status
+            if ($LASTEXITCODE -ne 0) { throw "the app didn't start again after the update" }
+            $st = Get-Content $status -Raw | ConvertFrom-Json
+            Write-Host "After the update: $($st.build.version), own Mapillary token kept: $($st.mapillary_token_set)"
+            if ($st.build.version -ne $env:APP_VERSION) { throw "unexpected version after the update" }
+            if (-not $st.mapillary_token_set -or -not "$($st.mapillary_token_hint)".EndsWith("1308")) { throw "the update lost the settings" }
+            if ($st.check_updates -ne $false) { throw "the update lost check_updates" }
+          } finally {
+            Get-Process AssettoCorsaMapGenerator -ErrorAction SilentlyContinue | Stop-Process -Force
+          }
+          if ((Get-Content $settings -Raw) -notmatch "ci-keep-me") { throw "settings.json changed" }
+          $p = Start-Process -FilePath (Join-Path $app "unins000.exe") -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -PassThru
+          $null = $p.Handle
+          $p.WaitForExit()
+          if ($p.ExitCode -ne 0) { throw "uninstall exited with $($p.ExitCode)" }
+          for ($i = 0; $i -lt 60 -and (Test-Path $exe); $i++) { Start-Sleep -Seconds 1 }
+          if (Test-Path $exe) { throw "the app is still there after uninstalling" }
+          if (Test-Path $menu) { throw "the Start Menu shortcut is still there after uninstalling" }
+          if (-not (Test-Path $settings)) { throw "uninstalling deleted the user data" }
+          Remove-Item -Recurse -Force $data
+          Write-Host "Install, self-test, update with settings kept, relaunch and uninstall: OK"
+          $global:LASTEXITCODE = 0
+
+      - name: Checksums (SHA256SUMS.txt)
+        run: |
+          $lines = Get-ChildItem release -File | Where-Object Name -ne "SHA256SUMS.txt" | Sort-Object Name |
+            ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name }
+          [IO.File]::WriteAllText((Join-Path $PWD "release\SHA256SUMS.txt"), (($lines -join "`n") + "`n"))
+          Get-Content release\SHA256SUMS.txt
+
+      # Signed statements that these files were built by this workflow from this commit:
+      # gh attestation verify <file> -R cooldude-7/MapsAssetoCorsa
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release/${{ env.SETUP }}
+            release/${{ env.ZIP }}
+
+      - name: Verify the attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "release\$env:SETUP" -R $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw "gh attestation verify failed" }
+
+      - name: Upload the installer, the portable zip and SHA256SUMS.txt (workflow artifact)
         uses: actions/upload-artifact@v4
         with:
           name: AssettoCorsaMapGenerator-windows
-          path: dist/AssettoCorsaMapGenerator/
+          path: release/
           if-no-files-found: error
 
-      - name: Attach the zip to the GitHub Release (v* tags)
+      - name: Publish the GitHub Release (vX.Y.Z tags, tests passed)
         if: startsWith(github.ref, 'refs/tags/v') && steps.tests.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
+          $notes = (Get-Content docs/RELEASE_NOTES_TEMPLATE.md -Raw).Replace("{{VERSION}}", $env:APP_VERSION).Replace("{{SETUP}}", $env:SETUP).Replace("{{ZIP}}", $env:ZIP)
+          $notesFile = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          [IO.File]::WriteAllText($notesFile, $notes)
+          $files = Get-ChildItem release -File | ForEach-Object { $_.FullName }
           gh release view $env:TAG *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:TAG $env:ZIP --clobber
+            gh release upload $env:TAG @files --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+            gh release edit $env:TAG --notes-file $notesFile
           } else {
-            gh release create $env:TAG $env:ZIP --title "Assetto Corsa Map Generator $env:TAG" `
-              --notes "Download $env:ZIP below, unzip it anywhere and double-click AssettoCorsaMapGenerator.exe. Step-by-step: docs/INSTALL_APP.md"
+            gh release create $env:TAG @files --title "Assetto Corsa Map Generator $env:TAG" --notes-file $notesFile
           }
+          if ($LASTEXITCODE -ne 0) { throw "gh release failed" }
 
       - name: Fail the run if the tests failed
         if: steps.tests.outcome == 'failure'
